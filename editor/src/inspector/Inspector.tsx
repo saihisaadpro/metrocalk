@@ -9,57 +9,30 @@
 //! (`CollapsibleGroup`), every raw input is the M14.1 styled `NumericField` (now **scrub-to-edit** —
 //! drag/keyboard/type, each commit one ADR-010 optimistic transaction, a scrub coalescing to one undo step),
 //! a header names the object (icon + mono id), and a true empty-state replaces a blank pane.
+//!
+//! **ADR-169 — and when MORE THAN ONE thing is selected.** This file is the single-object form plus the
+//! one-line decision of which form to show. The multi-selection form is a separate component and not a
+//! branch inside this one, because the two subscribe differently: this one watches `displayed[id]` and
+//! must keep doing so (a field edit on one object never re-renders against a 5k tree), while the other
+//! has to watch the whole map. Two components, two hook sets, one seam.
 
 import { JsonForms } from "@jsonforms/react";
 import { vanillaCells } from "@jsonforms/vanilla-renderers";
-import { useSelectedId, useDisplayedEntity, useSummary } from "../store/projection";
+import { useSelectedId, useDisplayedEntity, useMultiSelect, useSummary } from "../store/projection";
 import { setStatus } from "../store/ui";
 import type { EditorClient } from "../transport/session";
 import type { Json } from "../transport/protocol";
 import { buildEntitySchema, buildEntityUiSchema } from "../schema/registry";
-import {
-  AssetRefControl,
-  assetRefTester,
-  BooleanControl,
-  booleanTester,
-  CollapsibleGroup,
-  groupTester,
-  EntityRefControl,
-  entityRefTester,
-  EnumControl,
-  enumTester,
-  NumberControl,
-  numberTester,
-  StringControl,
-  stringTester,
-  VerticalLayout,
-  verticalLayoutTester,
-} from "./renderers";
+import { inspectorRenderers } from "./renderers";
+import { MultiInspector } from "./MultiInspector";
+import { TransformSection } from "./TransformSection";
+import { readTransform, withoutTransform } from "./transform";
+import { pushToast } from "../store/toasts";
 import { TypeIcon } from "../theme/primitives";
 import { Icon } from "../theme/icons";
 import { EmptyPanelState } from "../theme/workspace";
 import { InspectorEmpty } from "./InspectorEmpty";
 import { color, font, fontSize, space } from "../theme/tokens";
-
-/** **`vanillaRenderers` IS DELIBERATELY NOT HERE (ADR-136).** It used to be spread in as the fallback,
- *  and it is what every boolean, plain string and vocabulary field in the inspector actually rendered
- *  through — emitting `.control`, `.input`, `.select` and `.checkbox`, generic class names this
- *  repository's stylesheet has no rules for and that `check-class-hooks.mjs` cannot see, because they
- *  come out of `node_modules` rather than out of the markup it reads. The set below covers every scalar
- *  `FieldType` the core can register (Number · Integer · Boolean · String, plus the `format` and
- *  vocabulary refinements), so there is nothing left for a fallback to catch — and its absence is what
- *  lets a `shots` scene assert those four class names are not on the page. `vanillaCells` stays: cells
- *  are the array/table path, which this inspector does not use, and JsonForms wants a non-empty list. */
-const renderers = [
-  { tester: stringTester, renderer: StringControl },
-  { tester: numberTester, renderer: NumberControl },
-  { tester: booleanTester, renderer: BooleanControl },
-  { tester: enumTester, renderer: EnumControl },
-  { tester: assetRefTester, renderer: AssetRefControl },
-  { tester: entityRefTester, renderer: EntityRefControl },
-  { tester: groupTester, renderer: CollapsibleGroup },
-  { tester: verticalLayoutTester, renderer: VerticalLayout },
-];
 
 type Components = Record<string, Record<string, Json>>;
 
@@ -79,14 +52,36 @@ function emitChanges(client: EditorClient, id: string, before: Components, after
   }
 }
 
+/** The panel the Inspector dock mounts: one object, or the selection.
+ *
+ *  The multi-selection is ORDERED PRIMARY-FIRST before it is handed on. `multiSelect` keeps the order
+ *  the user built the selection in and the primary is wherever the last click put it; the panel uses
+ *  the first entry to fix which object's component and field ORDER the form follows, so a form that
+ *  re-ordered itself because a different object happened to be first would be a defect that only ever
+ *  showed up on a shift-click at one end of a range. */
 export function Inspector({ client }: { client: EditorClient }) {
+  const primary = useSelectedId();
+  const multi = useMultiSelect();
+  if (multi.length >= 2) {
+    const ordered = primary ? [primary, ...multi.filter((i) => i !== primary)] : multi;
+    return <MultiInspector client={client} ids={ordered} />;
+  }
+  return <SingleInspector client={client} />;
+}
+
+function SingleInspector({ client }: { client: EditorClient }) {
   const id = useSelectedId();
   const entity = useDisplayedEntity(id ?? "");
   const summary = useSummary(id ?? "");
   // The state this panel is in most often, and the one it had never been designed for — see
   // `InspectorEmpty` for what replaced the one grey sentence that used to be here.
   if (!id || !entity) return <InspectorEmpty />;
-  const schema = buildEntitySchema(entity.components);
+  // ADR-172 — `Transform` is drawn by its own section, not by the data-driven form. It is the one
+  // component whose STORAGE and whose PROPERTIES are different shapes: eight sparse scalars on the
+  // wire, three properties on screen, one of them (rotation) a quaternion nobody types.
+  const rest = withoutTransform(entity.components);
+  const schema = buildEntitySchema(rest);
+  const transform = entity.components.Transform ? readTransform(entity.components.Transform) : null;
   // A real empty-state (C6) — never a blank pane: when the entity carries no *editable* (schema-backed)
   // properties, say so + name the next step, rather than rendering nothing beside the header.
   const hasFields = !!schema.properties && Object.keys(schema.properties).length > 0;
@@ -103,14 +98,46 @@ export function Inspector({ client }: { client: EditorClient }) {
           <div style={{ font: font.mono, fontSize: fontSize.micro, color: color.text.muted }}>{id}</div>
         </div>
       </div>
+      {transform && (
+        <TransformSection
+          transforms={[transform]}
+          selectionKey={id}
+          onSetPosition={(field, value) => {
+            client.setField(id, "Transform", field, value);
+            setStatus(`edit Transform.${field}`);
+          }}
+          onSetScale={(value) => {
+            client.setField(id, "Transform", "scale", value);
+            setStatus("edit Transform.scale");
+          }}
+          onSetRotation={(quat) => {
+            setStatus("edit Transform.rotation");
+            void client
+              .setRotation([id], quat)
+              .then((r) => {
+                if (r.ok) {
+                  setStatus("rotation set · Ctrl-Z to undo");
+                  return;
+                }
+                // The engine's own sentence, at the control — a rotation can be refused (a target
+                // with no place in the world, four numbers that are not a rotation) and "nothing
+                // happened" is the one answer a property field must never give.
+                const said = r.reason ?? "the engine refused that rotation";
+                setStatus(said);
+                pushToast(said, "error");
+              })
+              .catch((e: unknown) => console.error("setRotation failed", e));
+          }}
+        />
+      )}
       {hasFields ? (
         <JsonForms
           schema={schema}
-          uischema={buildEntityUiSchema(entity.components)}
-          data={entity.components}
-          renderers={renderers}
+          uischema={buildEntityUiSchema(rest)}
+          data={rest}
+          renderers={inspectorRenderers}
           cells={vanillaCells}
-          onChange={({ data }) => emitChanges(client, id, entity.components, data as Components)}
+          onChange={({ data }) => emitChanges(client, id, rest, data as Components)}
         />
       ) : (
         // THE OTHER EMPTY STATE, AND THE SENTENCE THAT NAMED A CONTROL THAT DOES NOT EXIST. "add a
@@ -120,13 +147,19 @@ export function Inspector({ client }: { client: EditorClient }) {
         // own action list (`entityActions` → the context menu: make dynamic, add a joint, give it a
         // role), so that is what it points at now — the same anatomy as the no-selection state one
         // branch up, because two empty states in one panel that look different is how this began.
-        <EmptyPanelState
-          data-testid="inspectorNoFields"
-          compact
-          icon={<Icon name="properties" size="xl" />}
-          title="No editable properties"
-          description="Nothing on this object exposes an editable field yet. Right-click it for what can be added."
-        />
+        //
+        // Guarded on `!transform` (ADR-172): a Transform-only object HAS an editable property on
+        // screen — the section above it — so "no editable properties" would be contradicted by the
+        // control directly above the sentence.
+        !transform && (
+          <EmptyPanelState
+            data-testid="inspectorNoFields"
+            compact
+            icon={<Icon name="properties" size="xl" />}
+            title="No editable properties"
+            description="Nothing on this object exposes an editable field yet. Right-click it for what can be added."
+          />
+        )
       )}
     </div>
   );

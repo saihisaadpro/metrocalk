@@ -47,12 +47,28 @@ import {
   type UISchemaElement,
 } from "@jsonforms/core";
 import { JsonFormsDispatch, withJsonFormsControlProps, withJsonFormsLayoutProps } from "@jsonforms/react";
-import type { ReactNode } from "react";
+import { createContext, useContext, type ReactNode } from "react";
 import { useStore } from "zustand";
 import { projectionStore } from "../store/projection";
 import { Icon } from "../theme/icons";
 import { Button, NumericField, PropertyRow, SelectField, TextField } from "../theme/primitives";
 import { DisclosureSection } from "../theme/workspace";
+
+/** ADR-169 — the field paths (`Component.field`) a MULTI-SELECTION disagrees about.
+ *
+ *  A context rather than a prop because the controls are reached through JSON Forms' dispatcher,
+ *  which owns the props it passes down and has no slot for "and by the way this is a selection".
+ *  Empty for a single object, which is why every control below behaves exactly as it did before.
+ *
+ *  WHY THE CONTROL, NOT THE PANEL, HAS TO KNOW. "Mixed" is not a value — it is the absence of one
+ *  — and each control shows the absence of a value differently: an empty box with a placeholder,
+ *  a select with an extra option, a checkbox in its indeterminate state. A panel-level banner saying
+ *  "some of these differ" would leave every row still printing the primary's value as though it
+ *  were everyone's, which is the untruth this whole change is about. */
+export const MixedPaths = createContext<ReadonlySet<string>>(new Set<string>());
+
+/** Does the current selection disagree about this control's field? */
+const useMixed = (path: string): boolean => useContext(MixedPaths).has(path);
 
 const hasFormat = (fmt: string) =>
   schemaMatches((s) => (s as { format?: string }).format === fmt);
@@ -82,7 +98,12 @@ function Row({
   children: ReactNode;
 }) {
   const { unit, default: dflt } = schema as { unit?: string; default?: unknown };
-  const resettable = dflt !== undefined && data !== undefined && data !== null && data !== dflt;
+  const mixed = useMixed(path);
+  // A MIXED field has no `data` (that is what mixed means here), and "set every one of them back to
+  // the default" is precisely the action a reset is for — so the row offers it, where an unbound
+  // single field still does not.
+  const resettable =
+    dflt !== undefined && (mixed || (data !== undefined && data !== null && data !== dflt));
   return (
     <PropertyRow
       htmlFor={controlId(path)}
@@ -131,7 +152,8 @@ function NumberControlBase(props: ControlProps) {
   const num = typeof data === "number" ? data : Number(data);
   const value = Number.isFinite(num) ? num : 0;
   // An "unbound/default" cue: the field has no concrete projected value yet (the C6 default state).
-  const unbound = data === undefined || data === null;
+  const mixed = useMixed(path);
+  const unbound = !mixed && (data === undefined || data === null);
   const { minimum, maximum } = schema as { minimum?: number; maximum?: number };
   return (
     <Row {...props}>
@@ -144,7 +166,14 @@ function NumberControlBase(props: ControlProps) {
         max={maximum}
         disabled={enabled === false}
         invalid={unbound}
-        title={unbound ? `${label}: no value set yet` : undefined}
+        mixed={mixed}
+        title={
+          mixed
+            ? `${label}: the selected objects differ — type a value to set all of them`
+            : unbound
+              ? `${label}: no value set yet`
+              : undefined
+        }
         ariaLabel={named(label, schema)}
         data-testid={`num-${path}`}
         onCommit={(v) => handleChange(path, v)}
@@ -239,7 +268,8 @@ export const verticalLayoutTester = rankWith(3, uiTypeIs("VerticalLayout"));
 function EnumControlBase(props: ControlProps) {
   const { data, handleChange, path, label, schema, enabled } = props;
   const options = ((schema as { enum?: unknown[] }).enum ?? []).map(String);
-  const value = typeof data === "string" ? data : "";
+  const mixed = useMixed(path);
+  const value = !mixed && typeof data === "string" ? data : "";
   return (
     <Row {...props}>
       <SelectField
@@ -247,11 +277,15 @@ function EnumControlBase(props: ControlProps) {
         aria-label={named(label, schema)}
         disabled={enabled === false}
         value={value}
-        title={value || undefined}
+        title={mixed ? "The selected objects differ — pick one to set all of them" : value || undefined}
+        data-mixed={mixed ? "1" : undefined}
         data-testid={`enum-${path}`}
         onChange={(e) => handleChange(path, e.target.value)}
         style={{ width: "100%" }}
       >
+        {/* The mixed state is a real option so the closed select can SHOW it; it is never a value the
+            user can choose back to, because "un-set them" is not a thing this control can do. */}
+        {mixed && <option value="" disabled>Mixed</option>}
         {/* A value the core sent that is NOT in the vocabulary must stay visible and selected rather
             than silently reading as the first option — that would show the user a value the entity
             does not have, and committing any other field would then write it. */}
@@ -283,7 +317,8 @@ export const enumTester = rankWith(8, and(isStringControl, isEnum));
 // a blank box. Every part of that is wired.
 function AssetRefControlBase(props: ControlProps) {
   const { data, handleChange, path, label, enabled } = props;
-  const value = typeof data === "string" ? data : "";
+  const mixed = useMixed(path);
+  const value = !mixed && typeof data === "string" ? data : "";
   return (
     <Row {...props}>
       <TextField
@@ -292,8 +327,9 @@ function AssetRefControlBase(props: ControlProps) {
         aria-label={`${label} (asset reference)`}
         disabled={enabled === false}
         value={value}
-        title={value || undefined}
-        placeholder="no asset"
+        title={mixed ? "The selected objects reference different assets" : value || undefined}
+        placeholder={mixed ? "Mixed" : "no asset"}
+        data-mixed={mixed ? "1" : undefined}
         data-testid={`asset-${path}`}
         onChange={(e) => handleChange(path, e.target.value)}
         style={{ width: "100%" }}
@@ -316,7 +352,8 @@ function EntityRefControlBase(props: ControlProps) {
   const options = Object.values(summaries)
     .sort((a, b) => a.name.localeCompare(b.name))
     .slice(0, 200); // never dump 5k into a <select>; the graph is the at-scale picker
-  const value = typeof data === "string" ? data : "";
+  const mixed = useMixed(path);
+  const value = !mixed && typeof data === "string" ? data : "";
   const dangling = value && !options.some((o) => o.id === value);
   // The selected entity's NAME in the title: inside a 320px dock the closed select ellipsises, and a
   // name is the only thing here a user can identify the target by ("Counterwe…" is not one).
@@ -328,12 +365,13 @@ function EntityRefControlBase(props: ControlProps) {
         aria-label={named(label, schema)}
         disabled={enabled === false}
         value={value}
-        title={selectedName ?? (value || undefined)}
+        title={mixed ? "The selected objects point at different entities" : selectedName ?? (value || undefined)}
+        data-mixed={mixed ? "1" : undefined}
         data-testid={`ref-${path}`}
         onChange={(e) => handleChange(path, e.target.value)}
         style={{ width: "100%" }}
       >
-        <option value="">— none —</option>
+        {mixed ? <option value="" disabled>Mixed</option> : <option value="">— none —</option>}
         {/* A reference to an entity that is not in the projection (deleted, or not yet loaded) keeps
             its id on screen. Dropping it would silently re-point the joint at nothing. */}
         {dangling && <option value={value}>{value} — not in this scene</option>}
@@ -355,14 +393,23 @@ export const entityRefTester = rankWith(10, and(isStringControl, hasFormat("enti
 // uses); what this adds is the row it sits in.
 function BooleanControlBase(props: ControlProps) {
   const { data, handleChange, path, label, schema, enabled } = props;
+  const mixed = useMixed(path);
   return (
     <Row {...props}>
       <input
         id={controlId(path)}
         type="checkbox"
         aria-label={named(label, schema)}
+        aria-checked={mixed ? "mixed" : undefined}
         disabled={enabled === false}
         checked={data === true}
+        // A checkbox has a THIRD state and the DOM only reaches it through the property, never an
+        // attribute — so a mixed tick shows as indeterminate rather than as a confident "off".
+        ref={(el) => {
+          if (el) el.indeterminate = mixed;
+        }}
+        title={mixed ? "The selected objects differ — tick to set all of them" : undefined}
+        data-mixed={mixed ? "1" : undefined}
         data-testid={`bool-${path}`}
         onChange={(e) => handleChange(path, e.target.checked)}
       />
@@ -377,13 +424,17 @@ export const booleanTester = rankWith(6, isBooleanControl);
 // last so that a field which is really an asset, a reference or a vocabulary never lands here.
 function StringControlBase(props: ControlProps) {
   const { data, handleChange, path, label, schema, enabled } = props;
+  const mixed = useMixed(path);
   return (
     <Row {...props}>
       <TextField
         id={controlId(path)}
         aria-label={named(label, schema)}
         disabled={enabled === false}
-        value={typeof data === "string" ? data : ""}
+        value={!mixed && typeof data === "string" ? data : ""}
+        placeholder={mixed ? "Mixed" : undefined}
+        title={mixed ? "The selected objects differ — type a value to set all of them" : undefined}
+        data-mixed={mixed ? "1" : undefined}
         data-testid={`text-${path}`}
         onChange={(e) => handleChange(path, e.target.value)}
         style={{ width: "100%" }}
@@ -393,3 +444,29 @@ function StringControlBase(props: ControlProps) {
 }
 export const StringControl = withJsonFormsControlProps(StringControlBase);
 export const stringTester = rankWith(4, isStringControl);
+
+/** **THE REGISTRY — ONE LIST, TWO PANELS.**
+ *
+ *  `vanillaRenderers` IS DELIBERATELY NOT HERE (ADR-136). It used to be spread in as the fallback, and
+ *  it is what every boolean, plain string and vocabulary field in the inspector actually rendered
+ *  through — emitting `.control`, `.input`, `.select` and `.checkbox`, generic class names this
+ *  repository's stylesheet has no rules for and that `check-class-hooks.mjs` cannot see, because they
+ *  come out of `node_modules` rather than out of the markup it reads. The set below covers every scalar
+ *  `FieldType` the core can register (Number · Integer · Boolean · String, plus the `format` and
+ *  vocabulary refinements), so there is nothing left for a fallback to catch — and its absence is what
+ *  lets a `shots` scene assert those four class names are not on the page. `vanillaCells` stays: cells
+ *  are the array/table path, which this inspector does not use, and JsonForms wants a non-empty list.
+ *
+ *  It lives HERE rather than in `Inspector.tsx` because ADR-169 gave it a second consumer. A
+ *  multi-selection form that resolved one control differently from the single-object form would be a
+ *  drift nothing could see — both panels read this array. */
+export const inspectorRenderers = [
+  { tester: stringTester, renderer: StringControl },
+  { tester: numberTester, renderer: NumberControl },
+  { tester: booleanTester, renderer: BooleanControl },
+  { tester: enumTester, renderer: EnumControl },
+  { tester: assetRefTester, renderer: AssetRefControl },
+  { tester: entityRefTester, renderer: EntityRefControl },
+  { tester: groupTester, renderer: CollapsibleGroup },
+  { tester: verticalLayoutTester, renderer: VerticalLayout },
+];

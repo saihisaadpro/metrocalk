@@ -961,7 +961,10 @@ progress { accent-color: var(--mtk-accent-solid); }
 .mtk-compact-popup__body { max-height: min(440px, calc(100vh - 120px)); overflow: auto; padding: var(--mtk-space-3); }
 .mtk-dialog-surface {
   box-sizing: border-box;
-  width: min(560px, calc(100vw - 32px));
+  /* A dialog widens through the token, never through an inline `width` that would then have to
+     restate the viewport clamp beside it — a confirmation and a two-column task dialog are the same
+     surface at two sizes. */
+  width: min(var(--mtk-dialog-width, 560px), calc(100vw - 32px));
   max-height: min(760px, calc(100vh - 32px));
   overflow: auto;
   padding: var(--mtk-space-6);
@@ -972,8 +975,186 @@ progress { accent-color: var(--mtk-accent-solid); }
   box-shadow: var(--mtk-shadow-4);
   color-scheme: light;
 }
+.mtk-dialog-surface--flush { padding: 0; overflow: hidden; }
 body > [role="dialog"][aria-modal="true"] {
   background: var(--mtk-overlay-scrim) !important;
+}
+
+/* ── The export task dialog (ADR-174) ────────────────────────────────────────────────────────────
+   A rail of writable formats beside a pane that holds the SAME region through all three moments of
+   the workflow — the options, the run, and the exporter's ledger. The pane scrolls; the footer does
+   not, so the one primary action is never the thing below the fold. */
+.mtk-export { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: 420px; }
+.mtk-export__rail {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--mtk-bg-panel);
+  border-right: 1px solid var(--mtk-border-subtle);
+}
+/* Type comes from `DialogTitle` (`text.panelTitle` at `fontSize.heading`), so this rule states only
+   the box — a second font stack here would be the per-dialog styling the shared title exists to end. */
+.mtk-export__title {
+  margin: 0;
+  padding: var(--mtk-space-6) var(--mtk-space-6) var(--mtk-space-3);
+}
+/* The rail sits inside a column that already paints the panel surface and draws the divider, so its
+   own copies of both would double the hairline and re-tint the tint. */
+.mtk-export .mtk-nav-rail {
+  flex: 1 1 auto;
+  width: auto;
+  padding: var(--mtk-space-2) var(--mtk-space-3);
+  background: transparent;
+  border-right: none;
+}
+.mtk-export__subject {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: none;
+  min-width: 0;
+  margin: var(--mtk-space-3);
+  padding: var(--mtk-space-3) var(--mtk-space-4);
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-lg);
+  background: var(--mtk-bg-raised);
+}
+.mtk-export__subject-name {
+  overflow: hidden;
+  font: 600 13px/1.3 var(--mtk-font-ui);
+  color: var(--mtk-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mtk-export__subject-count { font-size: 12px; color: var(--mtk-text-muted); }
+
+.mtk-export__pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.mtk-export__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mtk-space-6);
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: var(--mtk-space-6) var(--mtk-space-7);
+  overflow: hidden auto;
+}
+.mtk-export__head { display: flex; align-items: center; gap: var(--mtk-space-3); flex-wrap: wrap; }
+/* Type from `SectionHeader variant="panel"`; the rule keeps only the box. */
+.mtk-export__format { margin: 0; }
+.mtk-export__ext { font: 12px/1 var(--mtk-font-mono); color: var(--mtk-text-muted); }
+.mtk-export__note { margin: 0; font-size: 13px; line-height: 1.5; color: var(--mtk-text-secondary); }
+/* A heading and the block it labels are ONE unit: 6px apart, 16px from the next unit. Without the
+   grouping every legend sat at the body's 16px from both its own list and the block above it, so
+   "what was written" and "what it cost" read as four unrelated strips instead of two sections. */
+.mtk-export__block { display: grid; gap: var(--mtk-space-3); align-content: start; }
+.mtk-export__report { display: grid; gap: var(--mtk-space-6); align-content: start; }
+/* Type from `SectionHeader variant="eyebrow"` (`text.eyebrow`); the rule keeps only the box. */
+.mtk-export__legend {
+  margin: 0;
+}
+
+/* Two columns of nine capabilities: at the dialog's width one column would run past the fold and
+   make "what does this write" a scroll rather than a glance. */
+.mtk-export__carries {
+  display: grid;
+  gap: var(--mtk-space-3) var(--mtk-space-6);
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mtk-export__carry {
+  display: flex;
+  align-items: center;
+  gap: var(--mtk-space-3);
+  min-width: 0;
+  font-size: 13px;
+  color: var(--mtk-text);
+}
+/* Carried and not-carried differ by MARK first (check vs dash) and only then by weight, so the
+   distinction survives greyscale and a colour-vision difference. */
+.mtk-export__carry[data-carried="true"] { color: var(--mtk-text); }
+.mtk-export__carry[data-carried="true"] > svg { color: var(--mtk-success); }
+/* `--mtk-text-faint` measured 3.73:1 on the dialog's white and this is body text, not an inactive
+   control's label, so it is held to 4.5:1 (WCAG 2.2 SC 1.4.3). The MARK may sit at the 3:1 that
+   applies to a graphic, which is what keeps the two states distinguishable at a glance. */
+.mtk-export__carry[data-carried="false"] { color: var(--mtk-text-muted); }
+.mtk-export__carry[data-carried="false"] > svg { color: var(--mtk-text-faint); }
+
+.mtk-export__cost {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--mtk-space-3);
+  padding: var(--mtk-space-3) var(--mtk-space-4);
+  border: 1px solid var(--mtk-warn-border);
+  border-radius: var(--mtk-radius-lg);
+  background: var(--mtk-warn-bg);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--mtk-text-secondary);
+}
+.mtk-export__cost > svg { flex: none; margin-top: 2px; color: var(--mtk-warn); }
+.mtk-export__cost strong { color: var(--mtk-text); }
+
+.mtk-export__counts {
+  display: flex;
+  gap: var(--mtk-space-6);
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mtk-export__counts li { display: flex; align-items: baseline; gap: var(--mtk-space-2); }
+.mtk-export__counts strong { font: 600 18px/1.2 var(--mtk-font-ui); color: var(--mtk-text); }
+.mtk-export__counts span { font-size: 12px; color: var(--mtk-text-muted); }
+.mtk-export__path {
+  margin: 0;
+  overflow: hidden;
+  padding: var(--mtk-space-2) var(--mtk-space-3);
+  border-radius: var(--mtk-radius-sm);
+  background: var(--mtk-bg-inset);
+  font: 12px/1.5 var(--mtk-font-mono);
+  color: var(--mtk-text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mtk-export__ledger { display: grid; gap: var(--mtk-space-3); margin: 0; padding: 0; list-style: none; }
+/* A FIXED badge track, not `auto`: `preserved`, `converted` and `omitted` are three widths, and an
+   auto track starts each feature name at a different x — three rows that never line up. */
+.mtk-export__ledger li { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: var(--mtk-space-4); align-items: start; }
+.mtk-export__ledger .mtk-badge { justify-self: start; }
+.mtk-export__ledger strong { display: block; font: 600 13px/1.4 var(--mtk-font-ui); color: var(--mtk-text); }
+.mtk-export__ledger span { font-size: 12px; line-height: 1.5; color: var(--mtk-text-secondary); }
+.mtk-export__failure {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--mtk-space-3);
+  padding: var(--mtk-space-4);
+  border: 1px solid var(--mtk-danger-border);
+  border-radius: var(--mtk-radius-lg);
+  background: var(--mtk-danger-bg);
+}
+.mtk-export__failure > svg { flex: none; margin-top: 1px; color: var(--mtk-danger); }
+.mtk-export__failure p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--mtk-text); }
+
+.mtk-export__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--mtk-space-4);
+  flex: none;
+  padding: var(--mtk-space-5) var(--mtk-space-7);
+  border-top: 1px solid var(--mtk-border-subtle);
+  background: var(--mtk-bg-panel);
+}
+
+/* Below the rail's own breakpoint the dialog stacks: the rail becomes the horizontal strip
+   `.mtk-nav-rail` already turns into, and the pane takes the full width under it. */
+@media (max-width: 860px) {
+  .mtk-export { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .mtk-export__rail { border-right: none; border-bottom: 1px solid var(--mtk-border-subtle); }
+  .mtk-export__title { padding-bottom: 0; }
+  .mtk-export__body { padding: var(--mtk-space-5); }
+  .mtk-export__foot { padding: var(--mtk-space-5); }
 }
 
 /* ── Inspector property rows + collapsible groups (M14.3 / ADR-059) ── */

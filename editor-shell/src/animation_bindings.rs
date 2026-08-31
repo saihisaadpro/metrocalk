@@ -206,30 +206,14 @@ pub fn built_in_animation_binding_descriptors() -> Vec<AnimationBindingDescripto
             AnimationRuntimeSink::TransformProjection,
         ));
     }
-    // These fields exist in the core schema, but the current native animation projection does not
-    // consume them. Keeping them visible-but-disabled prevents schema presence being mistaken for a sink.
-    for property in ["rx", "ry", "rz"] {
-        out.push(unsupported(
-            "Transform",
-            property,
-            &format!("Euler rotation {}", axis_label(property)),
-            ValueKind::Number,
-            &spatial,
-            Scalar,
-            Rotation,
-        ));
-    }
-    for property in ["sx", "sy", "sz"] {
-        out.push(unsupported(
-            "Transform",
-            property,
-            &format!("Scale {}", axis_label(property)),
-            ValueKind::Number,
-            &spatial,
-            Scalar,
-            Scale,
-        ));
-    }
+    // ADR-172 — `rx`/`ry`/`rz` and `sx`/`sy`/`sz` used to be listed here, visible-but-disabled, with
+    // the reason "these fields exist in the core schema but the native projection does not consume
+    // them". They existed in the core schema and NOWHERE ELSE: no writer in this repository has ever
+    // put one on a `Transform`, `local_transform` does not read them, and the projection at
+    // `main.rs`'s animation sink rejects them by name. `stdlib.rs` no longer declares them, so the
+    // sentence they were kept for is gone and six catalog rows that could never bind are gone with
+    // it. A row that names a property nothing stores is the inert control `<ux_quality>` 6 forbids,
+    // in a data table.
 
     for component in ["KinematicJoint", "Joint"] {
         out.push(requires_validation(
@@ -790,13 +774,19 @@ mod tests {
     #[test]
     fn core_metadata_is_used_and_schema_drift_remains_visible() {
         let registry = AnimationBindingRegistry::standard();
-        let canonical = registry.descriptor("Transform", "px").unwrap();
+        // ADR-172 — THE TWO SWAPPED. This assertion used to read `px` canonical and `x` the
+        // metadata-less alias, which is exactly backwards: `x` is the field every writer writes and
+        // every reader reads, and `px` was a name only the registry had heard of. Correcting
+        // `stdlib.rs` moved the diagnostic to the property that actually lacks metadata, and the
+        // check still proves the same thing — the registry reads the core's schema rather than
+        // asserting its own.
+        let canonical = registry.descriptor("Transform", "x").unwrap();
         assert!(!has_diagnostic(
             canonical,
             AnimationBindingDiagnosticCode::PropertyMetadataMissing
         ));
 
-        let runtime_alias = registry.descriptor("Transform", "x").unwrap();
+        let runtime_alias = registry.descriptor("Transform", "px").unwrap();
         assert_eq!(runtime_alias.readiness, AnimationReadiness::Ready);
         assert!(has_diagnostic(
             runtime_alias,
@@ -804,10 +794,10 @@ mod tests {
         ));
 
         let bad_metadata = [ComponentMeta::builder("Transform")
-            .field("px", FieldType::String, true)
+            .field("x", FieldType::String, true)
             .build()];
         let mismatched = AnimationBindingRegistry::with_component_metadata(&bad_metadata);
-        let descriptor = mismatched.descriptor("Transform", "px").unwrap();
+        let descriptor = mismatched.descriptor("Transform", "x").unwrap();
         assert_eq!(descriptor.readiness, AnimationReadiness::Unsupported);
         assert_eq!(descriptor.runtime_sink, None);
         assert!(has_diagnostic(

@@ -55,6 +55,18 @@ export type ProjectionOp =
   | { op: "addEdge"; from: string; rel: string; to: string }
   | { op: "removeEdge"; from: string; rel: string; to: string };
 
+/** What a batched multi-entity edit did — or, when it refused, the one sentence that says why
+ *  (ADR-169). A property control that edits a whole selection must be able to answer "nothing
+ *  happened" with a reason; `boolean` could not, and this path is the one the Inspector now uses for
+ *  every field on a multi-selection. */
+export interface MultiEditResult {
+  ok: boolean;
+  /** How many entities the transaction wrote. `0` on a refusal — the pipeline is all-or-nothing. */
+  changed: number;
+  /** Plain-language refusal, `null` on success. */
+  reason: string | null;
+}
+
 /** A merge-validation rejection — the north-star "every 'no' explained". */
 export interface RejectInfo {
   clientOpId: string;
@@ -1430,6 +1442,17 @@ export interface AssetLabResponse {
   exportedPath: string | null;
   bakeEvidence: AssetLabBakeEvidence | null;
 }
+
+/**
+ * Every `format` argument `scene_export` acts on — the mirror of `formats::EXPORT_ARGS`.
+ *
+ * It is the full set, not the three spellings the File menu used to hardcode, because the export
+ * dialog addresses a format by its CANONICAL EXTENSION (`extensions[0]` of its `FormatSpec`) rather
+ * than by a second hand-written mapping — and two of those canonical extensions (`stp`, `usda`) are
+ * spellings the old union did not name. `every_writable_format_is_addressable_by_its_canonical_extension`
+ * in `editor-shell/src/formats.rs` is the test that keeps the two sides of that derivation paired.
+ */
+export type SceneExportFormat = "glb" | "usda" | "usd" | "step" | "stp";
 
 /** One machine-readable fidelity decision from complete-scene export. */
 export interface SceneExportFidelity {

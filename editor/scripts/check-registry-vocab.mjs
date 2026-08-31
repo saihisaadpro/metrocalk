@@ -25,11 +25,26 @@
 //!   * `ui_hint` carries the core's closed vocabularies (`"enum: directional|point|spot"`) and its
 //!     units (`"companion move speed, metres per second"`). Nothing in the editor reads `ui_hint`.
 //!
-//! Even `Transform` is wrong in the same way: the table says `x`/`y`/`z`, the core registers
-//! `px`/`py`/`pz` plus rotation and scale. That one is survivable — `buildEntitySchema` falls back to
-//! inferring from the projected value, and a Number infers to a number — which is precisely why it
-//! went unnoticed: the fallback is good enough to hide a table that is wrong, and only the fields
-//! where inference produces the WRONG CONTROL fail visibly.
+//! **AND THE ONE THIS GATE GOT BACKWARDS — read this before trusting a green run (ADR-172).** The
+//! paragraph here used to say: *"Even `Transform` is wrong in the same way: the table says
+//! `x`/`y`/`z`, the core registers `px`/`py`/`pz` plus rotation and scale. That one is survivable."*
+//! It was survivable, and it was also **the only entry where the TABLE was right and the CORE was
+//! wrong**. Every writer in the shell commits `Transform{x, y, z}` + a quaternion + a uniform
+//! `scale`; `capscene::local_transform` reads the same eight names; the dev `MockCore` seeds them;
+//! `.mtk` files on disk contain them. `px`/`py`/`pz`/`rx`..`sz` were declared in `stdlib.rs` in M1.3
+//! and **written by nothing, ever**. Repairing the table to match the registry therefore made the
+//! editor agree with the half that was fiction, and this gate then held it there: the curated
+//! `Transform` entry could not fire on any entity in this product, ADR-155's vector rows were
+//! declared over the same phantom fields and could not fire either, and both were photographed by a
+//! `shots` scene that seeded `px/py/pz` **to prove it was capturing the real vocabulary**.
+//!
+//! The lesson is not about Transform. **This gate compares two statements of a contract; it cannot
+//! tell you that BOTH are wrong.** What settles which one is right is the code that WRITES and READS
+//! the document, and no static check here can see it — so the comparison to the writer lives where
+//! the writer does: `stdlib_transform_matches_the_stored_transform` (`editor-shell/tests/
+//! transform_commit.rs`) commits a pose through the only writer and compares the document's own key
+//! set to `stdlib.rs`'s declaration. When you next find this gate disagreeing with the editor, ask
+//! which of the two the ENGINE agrees with before repairing either.
 //!
 //! NOT ONE GATE COULD SEE IT. `tsc` type-checks the table against `JsonSchema7`, which is a shape, not
 //! a vocabulary. vitest seeds `MockCore`'s entities, so every test agrees with the mock by

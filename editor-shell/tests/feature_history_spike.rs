@@ -178,7 +178,7 @@ fn property_d_concurrent_feature_history_merges() {
                 Op::SetField {
                     entity: id,
                     component: "Transform".into(),
-                    field: "px".into(),
+                    field: "x".into(),
                     value: FieldValue::Number(x),
                 },
                 Op::SetField {

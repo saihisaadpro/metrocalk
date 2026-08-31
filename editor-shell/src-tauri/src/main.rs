@@ -2379,9 +2379,11 @@ enum EngineCmd {
         reply: Sender<Result<metrocalk_editor_shell::match_cook::AuthoredMatch, String>>,
     },
     /// Duplicate an entity (M3.3) — one undoable transaction; replies the new id.
+    /// Duplicate N entities as ONE undoable transaction (M3.3 for one, ADR-169 for a selection) →
+    /// reply the new ids in source order, empty on refusal.
     Duplicate {
-        id: String,
-        reply: Sender<Option<String>>,
+        ids: Vec<String>,
+        reply: Sender<Vec<String>>,
     },
     /// Entity details for the hover tooltip (M3.3) — a read.
     Details {
@@ -3095,17 +3097,27 @@ enum EngineCmd {
         id: String,
         reply: Sender<bool>,
     },
-    /// Multi-edit — set one numeric field on N entities as ONE batched, atomic, undoable tx → reply applied.
+    /// Multi-edit — set one field (ANY scalar, not only a number — ADR-169) on N entities as ONE
+    /// batched, atomic, undoable tx → reply how many were written, or the plain-language refusal.
     MultiEdit {
         ids: Vec<String>,
         component: String,
         field: String,
-        value: f64,
-        reply: Sender<bool>,
+        value: FieldValue,
+        reply: Sender<Result<usize, String>>,
     },
-    /// Delete = deactivate (M10.6, non-destructive; frees dependents) → reply applied.
+    /// Set a rotation (ADR-172) — a normalised quaternion onto N entities as ONE batched, atomic,
+    /// undoable tx → reply how many were written, or the plain-language refusal. Four stored numbers
+    /// are ONE property; this is the only path that can write them together.
+    SetRotation {
+        ids: Vec<String>,
+        quat: [f64; 4],
+        reply: Sender<Result<usize, String>>,
+    },
+    /// Delete = deactivate (M10.6, non-destructive; frees dependents) — N entities as ONE undoable
+    /// transaction (ADR-169), so one Ctrl-Z restores the whole selection → reply applied.
     DeleteDeactivate {
-        id: String,
+        ids: Vec<String>,
         reply: Sender<bool>,
     },
     /// Copy a sub-tree to the clipboard (a read → fills the thread clipboard).
@@ -9351,11 +9363,23 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 }
                 let _ = reply.send(authored);
             }
-            EngineCmd::Duplicate { id, reply } => {
-                let new = EntityId::from_loro_key(&id)
-                    .and_then(|e| capscene::duplicate_entity(&mut engine, &scene, e).ok());
-                if let Some(new_id) = new {
-                    log.append(&Record::Duplicate { source: id.clone() });
+            EngineCmd::Duplicate { ids, reply } => {
+                // ONE transaction for the whole selection (ADR-169): the Actions menu counts the
+                // selection on its own trigger, and N separate commits would answer "duplicated 12"
+                // with twelve undo steps behind a toast that promises one.
+                let srcs: Vec<EntityId> = ids
+                    .iter()
+                    .filter_map(|s| EntityId::from_loro_key(s))
+                    .collect();
+                let new = if srcs.len() == ids.len() && !srcs.is_empty() {
+                    capscene::duplicate_entities(&mut engine, &scene, &srcs).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                for (source, &new_id) in ids.iter().zip(new.iter()) {
+                    log.append(&Record::Duplicate {
+                        source: source.clone(),
+                    });
                     echo_created(
                         &mut engine,
                         &shared,
@@ -9367,7 +9391,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         new_id,
                     );
                 }
-                let _ = reply.send(new.map(|n| n.to_loro_key()));
+                let _ = reply.send(new.iter().map(EntityId::to_loro_key).collect());
             }
             // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable commit → re-project the scene.
             // (Verbs persist via the M10.3 `.mtk` save/open — the Loro doc; the in-session replay-log
@@ -11790,30 +11814,75 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .iter()
                     .filter_map(|s| EntityId::from_loro_key(s))
                     .collect();
-                let ok = !targets.is_empty()
-                    && capscene::multi_edit(
-                        &mut engine,
-                        &targets,
-                        &component,
-                        &field,
-                        &FieldValue::Number(value),
-                    )
-                    .is_ok();
-                if ok {
+                // Every refusal on this path now carries the sentence that explains it, because the
+                // Inspector edits a whole selection through it and "nothing happened" is the one
+                // answer a property field must never give.
+                let outcome = if targets.is_empty() {
+                    Err("nothing is selected".to_owned())
+                } else if targets.len() != ids.len() {
+                    Err("part of the selection is no longer in the scene".to_owned())
+                } else {
+                    capscene::multi_edit(&mut engine, &targets, &component, &field, &value)
+                        .map(|()| targets.len())
+                        .map_err(|e| e.to_string())
+                };
+                if outcome.is_ok() {
+                    // ADR-172 — PERSIST IT. `Record::Edit` covers the one-object path; the batched
+                    // one had no record, so a selection edit survived a `.mtk` save and was lost by
+                    // the session replay a crash recovers through.
+                    log.append(&Record::MultiEdit {
+                        ids: ids.clone(),
+                        component: component.clone(),
+                        field: field.clone(),
+                        value: value.clone(),
+                    });
                     if let Some(ch) = &channel {
                         send_proj!(ch, proj_full(&engine, &scene));
                     }
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
-                let _ = reply.send(ok);
+                let _ = reply.send(outcome);
             }
-            EngineCmd::DeleteDeactivate { id, reply } => {
-                let ok = EntityId::from_loro_key(&id)
-                    .is_some_and(|e| capscene::delete_deactivate(&mut engine, &scene, e).is_ok());
+            EngineCmd::SetRotation { ids, quat, reply } => {
+                let targets: Vec<EntityId> = ids
+                    .iter()
+                    .filter_map(|s| EntityId::from_loro_key(s))
+                    .collect();
+                let outcome = if targets.is_empty() {
+                    Err("nothing is selected".to_owned())
+                } else if targets.len() != ids.len() {
+                    Err("part of the selection is no longer in the scene".to_owned())
+                } else {
+                    capscene::set_rotation(&mut engine, &targets, quat)
+                        .map(|()| targets.len())
+                        .map_err(|e| e.to_string())
+                };
+                if outcome.is_ok() {
+                    log.append(&Record::SetRotation {
+                        ids: ids.clone(),
+                        quat,
+                    });
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, proj_full(&engine, &scene));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(outcome);
+            }
+            EngineCmd::DeleteDeactivate { ids, reply } => {
+                let targets: Vec<EntityId> = ids
+                    .iter()
+                    .filter_map(|s| EntityId::from_loro_key(s))
+                    .collect();
+                let ok = !targets.is_empty()
+                    && targets.len() == ids.len()
+                    && capscene::delete_deactivate_many(&mut engine, &scene, &targets).is_ok();
                 if ok {
                     // Persist the deactivate so it SURVIVES reload (R-NEXT-2) — replay re-runs it, and
                     // `project_full` then re-emits `active:false` so the hierarchy dims the row on reopen.
-                    log.append(&Record::DeleteDeactivate { id: id.clone() });
+                    for id in &ids {
+                        log.append(&Record::DeleteDeactivate { id: id.clone() });
+                    }
                     if let Some(ch) = &channel {
                         send_proj!(ch, proj_full(&engine, &scene));
                     }
@@ -14271,7 +14340,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 reply,
             } => {
                 let normalized = format.to_ascii_lowercase();
-                if !matches!(normalized.as_str(), "glb" | "usda" | "usd" | "step" | "stp") {
+                // The accepted set lives in `formats::EXPORT_ARGS` because the export dialog also
+                // has to know it — it derives its argument from each writable format's canonical
+                // extension, and a second copy here is what would let the two drift apart.
+                if !metrocalk_editor_shell::formats::export_arg_accepted(&normalized) {
                     let _ = reply.send(SceneExportResponse {
                         message: format!(
                             "Unsupported scene format '{format}'; choose GLB, ASCII USDA, or STEP"
@@ -21381,12 +21453,33 @@ fn remove_entity(state: State<AppState>, id: String) {
 }
 
 /// Duplicate an entity (M3.3) — one undoable transaction; returns the clone's id.
+/// The one-entity form of [`duplicate_entities`]; both ride the same engine arm so the two can never
+/// disagree about what a duplicate is.
 #[tauri::command(async)]
 fn duplicate_entity(state: State<AppState>, id: String) -> Option<String> {
     ipc();
     let (reply, rx) = mpsc::channel();
-    if state.tx.send(EngineCmd::Duplicate { id, reply }).is_err() {
+    if state
+        .tx
+        .send(EngineCmd::Duplicate {
+            ids: vec![id],
+            reply,
+        })
+        .is_err()
+    {
         return None;
+    }
+    recv_reply(&rx).unwrap_or_default().into_iter().next()
+}
+
+/// ADR-169 — duplicate a whole SELECTION as ONE undoable transaction; returns the clones' ids in
+/// source order (empty on refusal). One Ctrl-Z removes all of them.
+#[tauri::command(async)]
+fn duplicate_entities(state: State<AppState>, ids: Vec<String>) -> Vec<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state.tx.send(EngineCmd::Duplicate { ids, reply }).is_err() {
+        return Vec::new();
     }
     recv_reply(&rx).unwrap_or_default()
 }
@@ -24693,16 +24786,49 @@ fn ungroup_entity(state: State<AppState>, id: String) -> bool {
     recv_reply(&rx).unwrap_or(false)
 }
 
-/// M10.6 — multi-edit: set one numeric field on N entities as ONE batched, atomic, undoable tx.
+/// The reply a multi-edit gives back: what it did, and — when it refused — why, in one sentence a
+/// panel can print beside the control that asked (`<ux_quality>` 1 and 4).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct MultiEditResult {
+    ok: bool,
+    /// How many entities the transaction wrote. `0` on a refusal — the pipeline is all-or-nothing.
+    changed: usize,
+    /// Plain-language refusal, `None` on success.
+    reason: Option<String>,
+}
+
+impl MultiEditResult {
+    fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            changed: 0,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+/// M10.6 — multi-edit: set one field on N entities as ONE batched, atomic, undoable tx.
+///
+/// **ADR-169 widened `value` from `f64` to any scalar.** It was declared `f64` and the engine wrapped
+/// it in `FieldValue::Number`, so the only property a selection could ever be edited through was a
+/// number — no material, no vocabulary, no boolean. Two `.exe` specs had already been written against
+/// the wider contract they assumed existed (`play-rules.e2e.js` passes `"BossArena"` and `false`);
+/// against an `f64` parameter those invokes cannot deserialise.
 #[tauri::command(async)]
 fn multi_edit(
     state: State<AppState>,
     ids: Vec<String>,
     component: String,
     field: String,
-    value: f64,
-) -> bool {
+    value: serde_json::Value,
+) -> MultiEditResult {
     ipc();
+    let Some(fv) = metrocalk_editor_shell::bridge::json_to_field(&value) else {
+        return MultiEditResult::refused(format!(
+            "{component}.{field} cannot hold that kind of value"
+        ));
+    };
     let (reply, rx) = mpsc::channel();
     if state
         .tx
@@ -24710,7 +24836,66 @@ fn multi_edit(
             ids,
             component,
             field,
-            value,
+            value: fv,
+            reply,
+        })
+        .is_err()
+    {
+        return MultiEditResult::refused("the engine is not accepting edits");
+    }
+    match recv_reply(&rx) {
+        Ok(Ok(changed)) => MultiEditResult {
+            ok: true,
+            changed,
+            reason: None,
+        },
+        Ok(Err(reason)) => MultiEditResult::refused(reason),
+        Err(_) => MultiEditResult::refused("the engine did not answer"),
+    }
+}
+
+/// ADR-172 — **set a rotation**: a quaternion onto N entities as ONE batched, atomic, undoable tx.
+///
+/// The Inspector rendered `qx`/`qy`/`qz`/`qw` as four independent number boxes, so a rotation could
+/// only be typed one component at a time — four transactions, four undo steps, and a quaternion of
+/// length ≠ 1 in between (and after, if the user stopped). `multi_edit` could not stand in for this:
+/// it writes ONE field to N entities, and a rotation is FOUR fields to N entities. The engine
+/// normalises, so no caller — panel, AI patch, MCP tool or script — can leave a non-rotation behind.
+#[tauri::command(async)]
+fn set_rotation(state: State<AppState>, ids: Vec<String>, quat: Vec<f64>) -> MultiEditResult {
+    ipc();
+    let Ok(quat) = <[f64; 4]>::try_from(quat.as_slice()) else {
+        return MultiEditResult::refused("a rotation is four numbers (qx, qy, qz, qw)");
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::SetRotation { ids, quat, reply })
+        .is_err()
+    {
+        return MultiEditResult::refused("the engine is not accepting edits");
+    }
+    match recv_reply(&rx) {
+        Ok(Ok(changed)) => MultiEditResult {
+            ok: true,
+            changed,
+            reason: None,
+        },
+        Ok(Err(reason)) => MultiEditResult::refused(reason),
+        Err(_) => MultiEditResult::refused("the engine did not answer"),
+    }
+}
+
+/// M10.6 — delete = deactivate (non-destructive; frees dependents); reply applied.
+/// The one-entity form of [`delete_deactivate_many`], through the same engine arm.
+#[tauri::command(async)]
+fn delete_deactivate(state: State<AppState>, id: String) -> bool {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::DeleteDeactivate {
+            ids: vec![id],
             reply,
         })
         .is_err()
@@ -24720,14 +24905,14 @@ fn multi_edit(
     recv_reply(&rx).unwrap_or(false)
 }
 
-/// M10.6 — delete = deactivate (non-destructive; frees dependents); reply applied.
+/// ADR-169 — delete a whole SELECTION as ONE undoable transaction, so one Ctrl-Z restores all of it.
 #[tauri::command(async)]
-fn delete_deactivate(state: State<AppState>, id: String) -> bool {
+fn delete_deactivate_many(state: State<AppState>, ids: Vec<String>) -> bool {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state
         .tx
-        .send(EngineCmd::DeleteDeactivate { id, reply })
+        .send(EngineCmd::DeleteDeactivate { ids, reply })
         .is_err()
     {
         return false;
@@ -27409,6 +27594,9 @@ fn main() {
             group_entities,
             ungroup_entity,
             multi_edit,
+            set_rotation,
+            delete_deactivate_many,
+            duplicate_entities,
             delete_deactivate,
             copy_subtree,
             cut_subtree,

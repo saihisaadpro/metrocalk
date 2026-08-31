@@ -365,6 +365,21 @@ pub fn import_extensions() -> Vec<&'static str> {
     out
 }
 
+/// Every `format` argument the `scene_export` command will act on.
+///
+/// It lives here rather than inline in the command because there are two statements of this set and
+/// they must agree: the command's guard, and the export UI, which derives its argument from a
+/// format's canonical extension so it never carries a second hand-written table. A writer landing
+/// with a canonical extension missing from this list would appear in the export dialog and refuse.
+pub const EXPORT_ARGS: &[&str] = &["glb", "usda", "usd", "step", "stp"];
+
+/// True when [`EXPORT_ARGS`] contains `arg` (case-insensitive, leading dot tolerated).
+#[must_use]
+pub fn export_arg_accepted(arg: &str) -> bool {
+    let lower = arg.trim_start_matches('.').to_ascii_lowercase();
+    EXPORT_ARGS.contains(&lower.as_str())
+}
+
 /// The spec matching a file extension (case-insensitive), if any.
 #[must_use]
 pub fn spec_for_extension(ext: &str) -> Option<FormatSpec> {
@@ -482,6 +497,42 @@ mod tests {
         let msg = explain_unsupported("turbine.sldprt");
         assert!(msg.contains("sldprt"), "{msg}");
         assert!(msg.contains("step") || msg.contains("stp"), "{msg}");
+    }
+
+    #[test]
+    fn every_writable_format_is_addressable_by_its_canonical_extension() {
+        // The pairing this exists to make: the catalogue declares which formats can be WRITTEN, and
+        // `scene_export`'s guard declares which `format` arguments it will act on. Those were two
+        // statements in two files that nothing compared, and the export dialog now bridges them by
+        // deriving its argument from `extensions[0]` rather than restating the mapping. A writer
+        // added with a canonical extension this guard does not accept would therefore be offered in
+        // the dialog and refuse at the click — which is the failure this turns into a red test.
+        for spec in format_catalog() {
+            if !spec.direction.writes() {
+                continue;
+            }
+            let canonical = spec.extensions[0];
+            assert!(
+                export_arg_accepted(canonical),
+                "{} can be written but scene_export rejects its canonical extension '{canonical}'",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_export_argument_set_refuses_a_spelling_outside_it() {
+        // The negative control. Without it the assertion above would still pass if
+        // `export_arg_accepted` returned true for everything, and a gate that accepts everything
+        // reports the same green as one that compared the right things.
+        assert!(export_arg_accepted("STEP"), "case must not matter");
+        assert!(export_arg_accepted(".usda"), "a leading dot is tolerated");
+        assert!(
+            !export_arg_accepted("gltf"),
+            "'gltf' is a real extension of a writable format and is still NOT an accepted argument"
+        );
+        assert!(!export_arg_accepted("fbx"));
+        assert!(!export_arg_accepted(""));
     }
 
     #[test]

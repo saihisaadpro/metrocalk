@@ -105,8 +105,12 @@ describe("acceptance / M10.6 — scene-authoring verbs (the hierarchy as a real 
 
     // The same command the toolbar's "Move (all)" dispatches: set Transform.y on EVERY selected entity in
     // ONE undoable transaction.
-    const ok = await invoke("multi_edit", { ids, component: "Transform", field: "y", value: 7.0 });
-    expect(ok).toBe(true);
+    // ADR-169 widened the reply from `bool` to `{ok, changed, reason}`, because a property control
+    // that edits a whole selection has to be able to say WHY nothing happened.
+    const res = await invoke("multi_edit", { ids, component: "Transform", field: "y", value: 7.0 });
+    expect(res.ok).toBe(true);
+    expect(res.changed).toBe(3);
+    expect(res.reason).toBe(null);
     await browser.waitUntil(
       async () => (await Promise.all(ids.map(yOf))).every((y) => Math.abs(y - 7.0) < 0.01),
       { timeout: 5000, timeoutMsg: "the batched multi-edit never moved all 3" }

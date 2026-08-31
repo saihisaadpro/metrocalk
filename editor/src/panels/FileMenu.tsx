@@ -23,7 +23,14 @@ import type { EditorClient } from "../transport/session";
 /** The file's display name *with* its extension (so a save names the real file, not a stem). */
 const fileName = (path: string | null): string | null => (path ? (path.split(/[\\/]/).pop() ?? path) : null);
 
-export function FileMenu({ client }: { client: EditorClient }) {
+export interface FileMenuProps {
+  client: EditorClient;
+  /** Open the export task dialog. The dialog is owned by `App` so the command palette can reach the
+   *  same one surface — a second instance behind the menu would be a second answer to one question. */
+  onExport: () => void;
+}
+
+export function FileMenu({ client, onExport }: FileMenuProps) {
   const { path, dirty, recents } = useProjectInfo();
   const [open, setOpen] = useState(false);
   // A guarded action awaiting "discard unsaved changes?" confirmation, or `null` when none is pending.
@@ -141,29 +148,6 @@ export function FileMenu({ client }: { client: EditorClient }) {
     }
   }
 
-  /** Export the authoritative scene without requiring a mesh selection or opening Asset Lab. */
-  async function exportScene(format: "glb" | "usda" | "step") {
-    setOpen(false);
-    setStatus(`Preparing complete-scene ${format.toUpperCase()} export…`);
-    try {
-      const result = await client.sceneExport(format);
-      setStatus(result.message);
-      if (result.ok) {
-        const changed = result.fidelity.filter((entry) => entry.status !== "preserved").length;
-        pushToast(
-          changed > 0 ? `${result.message} · ${changed} fidelity note${changed === 1 ? "" : "s"}` : result.message,
-          changed > 0 ? "info" : "success",
-        );
-      } else if (!/cancel/i.test(result.message)) {
-        pushToast(result.message, "error");
-      }
-    } catch (cause) {
-      const message = cause instanceof Error && cause.message ? cause.message : "Complete-scene export failed";
-      setStatus(message);
-      pushToast(message, "error");
-    }
-  }
-
   return (
     <div id="fileMenuRoot" ref={rootRef} style={{ position: "relative", font: font.ui }}>
       <Button
@@ -209,10 +193,20 @@ export function FileMenu({ client }: { client: EditorClient }) {
             <MenuItem id="fileSave" label="Save" onClick={() => void save(false)} />
             <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void save(true)} />
           </PopupMenuGroup>
-          <PopupMenuGroup label="Export complete scene">
-            <MenuItem id="fileExportGlb" label="GLB…" title="Self-contained hierarchy, reusable meshes, materials, textures, skins and standard animation" onClick={() => void exportScene("glb")} />
-            <MenuItem id="fileExportUsda" label="USDA…" title="Readable hierarchy-focused USD with an explicit fidelity report; not binary USDC or packaged USDZ" onClick={() => void exportScene("usda")} />
-            <MenuItem id="fileExportStep" label="STEP AP242…" title="Faceted STEP for CAD, CAM and fabrication — exact tessellated geometry with no materials or animation; trimmed surfaces are not invented" onClick={() => void exportScene("step")} />
+          <PopupMenuGroup label="Export">
+            {/* One item, not three. The format choice used to BE the menu, which meant the character of
+                each writer — what it carries, what it drops — had nowhere to live but a `title`, and the
+                write fired before the user had seen any of it. It is a decision with consequences, so it
+                gets the surface a decision needs (ADR-174). */}
+            <MenuItem
+              id="fileExport"
+              label="Export scene…"
+              title="Choose a format, see what it carries and what this scene would lose, then write it"
+              onClick={() => {
+                setOpen(false);
+                onExport();
+              }}
+            />
             <MenuItem id="fileSaveFrame" label="Viewport frame (PNG)…" title="Save the picture on the stage right now, exactly as you see it — including the grid and the gizmo, because nothing is posed and nothing is hidden. A cutscene render has neither." onClick={() => void saveFrame()} />
           </PopupMenuGroup>
           <PopupMenuGroup label={<span id="fileRecentHeading">Recent</span>}>

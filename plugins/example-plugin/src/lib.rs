@@ -53,7 +53,13 @@ pub fn arrange(input: String) -> FnResult<String> {
         let radius = req.spacing * fi.sqrt();
         let x = radius * angle.cos();
         let z = radius * angle.sin();
-        for (field, value) in [("px", x), ("py", 0.0_f64), ("pz", z)] {
+        // ADR-172 — `x`/`y`/`z`, NOT `px`/`py`/`pz`. `apply_ai_patch` validates a field name against
+        // the component registry, and it is the ONLY path in this engine that does — so while
+        // `stdlib.rs` declared `px`/`py`/`pz`, the only Transform fields a plugin was ALLOWED to write
+        // were the three `capscene::local_transform` does not read, and writing the ones that actually
+        // move an object would have been REFUSED. This spiral arranged fifty entities and nothing on
+        // screen moved.
+        for (field, value) in [("x", x), ("y", 0.0_f64), ("z", z)] {
             ops.push(json!({
                 "op": "setField",
                 "id": id,

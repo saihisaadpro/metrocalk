@@ -21,31 +21,9 @@ import { Button, SelectField } from "../theme/primitives";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import type { ColourStatus, FormatSpec } from "../transport/protocol";
 import type { EditorClient, ViewportRenderProfile } from "../transport/session";
-
-const FIDELITY_COPY: Record<string, { label: string; hint: string }> = {
-  full: { label: "Full", hint: "Everything the engine's scene model holds survives" },
-  subset: { label: "Subset", hint: "A stated, tested part of the format — the rest is reported" },
-  seam: { label: "Seam", hint: "Recognised and explained here, decoded elsewhere" },
-};
-
-const DIRECTION_COPY: Record<string, string> = {
-  import: "Read",
-  export: "Write",
-  both: "Read + write",
-};
-
-/** The capability flags, in the order a person actually asks about them. */
-const CARRIES: { key: keyof FormatSpec["carries"]; label: string }[] = [
-  { key: "geometry", label: "geometry" },
-  { key: "hierarchy", label: "hierarchy" },
-  { key: "materials", label: "materials" },
-  { key: "textures", label: "textures" },
-  { key: "skinning", label: "skinning" },
-  { key: "animation", label: "animation" },
-  { key: "cameras", label: "cameras" },
-  { key: "metadata", label: "engineering data" },
-  { key: "physics", label: "physics" },
-];
+// The fidelity words, the direction words and the capability ORDER are shared with the export
+// dialog, which describes the same registry to the same person minutes later.
+import { CARRIES, DIRECTION_COPY, FIDELITY_COPY } from "./formatVocabulary";
 
 /**
  * How colour is handled — per capability, and honest about what is not wired.

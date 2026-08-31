@@ -16,7 +16,11 @@
 // by its own signature. Both read tools answer from memory with nothing to await, so the generated
 // bodies carry no `.await` -- which is the trait contract, not a mistake. The attribute has to be
 // file-scoped because the code it applies to does not exist until the macro has run.
-#![allow(clippy::unused_async)]
+//
+// `unused_async_trait_impl` is clippy 1.98's narrower statement of the SAME finding, aimed at a trait
+// impl rather than a free function. It went red the day the toolchain moved, over generated code, with
+// nothing in this file to repair — so it sits beside its predecessor rather than in a second place.
+#![allow(clippy::unused_async, clippy::unused_async_trait_impl)]
 
 use std::path::PathBuf;
 

@@ -42,23 +42,23 @@ fn a_plugin_effect_is_an_undoable_transaction() {
     let schema = standard_components();
     let input = r#"{"ids":["1_0","1_1","1_2"],"seed":3,"spacing":2.0}"#;
 
-    let before = a.get_field(eid("1_1"), "Transform", "px");
+    let before = a.get_field(eid("1_1"), "Transform", "x");
     let delta = run_plugin(&mut a, &schema, "arrange", input).expect("the sandboxed plugin runs");
     assert!(
         delta.rejects.is_empty() && !delta.confirms.is_empty(),
         "the plugin effect committed through the pipeline: {delta:?}"
     );
-    let after = a.get_field(eid("1_1"), "Transform", "px");
+    let after = a.get_field(eid("1_1"), "Transform", "x");
     assert!(
         matches!(after, Some(FieldValue::Number(_))),
-        "the plugin set Transform.px (a numeric value)"
+        "the plugin set Transform.x (a numeric value)"
     );
     assert_ne!(before, after, "the algorithmic effect moved the entity");
 
     // ONE undo reverts the whole plugin effect (it's a single transaction).
     assert!(a.undo());
     assert_eq!(
-        a.get_field(eid("1_1"), "Transform", "px"),
+        a.get_field(eid("1_1"), "Transform", "x"),
         before,
         "undo reverts the plugin effect — a plugin is not a privileged path"
     );
@@ -74,7 +74,7 @@ fn a_plugin_effect_survives_close_then_reopen_via_replay() {
     let input = r#"{"ids":["1_0","1_1","1_2"],"seed":3,"spacing":2.0}"#.to_string();
     let delta = run_plugin(&mut a, &standard_components(), "arrange", &input).expect("run");
     assert!(delta.rejects.is_empty());
-    let want = a.get_field(eid("1_1"), "Transform", "px").expect("set");
+    let want = a.get_field(eid("1_1"), "Transform", "x").expect("set");
     log.append(&Record::RunPlugin {
         name: "arrange".to_string(),
         input: input.clone(),
@@ -86,7 +86,7 @@ fn a_plugin_effect_survives_close_then_reopen_via_replay() {
     let (applied, _skipped) = log.replay(&mut b, &scene, &MeshCatalog::new());
     assert_eq!(applied, 1, "the RunPlugin record replayed");
     assert_eq!(
-        b.get_field(eid("1_1"), "Transform", "px"),
+        b.get_field(eid("1_1"), "Transform", "x"),
         Some(want),
         "the plugin effect survives reload (the deterministic plugin re-derives the same arrangement)"
     );

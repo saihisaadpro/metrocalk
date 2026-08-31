@@ -18,6 +18,8 @@ import type { EditorClient } from "../transport/session";
 export interface EditorHeaderProps {
   client: EditorClient;
   onOpenCommands: () => void;
+  /** Open the export task dialog (owned by `App`, so the File menu and the command palette reach one). */
+  onExport: () => void;
   onOpenLeftDock?: () => void;
   onOpenRightDock?: () => void;
   compact?: boolean;
@@ -27,6 +29,7 @@ export interface EditorHeaderProps {
 export function EditorHeader({
   client,
   onOpenCommands,
+  onExport,
   onOpenLeftDock,
   onOpenRightDock,
   compact = false,
@@ -49,7 +52,7 @@ export function EditorHeader({
           <span className="mtk-editor-brand__mark" aria-hidden="true">M</span>
           <span className="mtk-editor-brand__name">metrocalk<span aria-hidden="true">.</span></span>
         </div>
-        <FileMenu client={client} />
+        <FileMenu client={client} onExport={onExport} />
         {compact && onOpenLeftDock && (
           <Button data-testid="header-scene" variant="ghost" compact icon aria-label="Open Scene and Assets" onClick={onOpenLeftDock} title="Open Scene and Assets">
             <Icon name="menu" size="md" />

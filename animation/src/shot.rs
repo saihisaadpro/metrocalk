@@ -550,22 +550,23 @@ impl Stage {
             return eye;
         }
         let mut confined = eye;
+        // ORDERING, NOT EQUALITY. "Did the clamp move anything" was written as `confined == eye` — an
+        // exact float-array comparison, which `clippy::float_cmp` rejects and CI was red on. The
+        // question being asked is whether the eye was OUTSIDE the room, and that answers itself with
+        // the same two comparisons the clamp is already making. A NaN axis satisfies neither, so it
+        // takes the unchanged-pose path exactly as it did before (the old `==` was false for NaN and
+        // the later `range.is_finite()` guard sent it back).
+        let mut outside = false;
         for axis in 0..3 {
             if lo[axis] > hi[axis] {
                 return eye; // a degenerate room is not a room
             }
+            if eye[axis] < lo[axis] || eye[axis] > hi[axis] {
+                outside = true;
+            }
             confined[axis] = confined[axis].clamp(lo[axis], hi[axis]);
         }
-        // EXACT, AND EXACT IS THE POINT. `clamp` returns its input BIT-IDENTICALLY when the value is
-        // already inside the range, so this asks "did any axis actually move?" — the one question an
-        // epsilon would answer wrongly, by discarding a real clamp of half a millimetre. Introduced
-        // with the room in `f557beb` and denied by `clippy::float_cmp` in the workspace job, which is
-        // the lint's escape hatch existing for exactly this case.
-        #[allow(
-            clippy::float_cmp,
-            reason = "clamp() is bit-identical when it does nothing; the question is whether it did"
-        )]
-        if confined == eye {
+        if !outside {
             return eye;
         }
         let d = [

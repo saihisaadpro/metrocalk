@@ -33,6 +33,7 @@ import type {
   GenerateResponse,
   ImportResult,
   Json,
+  MultiEditResult,
   JsonPatch,
   PhysicsWarning,
   ProjectionDelta,
@@ -79,6 +80,7 @@ import type {
   UserFittingCatalogEntry,
   AssetLabProcessRequest,
   AssetLabResponse,
+  SceneExportFormat,
   SceneExportResponse,
   AnimationWorkspaceInfo,
   AnimationClipInstanceSaveRequest,
@@ -213,6 +215,9 @@ export interface EditorClient {
   removeEntity(id: string): void;
   /** Duplicate an entity (M3.3) — one undoable transaction; resolves to the clone's id. */
   duplicateEntity(id: string): Promise<string | null>;
+  /** Duplicate a whole SELECTION as ONE undoable transaction (ADR-169) → the clones' ids in source
+   *  order. One Ctrl-Z removes all of them; N calls to `duplicateEntity` would need N. */
+  duplicateEntities(ids: string[]): Promise<string[]>;
   /** Frame the camera on an entity (M3.3) — no mutation. */
   focusEntity(id: string): void;
   /**
@@ -381,7 +386,7 @@ export interface EditorClient {
   /** Export a selected canonical mesh as an embedded-texture GLB. `path` is for automation. */
   assetLabExport(id: string, path?: string): Promise<AssetLabResponse>;
   /** Export the authoritative hierarchy, reusable meshes, skins and representable animation. */
-  sceneExport(format: "glb" | "usda" | "step", path?: string): Promise<SceneExportResponse>;
+  sceneExport(format: SceneExportFormat, path?: string): Promise<SceneExportResponse>;
   /** M11.3 — author a Light entity (kind = directional|point|spot) at a position with a linear RGB colour +
    *  intensity → its id. One undoable commit; the lit result is a render projection (not in the doc). */
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null>;
@@ -391,10 +396,19 @@ export interface EditorClient {
   groupEntities(ids: string[], name: string): Promise<string | null>;
   /** Ungroup — dissolve a group (children to its parent, delete the group) → applied. */
   ungroupEntity(id: string): Promise<boolean>;
-  /** Multi-edit — set one numeric field on N entities as ONE batched, atomic, undoable tx → applied. */
-  multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean>;
+  /** Multi-edit — set one field (ANY scalar, ADR-169) on N entities as ONE batched, atomic, undoable
+   *  transaction. Resolves to what it did, or to the sentence explaining why it refused. */
+  multiEdit(ids: string[], component: string, field: string, value: Json): Promise<MultiEditResult>;
+  /** Set a ROTATION on N entities as ONE batched, atomic, undoable transaction (ADR-172). A rotation
+   *  is four stored fields and one property, so `multiEdit` — one field to N entities — cannot express
+   *  it; the engine normalises the quaternion, so no caller can leave a non-rotation in the document.
+   *  Resolves to what it did, or to the sentence explaining why it refused. */
+  setRotation(ids: string[], quat: [number, number, number, number]): Promise<MultiEditResult>;
   /** Delete = deactivate (non-destructive; frees dependents) — undo restores → applied. */
   deleteDeactivate(id: string): Promise<boolean>;
+  /** Delete a whole SELECTION as ONE undoable transaction (ADR-169) → applied. One Ctrl-Z restores
+   *  all of it; N calls to `deleteDeactivate` would need N. */
+  deleteDeactivateMany(ids: string[]): Promise<boolean>;
   /** Copy a sub-tree to the clipboard (cross-project = the serde Composition). */
   copySubtree(id: string): void;
   /** Cut = copy + delete(deactivate) → applied. */
@@ -891,6 +905,9 @@ export class TauriClient implements EditorClient {
   duplicateEntity(id: string): Promise<string | null> {
     return this.core.invoke<string | null>("duplicate_entity", { id }).catch((e: unknown) => { console.error("duplicate_entity failed", e); throw e; });
   }
+  duplicateEntities(ids: string[]): Promise<string[]> {
+    return this.core.invoke<string[]>("duplicate_entities", { ids }).catch((e: unknown) => { console.error("duplicate_entities failed", e); throw e; });
+  }
   focusEntity(id: string): void {
     void this.core.invoke("focus_entity", { id }).catch((e: unknown) => console.error("focus_entity failed", e));
   }
@@ -1095,7 +1112,7 @@ export class TauriClient implements EditorClient {
   assetLabExport(id: string, path?: string): Promise<AssetLabResponse> {
     return this.core.invoke<AssetLabResponse>("asset_lab_export", { id, path: path ?? null }).catch((e: unknown) => { console.error("asset_lab_export failed", e); throw e; });
   }
-  sceneExport(format: "glb" | "usda" | "step", path?: string): Promise<SceneExportResponse> {
+  sceneExport(format: SceneExportFormat, path?: string): Promise<SceneExportResponse> {
     return this.core.invoke<SceneExportResponse>("scene_export", { format, path: path ?? null }).catch((e: unknown) => { console.error("scene_export failed", e); throw e; });
   }
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null> {
@@ -1110,11 +1127,17 @@ export class TauriClient implements EditorClient {
   ungroupEntity(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("ungroup_entity", { id }).catch((e: unknown) => { console.error("ungroup_entity failed", e); throw e; });
   }
-  multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean> {
-    return this.core.invoke<boolean>("multi_edit", { ids, component, field, value }).catch((e: unknown) => { console.error("multi_edit failed", e); throw e; });
+  multiEdit(ids: string[], component: string, field: string, value: Json): Promise<MultiEditResult> {
+    return this.core.invoke<MultiEditResult>("multi_edit", { ids, component, field, value }).catch((e: unknown) => { console.error("multi_edit failed", e); throw e; });
+  }
+  setRotation(ids: string[], quat: [number, number, number, number]): Promise<MultiEditResult> {
+    return this.core.invoke<MultiEditResult>("set_rotation", { ids, quat }).catch((e: unknown) => { console.error("set_rotation failed", e); throw e; });
   }
   deleteDeactivate(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("delete_deactivate", { id }).catch((e: unknown) => { console.error("delete_deactivate failed", e); throw e; });
+  }
+  deleteDeactivateMany(ids: string[]): Promise<boolean> {
+    return this.core.invoke<boolean>("delete_deactivate_many", { ids }).catch((e: unknown) => { console.error("delete_deactivate_many failed", e); throw e; });
   }
   copySubtree(id: string): void {
     void this.core.invoke("copy_subtree", { id }).catch((e: unknown) => console.error("copy_subtree failed", e));
@@ -1678,6 +1701,129 @@ export function buildWorld(n: number): EntityProjection[] {
   }
   return out;
 }
+
+/**
+ * The dev-mock mirror of `editor-shell/src/formats.rs::format_catalog()` — the one list the engine has
+ * an opinion about, so the Formats panel and the Export dialog render the same rows under
+ * `npm run dev`/Vitest as they do in the `.exe` (which serves the authoritative list from Rust).
+ *
+ * It was `[]` before, and an empty catalogue is not a neutral placeholder: every surface built on it
+ * looks finished and says the engine can read and write nothing. `available` mirrors the PACKAGED
+ * build's feature set (`editor-shell/src-tauri/Cargo.toml` forwards `assets-fbx`, `assets-ktx2` and
+ * `interchange-3dxml`), because that is the build this mock stands in for.
+ */
+const MOCK_FORMATS: FormatSpec[] = [
+  {
+    id: "gltf",
+    label: "glTF 2.0 / GLB",
+    extensions: ["glb", "gltf"],
+    domain: "Real-time",
+    direction: "both",
+    fidelity: "full",
+    carries: { geometry: true, hierarchy: true, materials: true, textures: true, skinning: true, animation: true, cameras: false, metadata: false, physics: false },
+    note: "The engine's best-supported path, both directions. Metallic-roughness PBR with embedded textures on export.",
+    available: true,
+  },
+  {
+    id: "obj",
+    label: "Wavefront OBJ",
+    extensions: ["obj"],
+    domain: "Real-time",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: false, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "Geometry only. OBJ has no hierarchy, no animation and no PBR; a companion .mtl is not read.",
+    available: true,
+  },
+  {
+    id: "fbx",
+    label: "Autodesk FBX",
+    extensions: ["fbx"],
+    domain: "Real-time",
+    direction: "import",
+    fidelity: "seam",
+    carries: { geometry: true, hierarchy: true, materials: true, textures: false, skinning: true, animation: true, cameras: false, metadata: false, physics: false },
+    note: "Read through the native ufbx reader.",
+    available: true,
+  },
+  {
+    id: "image",
+    label: "PNG / JPEG",
+    extensions: ["png", "jpg", "jpeg"],
+    domain: "Textures",
+    direction: "import",
+    fidelity: "full",
+    carries: { geometry: true, hierarchy: false, materials: false, textures: true, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "Placed as a textured quad. Treated as sRGB colour data.",
+    available: true,
+  },
+  {
+    id: "ktx2",
+    label: "KTX2 / Basis Universal",
+    extensions: ["ktx2"],
+    domain: "Textures",
+    direction: "import",
+    fidelity: "seam",
+    carries: { geometry: false, hierarchy: false, materials: false, textures: true, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "Supercompressed GPU texture, transcoded on import.",
+    available: true,
+  },
+  {
+    id: "hdr",
+    label: "Radiance HDR (equirectangular)",
+    extensions: ["hdr"],
+    domain: "Textures",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: false, hierarchy: false, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "An environment map for image-based lighting. Equirectangular layout only.",
+    available: true,
+  },
+  {
+    id: "step",
+    label: "STEP AP242",
+    extensions: ["stp", "step"],
+    domain: "CAD",
+    direction: "both",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: true, materials: true, textures: false, skinning: false, animation: false, cameras: false, metadata: true, physics: false },
+    note: "Pure-Rust reader and writer. Planar faces plus analytic cylinders, cones, spheres and tori tessellate exactly; trimmed NURBS and freeform faces are reported per face and left to a licensed kernel. Semantic PMI (GD&T) round-trips machine-readable, never downgraded to a graphical annotation.",
+    available: true,
+  },
+  {
+    id: "3dxml",
+    label: "CATIA 3DXML",
+    extensions: ["3dxml"],
+    domain: "CAD",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: true, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: true, physics: false },
+    note: "Product structure, assembly tree and instance transforms are read in full. CATIA's proprietary .3DRep tessellation is not decodable here — if a sibling STEP file is present it is used automatically for the geometry, otherwise each affected part is reported as a placed proxy.",
+    available: true,
+  },
+  {
+    id: "urdf",
+    label: "URDF",
+    extensions: ["urdf", "xml"],
+    domain: "Simulation",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: false, hierarchy: true, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: true },
+    note: "Links, joints and collision shapes with forward kinematics resolved to world poses. Visual geometry, inertia tensors and actuation are not read. Prismatic, floating and planar joints are declined with a reason rather than approximated.",
+    available: true,
+  },
+  {
+    id: "usd",
+    label: "OpenUSD (USD-Physics)",
+    extensions: ["usda", "usd"],
+    domain: "Simulation",
+    direction: "both",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: true, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: true },
+    note: "Export writes a USDA scene. Import reads ASCII .usda only, and only the USD-Physics subset: units, rigid bodies and primitive colliders. Binary .usdc, zipped .usdz and USD's composition system (references, payloads, variants, layers) are a declared seam — and composition, not geometry, is what USD is actually for, so this is an interop path and not a claim to speak USD.",
+    available: true,
+  },
+];
 
 /** The dev-mock mirror of the shell's shape catalog (same kinds/params, so the Build panel renders
  *  identically under `npm run dev`/Vitest; the .exe serves the authoritative list from Rust). */
@@ -2559,6 +2705,9 @@ class MockClient implements EditorClient {
   duplicateEntity(_id: string): Promise<string | null> {
     return Promise.resolve(null);
   }
+  duplicateEntities(_ids: string[]): Promise<string[]> {
+    return Promise.resolve([]);
+  }
   focusEntity(_id: string): void {}
   reportViewportRect(_rect: { x: number; y: number; width: number; height: number }): void {}
   makeDynamic(_id: string): Promise<boolean> {
@@ -2868,7 +3017,7 @@ class MockClient implements EditorClient {
     return Promise.resolve();
   }
   formatCatalog(): Promise<FormatSpec[]> {
-    return Promise.resolve([]);
+    return Promise.resolve(MOCK_FORMATS.map((spec) => ({ ...spec, carries: { ...spec.carries } })));
   }
   colourStatus(): Promise<ColourStatus> {
     return Promise.resolve({
@@ -3049,7 +3198,7 @@ class MockClient implements EditorClient {
   assetLabExport(id: string): Promise<AssetLabResponse> {
     return this.assetLabAudit(id);
   }
-  sceneExport(format: "glb" | "usda" | "step"): Promise<SceneExportResponse> {
+  sceneExport(format: SceneExportFormat): Promise<SceneExportResponse> {
     return Promise.resolve({
       ok: false,
       message: "Complete-scene export is available in the packaged desktop editor.",
@@ -3074,10 +3223,39 @@ class MockClient implements EditorClient {
   ungroupEntity(): Promise<boolean> {
     return Promise.resolve(true);
   }
-  multiEdit(): Promise<boolean> {
-    return Promise.resolve(true);
+  multiEdit(ids: string[]): Promise<MultiEditResult> {
+    return Promise.resolve({ ok: true, changed: ids.length, reason: null });
+  }
+  /** UNLIKE the scene-authoring stubs around it, this one really writes. `set_rotation` is the only
+   *  path a rotation can be typed through, so an inert stub would leave the dev build (and every
+   *  `shots` scene over it) unable to demonstrate the one gesture ADR-172 exists for. It pushes the
+   *  four fields down the SAME `MockCore.push` delta path the real core's re-projection uses, so the
+   *  Inspector's degree rows resolve from the committed quaternion exactly as they do under Tauri.
+   *  The engine's normalisation is mirrored here for the same reason it exists there: a projection
+   *  the panel reads back must be a rotation. */
+  setRotation(ids: string[], quat: [number, number, number, number]): Promise<MultiEditResult> {
+    const length = Math.hypot(...quat);
+    if (!Number.isFinite(length) || length < 1e-9) {
+      return Promise.resolve({
+        ok: false,
+        changed: 0,
+        reason: "those four numbers are not a rotation (a quaternion must be finite and non-zero)",
+      });
+    }
+    const unit = quat.map((c) => c / length);
+    const ops: ProjectionOp[] = [];
+    for (const id of ids) {
+      (["qx", "qy", "qz", "qw"] as const).forEach((field, i) => {
+        ops.push({ op: "setField", id, component: "Transform", field, value: unit[i] });
+      });
+    }
+    this.core.push(ops);
+    return Promise.resolve({ ok: true, changed: ids.length, reason: null });
   }
   deleteDeactivate(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  deleteDeactivateMany(): Promise<boolean> {
     return Promise.resolve(true);
   }
   copySubtree(): void {}

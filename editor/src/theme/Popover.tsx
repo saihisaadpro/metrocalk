@@ -262,17 +262,30 @@ export const PopoverSurface = forwardRef<HTMLDivElement, PopoverSurfaceProps>(fu
 
 /** Shared modal content surface. Modal owns the scrim, focus trap and dismissal behaviour. */
 export interface DialogSurfaceProps extends HTMLAttributes<HTMLDivElement> {
+  /** Drop the surface's own padding so a region inside it can reach the rounded edge.
+   *
+   *  A confirmation is text on a padded card and that is the default. A TASK dialog is a composition
+   *  — a rail beside a pane, a footer band — and every one of those has an edge the shared padding
+   *  would hold off the corner, which is exactly the "arbitrary fixed layout" a local override would
+   *  become. The variant is here rather than in the caller so the radius, the shadow and the viewport
+   *  clamp stay stated once. */
+  flush?: boolean;
   children: ReactNode;
 }
 
 export function DialogSurface({
+  flush = false,
   children,
   className,
   style,
   ...rest
 }: DialogSurfaceProps) {
   return (
-    <div className={["mtk-dialog-surface", className].filter(Boolean).join(" ")} style={style} {...rest}>
+    <div
+      className={["mtk-dialog-surface", flush && "mtk-dialog-surface--flush", className].filter(Boolean).join(" ")}
+      style={style}
+      {...rest}
+    >
       {children}
     </div>
   );
