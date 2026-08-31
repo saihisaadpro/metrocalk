@@ -697,6 +697,12 @@ describe("the stage can select more than one thing", () => {
     // file's own rule is that the only commands it invokes are reads. 98% of the seeded stage is
     // empty (measured in ADR-191), so a corner is bare; `viewport_peek` confirms it rather than
     // assuming.
+    // FRAME THE SCENE FIRST. By this point the suite has hunted across camera presets for an
+    // occluding pixel and deleted-then-undone twenty objects, so where the fixture is on screen is
+    // whatever the last test left. `frame_all` is a pure camera op and fixture arrangement, not the
+    // capability under test — the same justification ADR-191 gave `view_preset` in the alt-click case.
+    await browser.execute(() => window.__TAURI__.core.invoke("frame_all"));
+    await sleep(600);
     await clickEmptyPixel();
     await sleep(400);
     const a = await objectPixel();
@@ -735,6 +741,17 @@ describe("the stage can select more than one thing", () => {
 
     // The camera before, so "it framed something" is a measurement rather than a claim.
     const before = await browser.execute(() => window.__TAURI__.core.invoke("focus_debug"));
+    // PUT THE KEYBOARD ON THE STAGE, because the shell deliberately refuses bare-letter shortcuts
+    // while a CONTROL has it (`App.tsx`'s `editing` guard: a button owning the keyboard must not have
+    // W/E/R/F change the viewport tool under it). The preceding test clicks the Actions menu's Delete
+    // BUTTON, and a synthetic `PointerEvent` does not move focus the way a real click does — so
+    // without this the run measures the guard, not the feature. First seen as exactly this failure.
+    const owner = await browser.execute(() => {
+      const before = document.activeElement?.tagName ?? null;
+      document.getElementById("viewport")?.focus();
+      return { before, after: document.activeElement?.id || document.activeElement?.tagName || null };
+    });
+    console.log("  keyboard owner:", JSON.stringify(owner));
     await browser.execute(() => {
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", bubbles: true }));
     });
