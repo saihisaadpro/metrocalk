@@ -1095,14 +1095,24 @@ mod tests {
         Terrain::compile(r, Map::new()).expect("compile")
     }
 
-    /// Pump the runtime until the pending queue drains, or the frame budget runs out.
+    /// Pump the runtime until the pending queue drains, or FAIL saying what it was still waiting for.
     ///
     /// Bounded by a settled *state* rather than a fixed frame count: these tests each spin up a worker pool,
     /// and `cargo test` runs them concurrently, so a fixed count is really a bet on how much CPU this test
     /// happened to get. Stopping when nothing is in flight makes the run both faster and not a coin toss.
-    fn settle(rt: &mut TerrainRuntime, state: &mut SceneState, frames: usize) {
+    ///
+    /// THE BET WAS STILL BEING PLACED, and it was lost on 2026-08-31 under a machine running two cargo
+    /// builds and a browser: the 400-frame budget ran out, this returned as if it had settled, and
+    /// `replacing_the_terrain_drops_every_slot` failed on `resident_chunks > 0` -- a red test naming a
+    /// property that was never broken. A budget consumed by an unsettled runtime is not a bound, it is the
+    /// coin toss the comment above says it is not. So the budget is a DEADLINE now, generous enough that
+    /// only a genuine hang reaches it, and reaching it says which of the two conditions was still false
+    /// rather than handing an assertion three lines away a state it was never given.
+    fn settle(rt: &mut TerrainRuntime, state: &mut SceneState) {
+        let started = std::time::Instant::now();
+        let deadline = std::time::Duration::from_secs(60);
         let mut quiet = 0;
-        for _ in 0..frames {
+        loop {
             rt.update(
                 state,
                 [256.0, 40.0, 256.0],
@@ -1120,6 +1130,13 @@ mod tests {
             if quiet >= 8 {
                 return;
             }
+            assert!(
+                started.elapsed() < deadline,
+                "the terrain never settled in {}s: {} build(s) still pending, {} chunk(s) resident",
+                deadline.as_secs(),
+                s.pending_builds,
+                s.resident_chunks
+            );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
@@ -1131,7 +1148,7 @@ mod tests {
         assert!(!rt.is_active());
         rt.set_terrain(Some(small_terrain()), &mut state);
         assert!(rt.is_active());
-        settle(&mut rt, &mut state, 400);
+        settle(&mut rt, &mut state);
         assert!(
             rt.stats().resident_chunks > 0,
             "nothing became resident: {:?}",
@@ -1157,7 +1174,7 @@ mod tests {
         let mut state = scene();
         let mut rt = TerrainRuntime::new();
         rt.set_terrain(Some(small_terrain()), &mut state);
-        settle(&mut rt, &mut state, 400);
+        settle(&mut rt, &mut state);
         assert!(rt.stats().resident_chunks > 0);
         // Count the SLOTS, not the chunks: a submerged chunk also holds a water slot, and leaking those was
         // the failure mode this test exists to catch.
@@ -1200,7 +1217,7 @@ mod tests {
         let mut state = scene();
         let mut rt = TerrainRuntime::new();
         rt.set_terrain(Some(flooded()), &mut state);
-        settle(&mut rt, &mut state, 400);
+        settle(&mut rt, &mut state);
         rt.assert_slots_sane("after the first stream");
         assert!(rt.stats().resident_chunks > 0);
 
@@ -1208,7 +1225,7 @@ mod tests {
             // A sculpt: drop everything under the brush and let it come back.
             rt.invalidate(&mut state, [180.0, 180.0], [330.0, 330.0]);
             rt.assert_slots_sane(&format!("pass {pass}: after invalidating"));
-            settle(&mut rt, &mut state, 400);
+            settle(&mut rt, &mut state);
             rt.assert_slots_sane(&format!("pass {pass}: after re-streaming"));
 
             // An undo: the recipe changes, so every derived artefact is stale.
@@ -1218,7 +1235,7 @@ mod tests {
                 rt.live_slots().is_empty(),
                 "pass {pass}: nothing may stay resident"
             );
-            settle(&mut rt, &mut state, 400);
+            settle(&mut rt, &mut state);
             rt.assert_slots_sane(&format!("pass {pass}: after re-streaming the replacement"));
         }
 
@@ -1248,7 +1265,7 @@ mod tests {
         let mut state = scene();
         let mut rt = TerrainRuntime::new();
         rt.set_terrain(Some(flooded), &mut state);
-        settle(&mut rt, &mut state, 400);
+        settle(&mut rt, &mut state);
         assert!(rt.stats().resident_chunks > 0);
         assert!(
             rt.resident.values().all(|r| r.water_slot.is_some()),
@@ -1279,7 +1296,7 @@ mod tests {
         let mut state = scene();
         let mut rt = TerrainRuntime::new();
         rt.set_terrain(Some(dry), &mut state);
-        settle(&mut rt, &mut state, 400);
+        settle(&mut rt, &mut state);
         assert!(rt.stats().resident_chunks > 0);
         assert!(
             rt.resident.values().all(|r| r.water_slot.is_none()),
@@ -1293,7 +1310,7 @@ mod tests {
         let mut state = scene();
         let mut rt = TerrainRuntime::new();
         rt.set_terrain(Some(small_terrain()), &mut state);
-        settle(&mut rt, &mut state, 400);
+        settle(&mut rt, &mut state);
         rt.set_terrain(None, &mut state);
         assert!(!rt.is_active());
         rt.update(
@@ -1314,7 +1331,7 @@ mod tests {
         rt.set_terrain(Some(small_terrain()), &mut state);
         let h = rt.height_at(256.0, 256.0).expect("live terrain answers");
         assert!(h.is_finite());
-        settle(&mut rt, &mut state, 400);
+        settle(&mut rt, &mut state);
         // With nav grids resident, a short path across walkable ground resolves.
         if let Some(path) = rt.find_path([250.0, h, 250.0], [262.0, h, 262.0]) {
             assert!(
@@ -1329,7 +1346,7 @@ mod tests {
         let mut state = scene();
         let mut rt = TerrainRuntime::new();
         rt.set_terrain(Some(small_terrain()), &mut state);
-        settle(&mut rt, &mut state, 400);
+        settle(&mut rt, &mut state);
         let s = rt.stats();
         assert!(s.mesh_bytes > 0, "meshes are held but not accounted");
         assert!(s.texture_bytes > 0, "textures are held but not accounted");
@@ -1345,7 +1362,7 @@ mod tests {
         let mut state = scene();
         let mut rt = TerrainRuntime::new();
         rt.set_terrain(Some(small_terrain()), &mut state);
-        settle(&mut rt, &mut state, 400);
+        settle(&mut rt, &mut state);
 
         let bad = ChunkCoord::new(1, 1);
         rt.in_flight.insert(bad);
