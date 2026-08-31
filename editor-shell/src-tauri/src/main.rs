@@ -22147,6 +22147,16 @@ struct EnvImportReply {
     message: String,
     /// Set iff nothing changed.
     reason: Option<String>,
+    /// The file this was read from, when there was one. `None` for the built-in studio sky.
+    ///
+    /// Reported because it is the only thing that can be written to the project's view sidecar: a
+    /// label cannot be re-loaded, and re-deriving the path from the label is guesswork.
+    path: Option<String>,
+    /// Set iff the person dismissed the file dialog.
+    ///
+    /// A no-op is not a failure, and the two must not read the same. Without this the panel has to
+    /// choose between showing an error for a cancelled dialog and showing nothing for a real refusal.
+    cancelled: bool,
 }
 
 impl EnvImportReply {
@@ -22166,11 +22176,54 @@ impl EnvImportReply {
 /// `MTK_ENV_HDR` environment variable, read once at process start. This is the command that makes it a
 /// capability a person can actually use.
 ///
-/// Decoding runs on this command's own async thread, never the engine tick: an 8k panorama is ~400 MB
-/// of f32 and decoding it inline would freeze the viewport.
+/// **`path` is optional, and that is what makes it reachable.** With no path the native file dialog
+/// opens here, so the UI never has to ask a person to type an absolute path into a text box — the same
+/// arrangement `import_asset_dialog` uses for meshes. The dialog is opened from this command's own
+/// async thread, which is where `blocking_pick_file` is safe; a sync command would run it on the main
+/// thread and deadlock.
+///
+/// Decoding runs on that same async thread, never the engine tick: an 8k panorama is ~400 MB of f32
+/// and decoding it inline would freeze the viewport.
 #[tauri::command(async)]
-fn import_environment(state: State<AppState>, path: String) -> EnvImportReply {
+fn import_environment(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    path: Option<String>,
+) -> EnvImportReply {
     ipc();
+    let path = match path {
+        Some(p) => p,
+        None => match app
+            .dialog()
+            .file()
+            // The decoder reads Radiance only, so the filter states exactly that rather than a
+            // hopeful "images": offering a `.exr` the loader will refuse is a worse experience than
+            // not offering it.
+            .add_filter("Radiance HDR panorama", &["hdr"])
+            .blocking_pick_file()
+            .and_then(|f| f.into_path().ok())
+        {
+            Some(p) => p.display().to_string(),
+            // Dismissing the picker is a decision, not an error. Reported as its own state so the
+            // panel can go quiet instead of showing a refusal for something nobody asked for.
+            None => {
+                return EnvImportReply {
+                    cancelled: true,
+                    message: "No panorama chosen — the lighting is unchanged.".into(),
+                    ..EnvImportReply::default()
+                }
+            }
+        },
+    };
+    load_environment(&state, path)
+}
+
+/// Decode a Radiance panorama and hand it to the render loop.
+///
+/// Separate from the command because **reopening a project has to do exactly this** and must not do it
+/// a second, slightly different way: the sidecar restore path calls this, so a sky restored on open is
+/// the same sky, validated by the same bounds, as one chosen from the dialog.
+fn load_environment(state: &State<AppState>, path: String) -> EnvImportReply {
     let p = std::path::Path::new(&path);
     let label = p
         .file_stem()
@@ -22214,6 +22267,7 @@ fn import_environment(state: State<AppState>, path: String) -> EnvImportReply {
         let mut st = state.shared.lock().unwrap();
         st.pending_env = Some(source);
         st.env_label = label.clone();
+        st.env_path = Some(path.clone());
         st.env_revision = st.env_revision.wrapping_add(1);
     }
     EnvImportReply {
@@ -22226,20 +22280,32 @@ fn import_environment(state: State<AppState>, path: String) -> EnvImportReply {
             "Lighting from \"{label}\" ({w}x{h}) - it lights the scene and shows in reflections"
         ),
         reason: None,
+        path: Some(path),
+        cancelled: false,
     }
+}
+
+/// Drop any imported panorama and go back to the built-in studio sky. Returns the new label.
+///
+/// The command below and the project-open path both need this and must not diverge: an environment
+/// half-cleared — the source dropped but the path still recorded — is a project that saves a sky it is
+/// not being lit by.
+fn clear_environment(state: &State<AppState>) -> String {
+    let mut st = state.shared.lock().unwrap();
+    st.pending_env = None;
+    st.env_label = "Studio (built in)".into();
+    st.env_path = None;
+    st.env_revision = st.env_revision.wrapping_add(1);
+    st.env_label.clone()
 }
 
 /// Go back to the built-in studio sky.
 #[tauri::command(async)]
 fn reset_environment(state: State<AppState>) -> EnvImportReply {
     ipc();
-    let mut st = state.shared.lock().unwrap();
-    st.pending_env = None;
-    st.env_label = "Studio (built in)".into();
-    st.env_revision = st.env_revision.wrapping_add(1);
     EnvImportReply {
         applied: true,
-        label: st.env_label.clone(),
+        label: clear_environment(&state),
         message: "Back to the built-in studio lighting".into(),
         ..EnvImportReply::default()
     }
@@ -22270,6 +22336,8 @@ fn environment_state(state: State<AppState>) -> EnvImportReply {
         mean_radiance: custom.map_or([0.0; 3], |e| mean_radiance(&e.pixels)),
         message: String::new(),
         reason: None,
+        path: st.env_path.clone(),
+        cancelled: false,
     }
 }
 
@@ -25085,10 +25153,34 @@ fn presentation_sidecar(project: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{project}.view.json"))
 }
 
+/// What the sidecar actually holds: the renderer's presentation, plus the panorama lighting the scene.
+///
+/// The environment is `#[serde(flatten)]`-adjacent rather than a field of
+/// [`metrocalk_assets::colour::PresentationState`] on purpose. That type is `Copy` and is hashed into
+/// the identity every async render result carries, so giving it a `String` would cost the copy
+/// semantics and change the hash of every existing render — for a value the renderer never reads.
+/// Flattening keeps the file's existing keys exactly where they were, so a sidecar written by an
+/// older build still restores, and one written by this build still opens in an older one.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ViewSidecar {
+    #[serde(flatten)]
+    presentation: metrocalk_assets::colour::PresentationState,
+    /// The Radiance panorama the scene was last lit by. Absent = the built-in studio sky.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment: Option<String>,
+}
+
 /// Write the current presentation beside the project. Best-effort by design: a read-only directory
 /// must not fail a save of the actual work.
 fn save_presentation(state: &State<AppState>, project: &str) {
-    let present = state.shared.lock().unwrap().presentation();
+    let present = {
+        let st = state.shared.lock().unwrap();
+        ViewSidecar {
+            presentation: st.presentation(),
+            environment: st.env_path.clone(),
+        }
+    };
     match serde_json::to_string_pretty(&present) {
         Ok(json) => {
             if let Err(e) = std::fs::write(presentation_sidecar(project), json) {
@@ -25105,21 +25197,51 @@ fn save_presentation(state: &State<AppState>, project: &str) {
 /// project saved by an older build simply has none); a malformed one is reported, because a file that
 /// exists and cannot be read is a different situation from a file that was never written, and quietly
 /// treating them the same is how a corrupted preference becomes a mystery.
+///
+/// **The environment always follows the project you opened**, which is a stronger rule than the one
+/// the other presentation fields keep. It has to be: exposure carrying over from the previous project
+/// is a mild surprise, whereas a panorama carrying over relights the whole scene, so "no sky recorded"
+/// means the built-in studio sky rather than "whatever was on screen a moment ago".
 fn restore_presentation(state: &State<AppState>, project: &str) {
     let path = presentation_sidecar(project);
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return; // no sidecar — defaults, nothing to say
+        clear_environment(state); // no sidecar — the built-in sky, nothing to say
+        return;
     };
-    match serde_json::from_str::<metrocalk_assets::colour::PresentationState>(&text) {
-        Ok(p) => state.shared.lock().unwrap().set_presentation(p),
+    match serde_json::from_str::<ViewSidecar>(&text) {
+        Ok(p) => {
+            state.shared.lock().unwrap().set_presentation(p.presentation);
+            // The sky is restored SECOND and reported when it cannot be: choosing a panorama used to
+            // be something a person did again every session, and the failure mode of fixing that is a
+            // moved file — which must read as "your sky is gone and here is why", never as a scene
+            // that silently opens under different light than it was saved under.
+            match p.environment {
+                Some(env) => {
+                    let reply = load_environment(state, env.clone());
+                    if !reply.applied {
+                        eprintln!(
+                            "[colour] the panorama this project was lit by could not be loaded from {env}: {}",
+                            reply.message
+                        );
+                        clear_environment(state);
+                    }
+                }
+                None => {
+                    clear_environment(state);
+                }
+            }
+        }
         // The number comes from the renderer's own constant, so the message cannot quote an exposure
         // the renderer has stopped using.
-        Err(e) => eprintln!(
-            "[colour] {} could not be read ({e}); the viewport stays at its defaults \
-             (linear Rec.709, filmic, exposure {}).",
-            path.display(),
-            render::DEFAULT_EXPOSURE
-        ),
+        Err(e) => {
+            eprintln!(
+                "[colour] {} could not be read ({e}); the viewport stays at its defaults \
+                 (linear Rec.709, filmic, exposure {}).",
+                path.display(),
+                render::DEFAULT_EXPOSURE
+            );
+            clear_environment(state);
+        }
     }
 }
 
@@ -28839,5 +28961,52 @@ mod imported_assembly_pose_publication_tests {
             restored.center,
             restored.scale
         );
+    }
+}
+
+/// **The view sidecar's shape is a compatibility contract, and both directions matter.**
+///
+/// A project's `.view.json` is written by one build and read by another. Adding the environment as a
+/// flattened key rather than a field of `PresentationState` is what keeps that true in both
+/// directions, and neither direction is checked by anything a compiler does: a sidecar written before
+/// this change has no `environment` key at all, and one written after it must still be readable by a
+/// build whose reader is the older `PresentationState`.
+#[cfg(test)]
+mod view_sidecar_tests {
+    use super::ViewSidecar;
+    use metrocalk_assets::colour::PresentationState;
+
+    /// A sidecar written by the build BEFORE this change — no `environment` key anywhere.
+    const OLD_SIDECAR: &str = r#"{"working":"acesCg","view":"pbrNeutral","exposure":1.25}"#;
+
+    #[test]
+    fn a_sidecar_written_before_the_environment_existed_still_restores_the_presentation() {
+        let read: ViewSidecar = serde_json::from_str(OLD_SIDECAR).expect("old sidecars stay readable");
+        assert_eq!(read.presentation.exposure, 1.25);
+        // Absent is the built-in sky, which is also what `restore_presentation` acts on.
+        assert!(read.environment.is_none());
+    }
+
+    #[test]
+    fn the_presentation_keys_stay_at_the_top_level_so_an_older_build_can_still_read_ours() {
+        let written = serde_json::to_string(&ViewSidecar {
+            presentation: PresentationState { exposure: 2.5, ..PresentationState::default() },
+            environment: Some("C:/skies/sunset_4k.hdr".into()),
+        })
+        .expect("serialisable");
+        // Read back through the OLD reader — `PresentationState` on its own, which is what a build
+        // that predates this change runs. Nesting the presentation under a key would break this and
+        // would still look correct in every test that used the new reader.
+        let old: PresentationState = serde_json::from_str(&written).expect("older readers still work");
+        assert_eq!(old.exposure, 2.5);
+        assert!(written.contains("sunset_4k"), "the sky has to survive the round trip: {written}");
+    }
+
+    #[test]
+    fn the_built_in_sky_writes_no_key_at_all_rather_than_a_null() {
+        // `skip_serializing_if` — a `"environment": null` would be a second spelling of "no sky", and
+        // two spellings of one state is how a reader ends up handling only one of them.
+        let written = serde_json::to_string(&ViewSidecar::default()).expect("serialisable");
+        assert!(!written.contains("environment"), "{written}");
     }
 }

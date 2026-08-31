@@ -25,6 +25,7 @@ import { STAGE_MIN } from "../../src/app/layout";
 import { CommandPalette } from "../../src/panels/CommandPalette";
 import { ContextMenu } from "../../src/panels/ContextMenu";
 import { Hierarchy } from "../../src/panels/Hierarchy";
+import { LookSection } from "../../src/panels/LookSection";
 import { selectionCommands } from "../../src/app/selectionCommands";
 import { StageMarquee } from "../../src/app/StageMarquee";
 import { BindingGraph } from "../../src/graph/BindingGraph";
@@ -1030,6 +1031,7 @@ export const SCENES: Scene[] = [
   ...modelScenes(),
   ...selectionVerbScenes(),
   ...outlinerFindScenes(),
+  ...lookScenes(),
   ...contextMenuScenes(),
   ...shellScenes(),
   ...selectionScenes(),
@@ -1684,6 +1686,124 @@ function selectionVerbScenes(): Scene[] {
           })}
         />
       ),
+    },
+  ];
+}
+
+/** THE SUB-ENGINE THE AUDIT KEPT FINDING (ADR-186).
+ *
+ *  `import_environment` and `set_exposure` were registered commands with no caller in `editor/src`, so
+ *  the only ways to light a scene with a real sky were an environment variable read once at process
+ *  start and a driving script. What a capture answers that the vitest suite cannot: whether this reads
+ *  as a control panel or as three unrelated lines. The two states are deliberately paired — the panel
+ *  a fresh project meets, and the panel once a panorama is in — because the second grows two elements
+ *  (the reset and the measured brightness) and the row has to survive both.
+ *
+ *  Photographed at the width it ships in: 328 px inside the left dock's 340 px track. */
+function lookScenes(): Scene[] {
+  const seedLitScene = () => {
+    projectionStore.getState().bulkLoad([
+      { id: "skid", name: "Skid Frame", parentId: null, components: { Transform: {}, MeshRenderer: { mesh: "mtkasset:skid" } } },
+      { id: "key", name: "Key Light", parentId: null, components: { Transform: {}, Light: { intensity: 60 } } },
+      { id: "fill", name: "Fill Light", parentId: null, components: { Transform: {}, Light: { intensity: 20 } } },
+    ] as never);
+  };
+
+  const seedUnlitScene = () => {
+    projectionStore.getState().bulkLoad([
+      { id: "skid", name: "Skid Frame", parentId: null, components: { Transform: {}, MeshRenderer: { mesh: "mtkasset:skid" } } },
+    ] as never);
+  };
+
+  const lookClient = (env: {
+    applied: boolean;
+    label: string;
+    width: number;
+    height: number;
+    meanRadiance: [number, number, number];
+  }) =>
+    ({
+      environmentState: () =>
+        Promise.resolve({ ...env, message: "", reason: null, path: env.applied ? "C:/skies/kloppenheim_06.hdr" : null, cancelled: false }),
+      colourStatus: () =>
+        Promise.resolve({
+          spaces: [], views: [], capabilities: {}, notes: [],
+          working: {
+            current: "linearRec709", label: "Linear Rec.709", wired: true, options: [],
+            setCommand: "set_working_space", luminanceWeights: [0.2126, 0.7152, 0.0722],
+          },
+          activeView: "acesFit", activeViewLabel: "Filmic (ACES-like)",
+          setViewCommand: "set_render_profile", setViewArg: "cinematic",
+          presentationHash: "0000000000000709", exposure: 0.9,
+          environment: { sourceSpace: "linearRec709", label: "Linear Rec.709", assumed: true, options: [], setCommand: "set_environment_colour_space" },
+        }),
+      importEnvironment: () => Promise.resolve({ applied: false, label: "", width: 0, height: 0, meanRadiance: [0, 0, 0], message: "", reason: null, path: null, cancelled: true }),
+      resetEnvironment: () => Promise.resolve({ applied: true, label: "Studio (built in)", width: 0, height: 0, meanRadiance: [0, 0, 0], message: "Back to the built-in studio lighting", reason: null, path: null, cancelled: false }),
+      setExposure: (e: number) => Promise.resolve(e),
+    }) as unknown as EditorClient;
+
+  const inDock = (children: ReactNode) => (
+    <div style={{ width: 328, padding: 12, display: "flex", flexDirection: "column" }}>{children}</div>
+  );
+
+  return [
+    {
+      id: "scene-look-studio",
+      looking_for:
+        "the panel a fresh project meets: the built-in sky, no reset control (there is nothing to reset " +
+        "FROM), the scene's own two lights counted, and an exposure slider reading in stops rather than " +
+        "in the engine's 0.05..8 multiplier. What a reader checks: that the three blocks read as one " +
+        "control panel down a 328px column rather than as three unrelated lines, and that the exposure " +
+        "value label is attached to its own slider rather than floating between the two",
+      width: 380,
+      expect: {
+        present: [
+          ["[data-testid='look-section']", 1],
+          ["[data-testid='look-exposure']", 1],
+          // The reset is offered only when a panorama is loaded — an always-present control that does
+          // nothing on the default state is the inert-control defect.
+          ["[data-testid='look-env-reset']", 0],
+          // No measured brightness either: there is no file to have measured.
+          ["[data-testid='look-brightness']", 0],
+        ],
+        text_present: ["Studio (built in)", "Use a sky image", "2 lights", "+1.0 stops"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='look-env-choose']", "[data-testid='look-exposure']"],
+      },
+      setup: seedLitScene,
+      render: () =>
+        inDock(
+          <LookSection client={lookClient({ applied: false, label: "Studio (built in)", width: 0, height: 0, meanRadiance: [0, 0, 0] })} />,
+        ),
+    },
+    {
+      id: "scene-look-panorama",
+      looking_for:
+        "the same panel with a real 4k panorama in, on a scene with NO lights of its own. Two elements " +
+        "appear: the way back to the studio sky, and the MEASUREMENT line — the size and the brightness " +
+        "the engine already computed and displayed nowhere. What a reader checks: three distinguishable " +
+        "registers down a 328px column, not three grey paragraphs — the measurement reads as numbers " +
+        "about the file, the help under it reads as help, and the ruled-off line at the bottom reads as " +
+        "a footnote about the scene. The first capture of this panel had all three as the same grey " +
+        "sentence at the same indent, and every selector assertion passed",
+      width: 380,
+      expect: {
+        present: [
+          ["[data-testid='look-env-reset']", 1],
+          ["[data-testid='look-brightness']", 1],
+        ],
+        text_present: ["kloppenheim_06", "4096×2048", "stops over mid grey", "No lights in this scene"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='look-env-choose']", "[data-testid='look-env-reset']", "[data-testid='look-brightness']"],
+        // The two verbs are ONE row: a "Studio sky" that drops to its own line reads as a second,
+        // unrelated action rather than as the way back out of the first.
+        same_line: [["[data-testid='look-env-choose']", "[data-testid='look-env-reset']"]],
+      },
+      setup: seedUnlitScene,
+      render: () =>
+        inDock(
+          <LookSection client={lookClient({ applied: true, label: "kloppenheim_06", width: 4096, height: 2048, meanRadiance: [0.55, 0.52, 0.46] })} />,
+        ),
     },
   ];
 }

@@ -1027,6 +1027,12 @@ pub struct SceneState {
     pub env_revision: u64,
     /// What the current environment is called, for the UI to report.
     pub env_label: String,
+    /// The file the current environment was read from, when it came from one.
+    ///
+    /// A label cannot be re-loaded — "sunset_4k" says nothing about where the panorama is — so this is
+    /// the only part of the environment that can survive a reopen. It is written to the project's
+    /// `.view.json` sidecar and read back on open; `None` is the built-in studio sky.
+    pub env_path: Option<String>,
     /// How many MOMENT-fired one-shot bursts are alive right now. Published purely so a test can tell
     /// "the burst was never created" from "the burst was created and drew nothing" — two failures that
     /// look identical from a particle count alone.

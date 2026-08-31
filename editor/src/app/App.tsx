@@ -44,6 +44,7 @@ import { StageMarquee } from "./StageMarquee";
 import { selectionSentence, entityLabel } from "../store/selectionText";
 import { deleteSelection } from "./deleteSelection";
 import { selectAllWith, selectionCommands } from "./selectionCommands";
+import { environmentOutcome } from "./environmentOutcome";
 import { stateSelection } from "./stateSelection";
 import { requestObjectSearch } from "../store/find";
 
@@ -667,6 +668,35 @@ export function App() {
       hasSelection: multiSelect.length > 0,
       sceneEmpty,
     }),
+    // The scene's LIGHT, reachable without first knowing that a closed section in the Scene column
+    // holds it. Both rows read the reply through the same `environmentOutcome` the panel uses, so a
+    // dismissed file dialog is silent here too rather than reported as a failure.
+    {
+      id: "look-environment",
+      label: "Light the scene from a sky image…",
+      category: "Lighting",
+      description: "Choose a Radiance .hdr panorama — it lights the scene and shows in reflections",
+      keywords: ["hdri", "environment", "panorama", "sky", "ibl"],
+      execute: async () => {
+        const outcome = environmentOutcome(await client.importEnvironment());
+        if (!outcome) return;
+        pushToast(outcome.message, outcome.tone);
+        setStatus(outcome.message);
+      },
+    },
+    {
+      id: "look-environment-reset",
+      label: "Use the built-in studio sky",
+      category: "Lighting",
+      description: "Drop the loaded panorama and go back to the default lighting",
+      keywords: ["environment", "reset", "default"],
+      execute: async () => {
+        const outcome = environmentOutcome(await client.resetEnvironment());
+        if (!outcome) return;
+        pushToast(outcome.message, outcome.tone);
+        setStatus(outcome.message);
+      },
+    },
     { id: "view-frame-all", label: "Frame all", category: "View", description: "Fit the whole scene in the viewport", execute: () => client.frameAll() },
     { id: "view-top", label: "Top view", category: "View", execute: () => client.viewPreset("top") },
     { id: "view-front", label: "Front view", category: "View", execute: () => client.viewPreset("front") },

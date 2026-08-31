@@ -50,6 +50,7 @@ import type {
   VfxProbe,
   CameraProbe,
   ColourStatus,
+  EnvironmentReply,
   FormatSpec,
   ClauseRequest,
   ConditionListInfo,
@@ -304,6 +305,21 @@ export interface EditorClient {
    * reason — an HDR panorama is radiance, so "this EXR is sRGB" is not a thing a person can mean.
    */
   setEnvironmentColourSpace(space: string): Promise<string>;
+  /** What the scene is lit by right now. */
+  environmentState(): Promise<EnvironmentReply>;
+  /**
+   * Light the scene with a Radiance `.hdr` panorama. **With no path the engine opens the native file
+   * picker** — so the UI never has to ask for an absolute path — and `cancelled` comes back set if the
+   * person dismissed it, which is a no-op and not an error.
+   */
+  importEnvironment(path?: string): Promise<EnvironmentReply>;
+  /** Go back to the built-in studio sky. */
+  resetEnvironment(): Promise<EnvironmentReply>;
+  /**
+   * Set the viewport exposure — a linear multiplier applied before the tone curve. Replies the value
+   * actually in force, which is the sent one clamped to the renderer's range.
+   */
+  setExposure(exposure: number): Promise<number>;
   /** What the renderer is drawing this instant (Play only; zeros otherwise). */
   vfxProbe(): Promise<VfxProbe>;
   /** Where the camera actually is this instant. */
@@ -963,6 +979,20 @@ export class TauriClient implements EditorClient {
   }
   setEnvironmentColourSpace(space: string): Promise<string> {
     return this.core.invoke<string>("set_environment_colour_space", { space }).catch((e: unknown) => { console.error("set_environment_colour_space failed", e); throw e; });
+  }
+  environmentState(): Promise<EnvironmentReply> {
+    return this.core.invoke<EnvironmentReply>("environment_state").catch((e: unknown) => { console.error("environment_state failed", e); throw e; });
+  }
+  // `path` is omitted from the payload when absent rather than sent as `null`: the command's argument
+  // is an `Option<String>`, and "not given" is precisely what opens the picker.
+  importEnvironment(path?: string): Promise<EnvironmentReply> {
+    return this.core.invoke<EnvironmentReply>("import_environment", path === undefined ? {} : { path }).catch((e: unknown) => { console.error("import_environment failed", e); throw e; });
+  }
+  resetEnvironment(): Promise<EnvironmentReply> {
+    return this.core.invoke<EnvironmentReply>("reset_environment").catch((e: unknown) => { console.error("reset_environment failed", e); throw e; });
+  }
+  setExposure(exposure: number): Promise<number> {
+    return this.core.invoke<number>("set_exposure", { exposure }).catch((e: unknown) => { console.error("set_exposure failed", e); throw e; });
   }
   vfxProbe(): Promise<VfxProbe> {
     return this.core.invoke<VfxProbe>("vfx_probe").catch(() => ({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 }));
@@ -2829,7 +2859,7 @@ class MockClient implements EditorClient {
       setViewCommand: "set_render_profile",
       setViewArg: "cinematic",
       presentationHash: this.workingSpace === "acesCg" ? "00000000000000a1" : "0000000000000709",
-      exposure: 0.45,
+      exposure: this.mockExposure,
       environment: {
         sourceSpace: this.envSpace,
         label: this.envSpace === "acesCg" ? "ACEScg (AP1)" : "Linear Rec.709",
@@ -2850,6 +2880,9 @@ class MockClient implements EditorClient {
   /** Mock render state, so the colour card's controls do something in the dev build too. */
   private workingSpace = "linearRec709";
   private envSpace = "linearRec709";
+  /** The renderer's own default, so the dev build's slider starts where the real one does. */
+  private mockExposure = 0.45;
+  private mockEnvironment: { label: string; path: string } | null = null;
 
   setWorkingSpace(space: string): Promise<string> {
     this.workingSpace = space;
@@ -2859,6 +2892,56 @@ class MockClient implements EditorClient {
   setEnvironmentColourSpace(space: string): Promise<string> {
     this.envSpace = space;
     return Promise.resolve(space);
+  }
+
+  environmentState(): Promise<EnvironmentReply> {
+    return Promise.resolve(this.mockEnvironmentReply());
+  }
+
+  importEnvironment(path?: string): Promise<EnvironmentReply> {
+    // There is no native picker in a browser, and pretending otherwise would ship an enabled control
+    // that silently does nothing — `<ux_quality>` 6. A path supplied by a caller (a test, a scripted
+    // scene) is honoured; a click with no path says plainly where the capability lives.
+    if (path === undefined) {
+      return Promise.resolve({
+        applied: false, label: "", width: 0, height: 0, meanRadiance: [0, 0, 0],
+        message: "Choosing a panorama file needs the packaged desktop editor.",
+        reason: "Choosing a panorama file needs the packaged desktop editor.",
+        path: null, cancelled: false,
+      });
+    }
+    const label = path.split(/[\\/]/).pop()?.replace(/\.hdr$/i, "") ?? "environment";
+    this.mockEnvironment = { label, path };
+    return Promise.resolve(this.mockEnvironmentReply());
+  }
+
+  resetEnvironment(): Promise<EnvironmentReply> {
+    this.mockEnvironment = null;
+    return Promise.resolve({
+      applied: true, label: "Studio (built in)", width: 0, height: 0, meanRadiance: [0, 0, 0],
+      message: "Back to the built-in studio lighting", reason: null, path: null, cancelled: false,
+    });
+  }
+
+  setExposure(exposure: number): Promise<number> {
+    this.mockExposure = Math.min(8, Math.max(0.05, exposure));
+    return Promise.resolve(this.mockExposure);
+  }
+
+  /** The one place the mock says what it is lit by, so the read and the write cannot disagree. */
+  private mockEnvironmentReply(): EnvironmentReply {
+    const env = this.mockEnvironment;
+    return {
+      applied: env !== null,
+      label: env?.label ?? "Studio (built in)",
+      width: env ? 2048 : 0,
+      height: env ? 1024 : 0,
+      meanRadiance: env ? [0.42, 0.44, 0.5] : [0, 0, 0],
+      message: env ? `Lighting from "${env.label}" (2048x1024)` : "",
+      reason: null,
+      path: env?.path ?? null,
+      cancelled: false,
+    };
   }
   vfxProbe(): Promise<VfxProbe> {
     return Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 });

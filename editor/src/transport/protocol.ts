@@ -1935,6 +1935,33 @@ export interface ColourStatus {
   notes: string[];
 }
 
+/**
+ * What the scene is lit by — the answer every environment command gives, so a refusal, a no-op and a
+ * success are one shape the UI reads the same way.
+ */
+export interface EnvironmentReply {
+  /** Set iff a panorama is in force (import) or the change landed (reset). */
+  applied: boolean;
+  /** What it is called. The panorama's file stem, or the built-in sky's name. */
+  label: string;
+  /** Panorama size — the legible-cost line. Zero for the built-in sky. */
+  width: number;
+  height: number;
+  /**
+   * Mean linear radiance of the panorama — what the diffuse image-based lighting actually lights the
+   * scene with, not what the thumbnail looks like.
+   */
+  meanRadiance: [number, number, number];
+  /** A sentence to show: the summary on success, the reason on a refusal. Never empty on either. */
+  message: string;
+  /** Set iff nothing changed because something was wrong. */
+  reason: string | null;
+  /** The file it was read from, when there was one. */
+  path: string | null;
+  /** Set iff the person dismissed the file dialog — a no-op, not a failure, and drawn as neither. */
+  cancelled: boolean;
+}
+
 /** What the renderer is drawing this instant — measured, not inferred. */
 export interface VfxProbe {
   additive: number;
