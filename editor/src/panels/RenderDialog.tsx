@@ -6,6 +6,12 @@
 //! instant — and there was **no way at all to get a picture out**. Every still of this project's own
 //! benchmark film was an operating-system screenshot taken by a script outside the engine.
 //!
+//! ADR-182 — AND THEN IT BECAME A MOVIE. A sequence is not a deliverable: the person holding 120
+//! numbered PNGs still had to find, install and drive `ffmpeg` before anybody could watch the cut, and
+//! a cinematic that needs a second program is not one this engine delivered. The dialog now opens on
+//! `Movie`, writes one H.264 MP4 through the encoder Windows already has, and still offers the lossless
+//! sequence — which is what a compositor wants and the only thing that has no size ceiling.
+//!
 //! THE THREE MOMENTS, IN ONE PLACE (`<ux_quality>` 1-3). What will be written, said before the click;
 //! how far it has got, while it runs; and what was actually written and where, after. The last one is
 //! the part a status-bar toast could never carry: a sequence is 600 files in a folder, and "done" is
@@ -17,7 +23,7 @@ import { Button, SelectField, TextField } from "../theme/primitives";
 import { Callout, Field, FieldGrid, Metric, MetricGrid, ProgressBar } from "../theme/fields";
 import { Icon } from "../theme/icons";
 import { color, elevation, font, fontSize, radius, space } from "../theme/tokens";
-import type { CinemaReply, RenderReply } from "../transport/protocol";
+import type { CinemaReply, RenderFormat, RenderReply } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 
 /** The rates the engine renders at, in the order a picker should offer them.
@@ -43,6 +49,31 @@ const HEIGHTS = [
   { value: "1440", label: "1440 · QHD" },
   { value: "2160", label: "2160 · 4K UHD" },
 ] as const;
+
+/** ADR-182 — what a render delivers, in the order a picker should offer them.
+ *
+ *  TWO AND NOT FIVE. A movie is the thing a person can double-click and a sequence is the thing a
+ *  compositor can take; every other container is one of those two wearing a different extension. The
+ *  engine states the same two in `RenderFormat` and refuses anything else by name — and refuses the
+ *  MOVIE, in its own sentence, on a machine or at a size whose H.264 encoder will not take it, which
+ *  is the one refusal a sequence never has. */
+const FORMATS = [
+  { value: "movie", label: "Movie — one MP4 file" },
+  { value: "sequence", label: "PNG sequence — one file per frame" },
+] as const;
+
+/** What a render starts as.
+ *
+ *  THE MOVIE, for the reason 1080 is the default height and not "as on screen": a render is the thing
+ *  that LEAVES the editor, and what leaves it should be watchable. The sequence is still one click
+ *  away and is still the right answer for a compositor — it is lossless, and it is the only one of
+ *  the two with no encoder ceiling over it. */
+const DEFAULT_FORMAT: RenderFormat = "movie";
+
+/** Bits per second, in the unit a person would say out loud. */
+function rateLabel(bitsPerSecond: number): string {
+  return `${(bitsPerSecond / 1_000_000).toFixed(1)} Mbit/s`;
+}
 
 /** The height a render starts on.
  *
@@ -104,6 +135,7 @@ export function RenderDialog({
    *  it means is `height` below, and `null` is the engine's own word for "as on screen". */
   const [sizeChoice, setSizeChoice] = useState<string>(DEFAULT_HEIGHT);
   const [scope, setScope] = useState<"cut" | "shot">("cut");
+  const [format, setFormat] = useState<RenderFormat>(DEFAULT_FORMAT);
   const [stem, setStem] = useState(() => name);
   const [plan, setPlan] = useState<RenderReply | null>(null);
   const [job, setJob] = useState<RenderReply | null>(null);
@@ -135,6 +167,7 @@ export function RenderDialog({
     // two seconds of a thirteen-second cut for anybody who had clicked a clip first.
     setScope("cut");
     setSizeChoice(DEFAULT_HEIGHT);
+    setFormat(DEFAULT_FORMAT);
     let live = true;
     void client
       .cinemaRenderStatus()
@@ -156,7 +189,7 @@ export function RenderDialog({
     if (!open) return;
     let live = true;
     void client
-      .cinemaRenderPlan(entity, fps, shotIndex, height)
+      .cinemaRenderPlan(entity, fps, shotIndex, height, format)
       .then((reply) => {
         if (live) setPlan(reply);
       })
@@ -166,7 +199,7 @@ export function RenderDialog({
     return () => {
       live = false;
     };
-  }, [open, client, entity, fps, shotIndex, height]);
+  }, [open, client, entity, fps, shotIndex, height, format]);
 
   // Progress. Stops the moment the job does, so a finished render is not polled forever — and the
   // ledger it left is exactly what the last poll returned.
@@ -181,15 +214,25 @@ export function RenderDialog({
     return () => window.clearInterval(timer);
   }, [open, running, client]);
 
+  // ADR-182 — A MOVIE HAS ONE SIZE FOR ITS WHOLE LENGTH, so "as on screen" is not one it can have: a
+  // stream declares its frame size in a header written before the first sample, and the stage's size
+  // is a measurement that changes while you work. The engine refuses the pair in a sentence — but
+  // LEAVING the author on it and then explaining is worse than not offering it: the option disappears
+  // from the picker while a movie is selected, and choosing a movie while on it moves to the default
+  // height rather than to a refusal the author has to read and then undo.
+  useEffect(() => {
+    if (format === "movie" && sizeChoice === "viewport") setSizeChoice(DEFAULT_HEIGHT);
+  }, [format, sizeChoice]);
+
   const start = useCallback(async () => {
     setStarting(true);
     try {
-      const reply = await client.cinemaRenderStart(entity, fps, shotIndex, stem, null, height);
+      const reply = await client.cinemaRenderStart(entity, fps, shotIndex, stem, null, height, format);
       setJob(reply);
     } finally {
       setStarting(false);
     }
-  }, [client, entity, fps, shotIndex, stem, height]);
+  }, [client, entity, fps, shotIndex, stem, height, format]);
 
   const stop = useCallback(async () => {
     setJob(await client.cinemaRenderCancel());
@@ -203,6 +246,13 @@ export function RenderDialog({
   // flight, and while a refusal stands there is no size because there is no render.
   const outWidth = plan?.width ?? 0;
   const outHeight = plan?.height ?? 0;
+  // THE MOVIE'S PRICE, FROM THE ENGINE. `bitrate_for` is the engine's function and this never
+  // multiplies anything: the number said above the button is the number the encoder is handed.
+  const bitrate = plan?.bitrate ?? 0;
+  // What the FINISHED job was, not what the picker currently says — a reopened dialog is looking at a
+  // render it did not start, and a ledger captioned by this component's own state would describe the
+  // wrong delivery for it.
+  const jobIsMovie = job?.format === "movie";
   // ENABLED WHILE THE COUNT IS STILL COMING.
   //
   // A plan that has not arrived yet is not a refusal, and painting it as one is not free: the primary
@@ -258,8 +308,8 @@ export function RenderDialog({
             id={describedId}
             style={{ margin: 0, fontSize: fontSize.meta, color: color.text.secondary }}
           >
-            Every frame is drawn by the renderer the viewport draws with and written as a PNG, composed
-            for {deliveryLabel} — the same picture the preview shows, without the editor over it.
+            Every frame is drawn by the renderer the viewport draws with, composed for {deliveryLabel} —
+            the same picture the preview shows, without the editor over it.
           </p>
         </header>
 
@@ -280,7 +330,9 @@ export function RenderDialog({
             >
               {job.failures.length > 0
                 ? job.message
-                : `${job.seconds.toFixed(1)}s of cutscene at ${job.fps} frames per second.`}
+                : `${job.seconds.toFixed(1)}s of cutscene at ${job.fps} frames per second, ${
+                    jobIsMovie ? "encoded as one H.264 movie" : "as a lossless PNG sequence"
+                  }.`}
             </Callout>
             <MetricGrid minColumn={140}>
               <Metric
@@ -316,13 +368,24 @@ export function RenderDialog({
               >
                 {job.folder}
               </code>
+              {/* ONE NAME FOR A MOVIE, A RANGE FOR A SEQUENCE. The range answers the question the
+                  folder alone does not — which of these files are mine — and a movie has no such
+                  question: there is exactly one file and this is what it is called. Printing
+                  `take.0000.png … take.0119.png` over a folder holding one `take.mp4` would be the
+                  dialog describing a delivery it did not make. */}
               {job.written > 0 && (
                 <code
                   data-testid="render-ledger-files"
                   style={{ font: font.mono, fontSize: fontSize.meta, color: color.text.muted }}
                 >
-                  {job.stem}.0000.png … {job.stem}.
-                  {String(job.written - 1).padStart(4, "0")}.png
+                  {jobIsMovie ? (
+                    `${job.stem}.mp4`
+                  ) : (
+                    <>
+                      {job.stem}.0000.png … {job.stem}.
+                      {String(job.written - 1).padStart(4, "0")}.png
+                    </>
+                  )}
                 </code>
               )}
             </div>
@@ -401,6 +464,32 @@ export function RenderDialog({
                   )}
                 </SelectField>
               </Field>
+              {/* FIRST, BECAUSE IT CHANGES WHAT THE OTHERS MEAN. The size picker's ceiling, the cost
+                  line's second sentence and the ledger's file name all depend on this answer, so a
+                  control placed after them would be a control the reader meets after the sentences it
+                  governs. */}
+              <Field
+                label="Deliver as"
+                htmlFor="render-format"
+                help={
+                  format === "movie"
+                    ? "One file you can play anywhere. Encoded by this machine's own H.264 encoder."
+                    : "One lossless PNG per frame — bigger, and what a compositor or an editor wants."
+                }
+              >
+                <SelectField
+                  id="render-format"
+                  data-testid="render-format"
+                  value={format}
+                  onChange={(event) => setFormat(event.currentTarget.value as RenderFormat)}
+                >
+                  {FORMATS.map((f) => (
+                    <option key={f.value} value={f.value}>
+                      {f.label}
+                    </option>
+                  ))}
+                </SelectField>
+              </Field>
               <Field
                 label="Frame rate"
                 htmlFor="render-fps"
@@ -426,7 +515,9 @@ export function RenderDialog({
                 help={
                   // WHAT THE CHOICE IS FOR, not what the numbers are — the numbers are in the cost
                   // block below, stated once, by the engine.
-                  "The width follows the frame the shots are composed for. Taller is sharper and slower."
+                  format === "movie"
+                    ? "The width follows the frame the shots are composed for. A movie is one size for its whole length."
+                    : "The width follows the frame the shots are composed for. Taller is sharper and slower."
                 }
               >
                 <SelectField
@@ -437,8 +528,12 @@ export function RenderDialog({
                 >
                   {/* THE OLD BEHAVIOUR, STILL OFFERED AND NO LONGER THE DEFAULT. Rendering the stage
                       at whatever size the docks have left it is the right answer for a quick look at
-                      a cut, and the wrong one for anything that leaves the editor. */}
-                  <option value="viewport">As on screen</option>
+                      a cut, and the wrong one for anything that leaves the editor.
+
+                      ADR-182 — and it is not offered AT ALL for a movie, because a movie cannot have
+                      it: the stream's frame size is written once, before the first sample, and the
+                      stage's is a measurement that moves. Absent rather than present-and-refused. */}
+                  {format === "sequence" && <option value="viewport">As on screen</option>}
                   {HEIGHTS.map((h) => (
                     <option key={h.value} value={h.value}>
                       {h.label}
@@ -449,7 +544,11 @@ export function RenderDialog({
               <Field
                 label="Name"
                 htmlFor="render-stem"
-                help="Frames are numbered after it — name.0000.png, name.0001.png."
+                help={
+                  format === "movie"
+                    ? "The movie is called after it — name.mp4."
+                    : "Frames are numbered after it — name.0000.png, name.0001.png."
+                }
               >
                 <TextField
                   id="render-stem"
@@ -484,7 +583,9 @@ export function RenderDialog({
                   folder is the next question. */}
               {refusal === null && frames > 0 && (
                 <span style={{ fontSize: fontSize.meta, color: color.text.secondary }}>
-                  Lossless PNG, one file per frame, into a folder you choose next.
+                  {format === "movie"
+                    ? `One H.264 MP4 at about ${rateLabel(bitrate)}, into a folder you choose next.`
+                    : "Lossless PNG, one file per frame, into a folder you choose next."}
                 </span>
               )}
             </div>

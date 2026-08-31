@@ -117,6 +117,36 @@ jobs:
           fi
           echo "no rapier/parry outside /physics — Physics-trait boundary intact"
 
+      - name: No windows-crate types leak outside the video sub-engine (invariant 5, ADR-182)
+        run: |
+          # ADR-182 — the platform H.264 encoder (Media Foundation, through the `windows` crate) lives
+          # ONLY behind the project-owned MovieWriter/probe facade in editor-shell/src-tauri/src/video.rs
+          # — the same discipline as rapier-in-/physics and extism-in-/plugins. Nothing else may name a
+          # `windows::` type, so the day this engine encodes on another platform only the inside of that
+          # one file changes. `diag.rs` declares its four Win32 symbols by hand (no `windows::`), which is
+          # why it is not an exception here: it does not use the crate at all.
+          #
+          # THIS GATE CANNOT FAIL OPEN. A grep over a moved or renamed path exits non-zero and would
+          # otherwise print the success sentence having searched nothing, so the file's existence and a
+          # POSITIVE control inside it are both asserted first, and the gate reports its own reach.
+          VIDEO=editor-shell/src-tauri/src/video.rs
+          if [ ! -f "$VIDEO" ]; then
+            echo "::error::$VIDEO is gone — this gate has nothing to check, which is not the same as a clean tree"
+            exit 1
+          fi
+          INSIDE=$(grep -c "windows::" "$VIDEO" || true)
+          if [ "$INSIDE" -eq 0 ]; then
+            echo "::error::no windows:: inside $VIDEO — the pattern or the wrapper moved, so a clean result here means nothing"
+            exit 1
+          fi
+          OUTSIDE=$(grep -rln "windows::" core ecs transport plugins assets economy physics interchange gizmo skeleton deform terrain animation character gameplay editor-shell tools --include='*.rs' | grep -v "^$VIDEO$" || true)
+          if [ -n "$OUTSIDE" ]; then
+            echo "$OUTSIDE"
+            echo "::error::the windows crate leaked outside $VIDEO — platform encoder types must stay behind the MovieWriter facade (invariant 5; mirrors ADR-021/047)"
+            exit 1
+          fi
+          echo "$INSIDE windows:: reference(s), all inside $VIDEO — encoder boundary intact"
+
       - name: No extism/wasmtime types leak outside the /plugins crate (invariant 5, M12.3/ADR-047)
         run: |
           # extism::/wasmtime:: (the WASM host SDK) must live ONLY behind the PluginHost trait, in /plugins —

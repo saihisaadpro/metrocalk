@@ -11,6 +11,13 @@
 // out as a numbered sequence — both by reading back the SAME swapchain texture the viewer is looking
 // at, between the frame's submit and its present. So the file is the picture, by construction.
 //
+// ADR-182 — AND THEN IT BECAME A MOVIE. A sequence is not a deliverable: what came out of a render was
+// N numbered PNGs and an unstated instruction to install `ffmpeg`. `cinema_render_start` now defaults to
+// one H.264 MP4, written through the encoder Windows already has, and the claims about it are properties
+// of the FILE the same way the sequence's are — its box structure read out of its own bytes, with `moov`
+// as the one that cannot be faked: the sink writer only writes the movie header on `Finalize`, so a
+// container that was dropped rather than closed has media in it and no index.
+//
 // EVERY CLAIM HERE IS A PROPERTY OF THE FILES. How many exist, what shape they are (read out of each
 // PNG's own IHDR, not out of the reply that claims it), and whether consecutive frames differ — which
 // is the only way to tell a rendered camera MOVE from 60 copies of one frame. The UI is driven the way
@@ -63,6 +70,55 @@ function pngSize(file) {
 }
 
 const sha = (file) => createHash("sha256").update(readFileSync(file)).digest("hex").slice(0, 12);
+
+/** ADR-182 — an MP4's top-level box list, read out of its own bytes.
+ *
+ *  An ISO base-media file is a length-prefixed box list, so this is six lines and no demuxer. The one
+ *  that matters is `moov`: Media Foundation writes the movie header on `Finalize` and nowhere else, so
+ *  its presence is the difference between a playable file and a file every operating system lists at
+ *  the right size and no player will open. Nothing in the reply can tell those two apart. */
+function mp4Boxes(file) {
+  const buf = readFileSync(file);
+  const boxes = [];
+  let at = 0;
+  while (at + 8 <= buf.length) {
+    let size = buf.readUInt32BE(at);
+    const kind = buf.toString("ascii", at + 4, at + 8);
+    let header = 8;
+    if (size === 0) size = buf.length - at;
+    else if (size === 1 && at + 16 <= buf.length) {
+      size = Number(buf.readBigUInt64BE(at + 8));
+      header = 16;
+    }
+    boxes.push({ kind, size });
+    if (size < header) break;
+    at += size;
+  }
+  return { boxes, bytes: buf.length };
+}
+
+/** What `ffprobe` says about a movie, or `null` when this machine has no ffprobe.
+ *
+ *  EVIDENCE AND NOT A GATE. The assertions in this file are the box structure, which needs nothing
+ *  installed; this reads a SECOND, independent opinion out of a real demuxer when one happens to be on
+ *  the box, and logs it. A test that only passed where ffmpeg is installed would be a test most people
+ *  running this suite could not run. */
+function ffprobe(file) {
+  try {
+    const out = execFileSync(
+      "ffprobe",
+      ["-v", "error", "-select_streams", "v:0", "-show_entries",
+       "stream=codec_name,profile,pix_fmt,width,height,nb_frames,avg_frame_rate:format=duration", "-of", "json", file],
+      { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" },
+    );
+    return JSON.parse(out);
+  } catch {
+    return null;
+  }
+}
+
+const movies = (folder) =>
+  existsSync(folder) ? readdirSync(folder).filter((f) => f.endsWith(".mp4")).sort() : [];
 
 const frames = (folder) =>
   existsSync(folder) ? readdirSync(folder).filter((f) => f.endsWith(".png")).sort() : [];
@@ -120,8 +176,8 @@ const setSelect = (selector, value) =>
 
 /** Run a render to completion through the same three commands the dialog calls, and hand back the
  *  ledger. The folder is the one argument the picker would have supplied. */
-async function render(entity, { fps, shot, stem, folder, height = null }) {
-  const started = await invoke("cinema_render_start", { id: entity, fps, shot, stem, folder, height });
+async function render(entity, { fps, shot, stem, folder, height = null, format = "sequence" }) {
+  const started = await invoke("cinema_render_start", { id: entity, fps, shot, stem, folder, height, format });
   if (started.reason) throw new Error(`the render was refused: ${started.reason}`);
   let last = started;
   await browser.waitUntil(
@@ -191,7 +247,7 @@ describe("Rendering a cutscene to files — the engine delivers a picture", () =
 
     // The cost, before the click, and it is the engine's own arithmetic — asserted by asking
     // `cinema_render_plan` the same question the dialog asked and comparing the two.
-    plan = await invoke("cinema_render_plan", { id: statue, fps: 24, shot: null, height: null });
+    plan = await invoke("cinema_render_plan", { id: statue, fps: 24, shot: null, height: null, format: "sequence" });
     expect(plan.reason).toBe(null);
     expect(plan.frames).toBeGreaterThan(0);
     const cost = await text('[data-testid="render-cost"]');
@@ -207,14 +263,18 @@ describe("Rendering a cutscene to files — the engine delivers a picture", () =
     const dialog = await text('[data-testid="render-dialog"]');
     expect(dialog).toContain("Frame size");
     expect(await exists('[data-testid="render-size"]')).toBe(true);
-    const opened = await browser.execute(
-      () => document.querySelector('[data-testid="render-size"]')?.value ?? null,
-    );
-    console.log(`[render] the size picker opens on: ${opened}`);
-    expect(opened).toBe("1080");
+    const opened = await browser.execute(() => ({
+      size: document.querySelector('[data-testid="render-size"]')?.value ?? null,
+      format: document.querySelector('[data-testid="render-format"]')?.value ?? null,
+    }));
+    console.log(`[render] the dialog opens on: ${opened.format} at ${opened.size}`);
+    expect(opened.size).toBe("1080");
+    // ADR-182 — AND ON A MOVIE. Until this pass the answer to "render my cut" was a folder of numbered
+    // PNGs and an unstated instruction to go and install `ffmpeg`.
+    expect(opened.format).toBe("movie");
     // ...and the cost sentence carries the pixels the engine planned, not a multiplication done in the
     // dialog. Asked of the engine with the same height and compared.
-    const sized = await invoke("cinema_render_plan", { id: statue, fps: 24, shot: null, height: 1080 });
+    const sized = await invoke("cinema_render_plan", { id: statue, fps: 24, shot: null, height: 1080, format: "sequence" });
     expect(sized.reason).toBe(null);
     expect(sized.height).toBe(1080);
     console.log(`[render] 1080 planned as ${sized.width}x${sized.height}`);
@@ -351,6 +411,7 @@ describe("Rendering a cutscene to files — the engine delivers a picture", () =
       stem: "preview",
       folder,
       height: 1440,
+      format: "sequence",
     });
     expect(started.reason).toBe(null);
     expect(started.offscreen).toBe(true);
@@ -385,6 +446,195 @@ describe("Rendering a cutscene to files — the engine delivers a picture", () =
     expect(after.cinematic).toBe(false);
   });
 
+  it("ADR-182 — writes ONE movie, and it is a container that was actually closed", async () => {
+    // THE CLOSING GATE OF ADR-177's FIRST OWED ITEM. Every render before this one produced numbered
+    // PNGs; a person who wanted something watchable had to find, install and drive `ffmpeg`. Here the
+    // engine hands back a file, and every claim below is a property of THAT FILE rather than of the
+    // reply describing it.
+    const folder = path.join(shots, "movie-cut");
+    const ledger = await render(statue, {
+      fps: 24,
+      shot: 1,
+      stem: "hero-movie",
+      folder,
+      height: 720,
+      format: "movie",
+    });
+    console.log(`[movie] ${ledger.message}`);
+    expect(ledger.reason).toBe(null);
+    expect(ledger.failures).toEqual([]);
+    expect(ledger.format).toBe("movie");
+    // The bit rate is the engine's own `bitrate_for`, carried on the reply so the dialog states it
+    // rather than multiplying: 1722 x 720 x 24 x 0.12 bits.
+    expect(ledger.bitrate).toBe(Math.floor((1722 * 720 * 24 * 12) / 100));
+
+    // ONE FILE, AND NO FRAMES BESIDE IT. A movie render that also left 60 PNGs in the folder would be
+    // a delivery nobody asked for, and the ledger would be describing half of what happened.
+    const films = movies(folder);
+    console.log(`[movie] ${films.length} movie(s) and ${frames(folder).length} PNG(s) in ${folder}`);
+    expect(films).toEqual(["hero-movie.mp4"]);
+    expect(frames(folder).length).toBe(0);
+
+    const file = path.join(folder, films[0]);
+    const { boxes, bytes } = mp4Boxes(file);
+    const kinds = boxes.map((b) => b.kind);
+    console.log(`[movie] boxes: ${kinds.join(", ")} — ${bytes} bytes`);
+    // `ftyp` first: this is an MP4 and not a file with an .mp4 on the end.
+    expect(kinds[0]).toBe("ftyp");
+    // `moov` is THE assertion. Media Foundation writes the movie header on `Finalize` and nowhere
+    // else, so its presence is the difference between a playable file and one every operating system
+    // lists at the right size and no player will open. `finish` is called on all six of the job's
+    // endings for exactly this reason, and nothing in the reply can tell the two apart.
+    expect(kinds).toContain("moov");
+    const mdat = boxes.find((b) => b.kind === "mdat");
+    expect(mdat).toBeTruthy();
+    // A MOVING PICTURE, not 60 copies of one frame: a codec handed identical frames emits almost
+    // nothing after the first, so an `mdat` this size is the push-in actually being encoded.
+    expect(mdat.size).toBeGreaterThan(20_000);
+    // …and the ledger's byte count is the file's own size, not a running total of anything.
+    expect(ledger.bytes).toBe(bytes);
+    expect(ledger.written).toBe(ledger.frames);
+
+    // A SECOND, INDEPENDENT OPINION where the machine has one. Evidence and not a gate — the
+    // assertions above need nothing installed, and a test that only ran where ffmpeg is present would
+    // be a test most people running this suite could not run.
+    const probe = ffprobe(file);
+    if (probe) {
+      const v = probe.streams[0];
+      console.log(
+        `[movie] ffprobe: ${v.codec_name} ${v.profile} ${v.pix_fmt} ${v.width}x${v.height} @ ${v.avg_frame_rate}, ${probe.format.duration}s`,
+      );
+      expect(v.codec_name).toBe("h264");
+      // ADR-182 — NOT Constrained Baseline, which is what an encoder left to choose picks and what
+      // the first movie this engine wrote came back as. At the same bit rate that is visibly worse on
+      // large flat fills with hard edges, which is what a CAD cutscene is made of.
+      expect(v.profile).not.toBe("Constrained Baseline");
+      expect(v.pix_fmt).toBe("yuv420p");
+      expect(v.width).toBe(ledger.width);
+      expect(v.height).toBe(720);
+      // 24 frames of a 24 fps stream is one second; the shot is 2.5s at Normal pacing.
+      expect(Number(probe.format.duration)).toBeGreaterThan(ledger.frames / 24 - 0.2);
+    } else {
+      console.log("[movie] no ffprobe on this machine — the box assertions above are the gate");
+    }
+
+    // …and the viewport is handed back, exactly as a sequence render hands it back.
+    const after = await invoke("camera_probe");
+    expect(after.cinematic).toBe(false);
+  });
+
+  it("ADR-182 — a STOPPED movie is still a movie, because the container is closed on every ending", async () => {
+    // THE SIX-ENDINGS CLAIM, exercised on the one ending a user causes. `CinemaRenderJob::finish` is
+    // the single exit `render_size` was already cleared on, and ADR-182 put the container close there
+    // for exactly this reason: a cancelled render that left an un-finalised MP4 would hand back a file
+    // every operating system lists at the right size and no player will open — and the ledger would
+    // say "kept" about it. A cancelled SEQUENCE keeps the frames it wrote; this is the same promise.
+    const folder = path.join(shots, "stopped-movie");
+    const started = await invoke("cinema_render_start", {
+      id: statue,
+      fps: 24,
+      shot: null,
+      stem: "stopped",
+      folder,
+      height: 720,
+      format: "movie",
+    });
+    expect(started.reason).toBe(null);
+    let live = started;
+    await browser.waitUntil(
+      async () => {
+        live = await invoke("cinema_render_status");
+        return live.written >= 8 || live.done === true;
+      },
+      { timeout: 120000, interval: 200, timeoutMsg: "the movie never encoded a frame" },
+    );
+    expect(live.done).toBe(false);
+    const stopped = await invoke("cinema_render_cancel");
+    console.log(`[movie] stopped after ${stopped.written} of ${stopped.frames} frames: ${stopped.message}`);
+    expect(stopped.done).toBe(true);
+    // FEWER FRAMES THAN THE PLAN — otherwise this photographed a finished render and proves nothing.
+    expect(stopped.written).toBeLessThan(stopped.frames);
+    expect(stopped.written).toBeGreaterThan(0);
+
+    const films = movies(folder);
+    expect(films).toEqual(["stopped.mp4"]);
+    const { boxes, bytes } = mp4Boxes(path.join(folder, films[0]));
+    const kinds = boxes.map((b) => b.kind);
+    console.log(`[movie] the stopped file: ${kinds.join(", ")} — ${bytes} bytes`);
+    // The whole assertion: `moov` is written on `Finalize` and nowhere else.
+    expect(kinds).toContain("moov");
+    expect(bytes).toBe(stopped.bytes);
+    const probe = ffprobe(path.join(folder, films[0]));
+    if (probe) {
+      console.log(`[movie] the stopped file plays: ${probe.streams[0].codec_name} ${probe.format.duration}s`);
+      expect(probe.streams[0].codec_name).toBe("h264");
+    }
+    const after = await invoke("camera_probe");
+    expect(after.cinematic).toBe(false);
+  });
+
+  it("ADR-182 — refuses a movie it cannot make, by name, before anything is written", async () => {
+    // TWO REFUSALS, BOTH BEFORE THE CLICK, both naming the control that fixes them. The alternative is
+    // a render that draws every frame correctly for four minutes and then cannot close its container.
+    const tooBig = await invoke("cinema_render_plan", {
+      id: statue,
+      fps: 24,
+      shot: null,
+      height: 2160,
+      format: "movie",
+    });
+    console.log(`[movie] 2160 as a movie: ${tooBig.reason}`);
+    // The cut is in scope by now, so 2160 lines is 5162 wide — past what H.264 encodes.
+    expect(tooBig.reason).toContain("5162");
+    expect(tooBig.reason).toContain("PNG sequence");
+    // …and the SAME size as a sequence is fine, because the ceiling belongs to the encoder.
+    const asFrames = await invoke("cinema_render_plan", {
+      id: statue,
+      fps: 24,
+      shot: null,
+      height: 2160,
+      format: "sequence",
+    });
+    expect(asFrames.reason).toBe(null);
+    expect(asFrames.width).toBe(5162);
+
+    // A movie has ONE size for its whole length, so "as on screen" is not one it can have.
+    const unfixed = await invoke("cinema_render_plan", {
+      id: statue,
+      fps: 24,
+      shot: null,
+      height: null,
+      format: "movie",
+    });
+    console.log(`[movie] as-on-screen as a movie: ${unfixed.reason}`);
+    expect(unfixed.reason).toContain("output height");
+
+    // A delivery this build does not offer is refused rather than silently defaulted.
+    const nonsense = await invoke("cinema_render_plan", {
+      id: statue,
+      fps: 24,
+      shot: null,
+      height: 1080,
+      format: "webm",
+    });
+    expect(nonsense.reason).toContain("webm");
+
+    // NOTHING ON DISK for any of them.
+    const folder = path.join(shots, "never-a-movie");
+    const started = await invoke("cinema_render_start", {
+      id: statue,
+      fps: 24,
+      shot: null,
+      stem: "never",
+      folder,
+      height: 2160,
+      format: "movie",
+    });
+    expect(started.reason).toContain("5162");
+    expect(movies(folder).length).toBe(0);
+    expect(frames(folder).length).toBe(0);
+  });
+
   it("ADR-175 item 6 — re-rendering an unchanged cut writes the same bytes", async () => {
     // OBSERVED IN THE ADR-175 RUN, ASSERTED HERE. Two independent `.exe` builds produced byte-
     // identical sequences, which is a real property of a pure shot solver over a deterministic
@@ -417,7 +667,7 @@ describe("Rendering a cutscene to files — the engine delivers a picture", () =
   it("refuses a size this build does not render at, by name rather than by clamping", async () => {
     // The same shape of refusal as an unoffered frame rate, and for the same reason: a render that
     // quietly became 1080 would deliver a master at a size nobody chose.
-    const odd = await invoke("cinema_render_plan", { id: statue, fps: 24, shot: null, height: 900 });
+    const odd = await invoke("cinema_render_plan", { id: statue, fps: 24, shot: null, height: 900, format: "sequence" });
     expect(odd.reason).toContain("900");
     expect(odd.reason).toContain("2160");
     const folder = path.join(shots, "never-900");
@@ -428,6 +678,7 @@ describe("Rendering a cutscene to files — the engine delivers a picture", () =
       stem: "nine",
       folder,
       height: 900,
+      format: "sequence",
     });
     expect(started.reason).toContain("900");
     expect(frames(folder).length).toBe(0);

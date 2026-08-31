@@ -1448,6 +1448,89 @@ pub const DEFAULT_RENDER_FPS: u32 = 24;
 /// size that is the wrong shape for the shot.
 pub const RENDER_HEIGHTS: [u32; 4] = [720, 1080, 1440, 2160];
 
+/// ADR-182 — what a render DELIVERS.
+///
+/// TWO AND NOT FIVE. A movie is the thing a person can double-click; a sequence is the thing a
+/// compositor can take. Every other container anybody would name is one of those two wearing a
+/// different extension, and offering five would be four ways to ask the same question.
+///
+/// [`Self::Movie`] IS THE DEFAULT, for the reason 1080 is the default height and "as on screen" is
+/// not: a render is the thing that leaves the editor, and what leaves it should be watchable without
+/// a second program. Until this existed the answer to "render my cut" was 120 numbered PNGs and an
+/// unstated instruction to go and install `ffmpeg` — the last hop of the whole cinematics chain,
+/// left to the user, in a tool nobody named.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RenderFormat {
+    /// One H.264 MP4, encoded by the platform's own encoder.
+    #[default]
+    Movie,
+    /// One lossless PNG per frame — ADR-175's delivery, and still the right one for a compositor.
+    Sequence,
+}
+
+impl RenderFormat {
+    /// The wire name, matching the serde representation. One list, so a catalogue a UI renders and the
+    /// value it sends back cannot drift apart.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Movie => "movie",
+            Self::Sequence => "sequence",
+        }
+    }
+
+    /// What a user calls it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Movie => "Movie — one MP4 file",
+            Self::Sequence => "PNG sequence — one file per frame",
+        }
+    }
+
+    /// Both, in the order a picker should offer them.
+    #[must_use]
+    pub fn all() -> [Self; 2] {
+        [Self::Movie, Self::Sequence]
+    }
+
+    /// Read a wire name. Unknown names are refused rather than silently defaulted, for the reason
+    /// [`Delivery::from_key`] refuses one: a render that quietly became a sequence when the author
+    /// asked for a movie would deliver the wrong thing and say nothing.
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::all().into_iter().find(|f| f.key() == key)
+    }
+}
+
+/// ADR-182 — the largest either side of a MOVIE frame may be.
+///
+/// H.264's own level table reaches further and no encoder Windows ships reaches further reliably: the
+/// software fallback tops out around 1920 lines and the hardware ones at 4096. The failure past it is
+/// the worst kind there is — every frame drawn correctly and then a container that cannot be closed —
+/// so this is the point past which it is not worth asking, and `video::probe` measures the rest on the
+/// real machine. A 2160-line scope master is 5162 wide and lands past it, which is exactly the case
+/// this constant exists to turn into a sentence.
+pub const MAX_MOVIE_DIMENSION: u32 = 4096;
+
+/// ADR-182 — the bit rate a movie of this size and rate is encoded at.
+///
+/// A NUMBER THE ENGINE DERIVES, NOT A DIAL THE AUTHOR TURNS. Bit rate is the one video setting nobody
+/// can judge without watching the result, so a box offering it offers a way to make the render worse
+/// for no reason its owner can see. The formula is the ordinary one — bits per pixel per frame — at
+/// 0.12, which is where H.264 stops blocking on synthetic content with hard edges and large flat
+/// fills, which is what a CAD assembly is. 1920x1080 at 24 comes out at 6.0 Mbit/s and a 2582x1080
+/// scope master at 8.0. Integer arithmetic, so the answer is the same on every machine.
+///
+/// Clamped at both ends: below 2 Mbit/s even a small frame smears, and past 120 Mbit/s the encoder is
+/// being asked for more than the container is worth carrying.
+#[must_use]
+pub fn bitrate_for(width: u32, height: u32, fps: u32) -> u32 {
+    let pixels = u64::from(width) * u64::from(height) * u64::from(fps.max(1));
+    u32::try_from((pixels * 12 / 100).clamp(2_000_000, 120_000_000)).unwrap_or(120_000_000)
+}
+
 /// The largest either side of a rendered frame may be.
 ///
 /// `wgpu`'s downlevel-webgl2 floor for `max_texture_dimension_2d` is 8192 and every desktop backend
@@ -1593,6 +1676,13 @@ pub struct RenderPlan {
     /// renderer may not honour.
     pub width: u32,
     pub height: u32,
+    /// ADR-182 — what this render delivers.
+    pub format: RenderFormat,
+    /// ADR-182 — [`bitrate_for`]'s answer for a movie, `0` for a sequence, which has no such number:
+    /// PNG is lossless and its size is whatever the picture costs. Decided HERE for the reason the
+    /// pixel size is: the rate stated above the button is then the rate the encoder is handed, rather
+    /// than a second multiplication done in the dialog that the engine may not honour.
+    pub bitrate: u32,
 }
 
 impl RenderPlan {
@@ -1602,6 +1692,15 @@ impl RenderPlan {
     /// rather than on it, which is what a frame *rate* means — a frame is an interval, not a point, and
     /// filming the closing instant as well would play the cut back one frame long.
     #[must_use]
+    // Both casts are of numbers this type has already bounded: `index` is below `frames`, which
+    // `plan_render` refuses above `MAX_RENDER_FRAMES` (12,000), and `fps` is one of four constants.
+    // Every value either can hold is exactly representable in `f32` — 2^24 is 16.7 million — so there
+    // is no precision to lose here, and the alternative (`f64` throughout) would change the type the
+    // shot solver takes.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "both operands are bounded far below f32's exact-integer range"
+    )]
     pub fn instant(&self, index: u32) -> f32 {
         self.start_seconds + index as f32 / self.fps.max(1) as f32
     }
@@ -1617,6 +1716,7 @@ pub fn plan_render(
     fps: u32,
     scope: RenderScope,
     sizing: FrameSizing,
+    format: RenderFormat,
 ) -> Result<RenderPlan, String> {
     if cut.shots.is_empty() {
         return Err("There is nothing to render — this object has no shots yet.".into());
@@ -1652,6 +1752,16 @@ pub fn plan_render(
     // Round rather than truncate: a 2.5 s shot at 24 fps is 60 frames, and `as u32` on 59.999994 is 59
     // — one frame of the shot silently missing, which is exactly the kind of arithmetic that is only
     // ever noticed when somebody counts the files.
+    //
+    // `fps` is one of four constants and exact in `f32`; `seconds` is finite and positive by the check
+    // above, so the product is non-negative and a value large enough to saturate lands on `u32::MAX`,
+    // which the very next line refuses rather than wrapping. Same argument as `render_frame_size`.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bounded above, and the ceiling check below is what catches anything that is not"
+    )]
     let frames = (seconds * fps as f32).round().max(1.0) as u32;
     if frames > MAX_RENDER_FRAMES {
         return Err(format!(
@@ -1662,6 +1772,32 @@ pub fn plan_render(
     // empty or stale cut produces. A size refusal is about the delivery, and reaching it means the
     // cutscene itself was fine.
     let (width, height) = render_frame_size(sizing)?;
+    // ADR-182 — LAST OF ALL, and only for a movie. A sequence has no encoder over it, so this refusal
+    // must never be able to reach one; and it is stated after the size for the same reason the size is
+    // stated after the cut — reaching it means everything before it was fine, so the sentence can name
+    // the one control that has to change. `video::probe` measures the rest on the real device; this is
+    // the part that can be known without one, and therefore the part a test can hold.
+    // ADR-182 — A MOVIE IS ONE SIZE FOR ITS WHOLE LENGTH, so it cannot be "whatever the window is".
+    //
+    // Not a limitation of this encoder: a video stream declares its frame size once, in the header
+    // written before the first sample. The swapchain path's size is a MEASUREMENT taken from the first
+    // captured frame — the window can be resized, a dock opened, the picture re-composed — and it can
+    // land on an odd number of pixels, which 4:2:0 chroma has no partner for. Every one of those is a
+    // render that would start and then fail somewhere in the middle. The height picker is one control
+    // away and the default is already 1080, so this is a sentence almost nobody reads.
+    if format == RenderFormat::Movie && sizing.height.is_none() {
+        return Err(
+            "A movie is encoded at one fixed size, and the stage changes size while you work. Choose an output height, or render a PNG sequence, which follows the window."
+                .into(),
+        );
+    }
+    if format == RenderFormat::Movie
+        && (width > MAX_MOVIE_DIMENSION || height > MAX_MOVIE_DIMENSION)
+    {
+        return Err(format!(
+            "{width} x {height} is larger than the {MAX_MOVIE_DIMENSION} pixels H.264 encodes reliably. Choose a shorter height, or render a PNG sequence, which has no such limit."
+        ));
+    }
     Ok(RenderPlan {
         start_seconds,
         seconds,
@@ -1670,6 +1806,11 @@ pub fn plan_render(
         scope,
         width,
         height,
+        format,
+        bitrate: match format {
+            RenderFormat::Movie => bitrate_for(width, height, fps),
+            RenderFormat::Sequence => 0,
+        },
     })
 }
 
@@ -1708,6 +1849,16 @@ pub fn sanitise_stem(stem: &str) -> String {
     }
 }
 
+/// ADR-182 — the file a MOVIE render writes, for a cut whose frames would be called `stem`.
+///
+/// One file and not a folder of them, which is the whole point — and through the same
+/// [`sanitise_stem`] the sequence uses, so one cut delivered both ways is named the same thing twice
+/// rather than two things once.
+#[must_use]
+pub fn render_movie_name(stem: &str) -> String {
+    format!("{}.mp4", sanitise_stem(stem))
+}
+
 /// What a render job answers with, whether it is being started, polled or cancelled.
 ///
 /// ONE reply shape for all three, because a progress bar and a ledger are the same six numbers at
@@ -1743,6 +1894,17 @@ pub struct RenderReply {
     /// swapchain capture genuinely depends on — would be a false warning on the path that does not.
     #[serde(default)]
     pub offscreen: bool,
+    /// ADR-182 — what this render delivers.
+    ///
+    /// On the REPLY and not only in the dialog's own state, because a dialog reopened onto a running
+    /// job is looking at a render it did not start: a ledger captioned from the picker's current
+    /// position would name the wrong delivery for it, and "…take.0000.png … take.0119.png" over a
+    /// folder holding one `take.mp4` is a surface describing something that did not happen.
+    #[serde(default)]
+    pub format: RenderFormat,
+    /// ADR-182 — the bit rate a movie is encoded at, `0` for a sequence. See [`bitrate_for`].
+    #[serde(default)]
+    pub bitrate: u32,
     /// The rate the sequence is timed at.
     pub fps: u32,
     /// The span of the cutscene clock being filmed.
@@ -2887,7 +3049,14 @@ mod tests {
         let (mut engine, _scene) = world();
         let hero = spawn(&mut engine);
         let cut = three_shot_cut(&mut engine, hero);
-        let plan = plan_render(&cut, 24, RenderScope::WholeCut, stage()).expect("plans");
+        let plan = plan_render(
+            &cut,
+            24,
+            RenderScope::WholeCut,
+            stage(),
+            RenderFormat::Sequence,
+        )
+        .expect("plans");
         assert!(exactly(plan.start_seconds, 0.0), "the cut starts at zero");
         assert!(
             (plan.seconds - cut.seconds()).abs() < 1.0e-4,
@@ -2897,7 +3066,13 @@ mod tests {
         );
         // ROUNDED, not truncated. The count is the one number a user can check by listing a folder,
         // and `as u32` on 179.99999 writes 179 files for a 180-frame cut with nothing saying so.
-        assert_eq!(plan.frames, (cut.seconds() * 24.0).round() as u32);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a fixture cut of a few seconds; the assertion is about the rounding"
+        )]
+        let expected = (cut.seconds() * 24.0).round() as u32;
+        assert_eq!(plan.frames, expected);
         // The LAST frame lands inside the cut, a frame short of its end — a frame is an interval, and
         // filming the closing instant as well plays back one frame long.
         let last = plan.instant(plan.frames - 1);
@@ -2917,7 +3092,14 @@ mod tests {
         let (mut engine, _scene) = world();
         let hero = spawn(&mut engine);
         let cut = three_shot_cut(&mut engine, hero);
-        let second = plan_render(&cut, 30, RenderScope::Shot(1), stage()).expect("plans");
+        let second = plan_render(
+            &cut,
+            30,
+            RenderScope::Shot(1),
+            stage(),
+            RenderFormat::Sequence,
+        )
+        .expect("plans");
         let one = cut.effective_shot_seconds(0).expect("shot 0");
         assert!(
             (second.start_seconds - one).abs() < 1.0e-4,
@@ -2947,27 +3129,52 @@ mod tests {
         let (mut engine, _scene) = world();
         let hero = spawn(&mut engine);
         let empty = Cutscene::default();
-        assert!(plan_render(&empty, 24, RenderScope::WholeCut, stage())
-            .expect_err("an empty cut has nothing to render")
-            .contains("no shots"));
+        assert!(plan_render(
+            &empty,
+            24,
+            RenderScope::WholeCut,
+            stage(),
+            RenderFormat::Sequence
+        )
+        .expect_err("an empty cut has nothing to render")
+        .contains("no shots"));
         let cut = three_shot_cut(&mut engine, hero);
         // A rate this build does not offer. Refused rather than clamped: a render that quietly became
         // 24 fps would produce a sequence timed against a rate nobody chose.
-        let refused =
-            plan_render(&cut, 23, RenderScope::WholeCut, stage()).expect_err("23 is not a rate");
+        let refused = plan_render(
+            &cut,
+            23,
+            RenderScope::WholeCut,
+            stage(),
+            RenderFormat::Sequence,
+        )
+        .expect_err("23 is not a rate");
         assert!(refused.contains("23"), "{refused}");
         assert!(
             refused.contains("24"),
             "and names what is offered: {refused}"
         );
         // A shot that is not there.
-        assert!(plan_render(&cut, 24, RenderScope::Shot(9), stage())
-            .expect_err("shot 10 of 3")
-            .contains("Shot 10"));
+        assert!(plan_render(
+            &cut,
+            24,
+            RenderScope::Shot(9),
+            stage(),
+            RenderFormat::Sequence
+        )
+        .expect_err("shot 10 of 3")
+        .contains("Shot 10"));
         // And the ceiling. NEGATIVE CONTROL beside it: the same cut at 24 fps is well inside, so this
         // asserts the ceiling and not merely that some rate somewhere refuses.
         assert!(
-            plan_render(&cut, 24, RenderScope::WholeCut, stage()).is_ok(),
+            plan_render(
+                &cut,
+                24,
+                RenderScope::WholeCut,
+                stage(),
+                RenderFormat::Sequence
+            )
+            .is_ok(),
             "a three-shot cut at 24 fps is nowhere near the ceiling"
         );
         let long = Cutscene {
@@ -2985,8 +3192,14 @@ mod tests {
             mood: Mood::Calm,
             ..Cutscene::default()
         };
-        let over =
-            plan_render(&long, 60, RenderScope::WholeCut, stage()).expect_err("over the ceiling");
+        let over = plan_render(
+            &long,
+            60,
+            RenderScope::WholeCut,
+            stage(),
+            RenderFormat::Sequence,
+        )
+        .expect_err("over the ceiling");
         assert!(
             over.contains(&MAX_RENDER_FRAMES.to_string()),
             "the refusal names the ceiling: {over}"
@@ -3019,8 +3232,13 @@ mod tests {
         );
         // 1080 x 2.39 = 2581.2, rounded to 2581, and then made even.
         assert_eq!(w, 2582);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "two render dimensions, both far below f32's exact-integer range"
+        )]
+        let ratio = w as f32 / h as f32;
         assert!(
-            ((w as f32 / h as f32) - 2.39).abs() < 0.002,
+            (ratio - 2.39).abs() < 0.002,
             "the file is the shape the shot was solved for: {w}x{h}"
         );
         // A vertical delivery gets a NARROW frame from the same rule — the width is never assumed to
@@ -3049,7 +3267,13 @@ mod tests {
         }
         // And the negative control: 1721 is what the unrounded arithmetic gives, so the assertion
         // above is testing the rounding and not a coincidence.
-        assert_eq!((720.0f32 * 2.39).round() as u32, 1721);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a literal negative control: 1721.0 is exact in f32"
+        )]
+        let unrounded = (720.0f32 * 2.39).round() as u32;
+        assert_eq!(unrounded, 1721);
     }
 
     #[test]
@@ -3123,6 +3347,7 @@ mod tests {
                 aspect: 16.0 / 9.0,
                 ..stage()
             },
+            RenderFormat::Sequence,
         )
         .expect("plans");
         assert_eq!((plan.width, plan.height), (1920, 1080));
@@ -3136,6 +3361,7 @@ mod tests {
                 height: Some(999),
                 ..stage()
             },
+            RenderFormat::Sequence,
         )
         .expect_err("999 is not a height");
         assert!(refused.contains("999"), "{refused}");
@@ -3149,9 +3375,180 @@ mod tests {
                 height: Some(999),
                 ..stage()
             },
+            RenderFormat::Sequence,
         )
         .expect_err("an empty cut")
         .contains("no shots"));
+    }
+
+    // ── ADR-182: the sequence becomes a movie ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_render_delivers_a_movie_unless_the_author_asks_for_the_frames() {
+        // THE DEFAULT IS THE DELIVERABLE. Before this a render's answer was 120 numbered PNGs and an
+        // unstated instruction to go and find `ffmpeg`; the last hop of the chain was the user's.
+        assert_eq!(RenderFormat::default(), RenderFormat::Movie);
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let cut = three_shot_cut(&mut engine, hero);
+        // At a CHOSEN height, because a movie cannot be "whatever the window is" — that rule has its
+        // own test below. The sequence is planned at the same size so the two are comparable.
+        let sizing = FrameSizing {
+            height: Some(1080),
+            ..stage()
+        };
+        let movie = plan_render(&cut, 24, RenderScope::WholeCut, sizing, RenderFormat::Movie)
+            .expect("plans a movie");
+        let sequence = plan_render(
+            &cut,
+            24,
+            RenderScope::WholeCut,
+            sizing,
+            RenderFormat::Sequence,
+        )
+        .expect("plans a sequence");
+        // The delivery changes NOTHING about what is filmed: same instants, same count, same pixels.
+        // A movie that quietly rounded the frame count or the size would be a different cut.
+        assert_eq!(movie.frames, sequence.frames);
+        assert_eq!(
+            (movie.width, movie.height),
+            (sequence.width, sequence.height)
+        );
+        assert!(exactly(movie.seconds, sequence.seconds));
+        // …and the one number that IS different is the one only a movie has.
+        assert_eq!(movie.bitrate, bitrate_for(movie.width, movie.height, 24));
+        assert_eq!(sequence.bitrate, 0, "a lossless sequence has no bit rate");
+    }
+
+    #[test]
+    fn the_bit_rate_scales_with_the_picture_and_is_bounded_at_both_ends() {
+        assert_eq!(bitrate_for(1920, 1080, 24), 5_971_968);
+        // Twice the frames, twice the bits — the property that makes it a RATE and not a size.
+        assert_eq!(bitrate_for(1920, 1080, 48), bitrate_for(1920, 1080, 24) * 2);
+        // A postage stamp still gets a floor and a wall still gets a ceiling, so no plan can hand the
+        // encoder a number it will refuse.
+        assert_eq!(bitrate_for(64, 64, 24), 2_000_000);
+        assert_eq!(bitrate_for(4096, 4096, 60), 120_000_000);
+    }
+
+    #[test]
+    fn a_movie_past_the_h264_ceiling_is_refused_by_name_and_the_sequence_is_not() {
+        // THE ONE SIZE IN THE PICKER'S OWN MATRIX THAT NO ENCODER TAKES: 2160 lines at 2.39:1 is
+        // 5162 wide. It has to arrive as a sentence naming the number AND the two controls that can
+        // change it — because the alternative is a render that draws every frame correctly and then
+        // cannot close its container, four minutes after the click.
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let cut = three_shot_cut(&mut engine, hero);
+        let sizing = FrameSizing {
+            height: Some(2160),
+            aspect: 2.39,
+            ..stage()
+        };
+        let why = plan_render(&cut, 24, RenderScope::WholeCut, sizing, RenderFormat::Movie)
+            .expect_err("5162 is past the ceiling");
+        assert!(why.contains("5162"), "names the size: {why}");
+        assert!(why.contains("shorter height"), "names a way out: {why}");
+        assert!(
+            why.contains("PNG sequence"),
+            "names the other way out: {why}"
+        );
+        // AND THE SEQUENCE IS UNTOUCHED BY IT. The ceiling belongs to the encoder, so a refusal that
+        // reached the lossless path would deny a master nobody was going to encode.
+        let seq = plan_render(
+            &cut,
+            24,
+            RenderScope::WholeCut,
+            sizing,
+            RenderFormat::Sequence,
+        )
+        .expect("a sequence has no encoder over it");
+        assert_eq!((seq.width, seq.height), (5162, 2160));
+    }
+
+    #[test]
+    fn a_movie_cannot_be_whatever_the_window_is_and_says_which_control_fixes_it() {
+        // A video stream declares its frame size ONCE. The swapchain path's size is measured from the
+        // first captured frame and the window moves under a render, so "as on screen" is a size that
+        // does not exist yet — and half the time it is an odd number of pixels, which 4:2:0 chroma has
+        // no partner for. Refused here, before anything is opened, rather than in the middle.
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let cut = three_shot_cut(&mut engine, hero);
+        let on_screen = FrameSizing {
+            height: None,
+            ..stage()
+        };
+        let why = plan_render(
+            &cut,
+            24,
+            RenderScope::WholeCut,
+            on_screen,
+            RenderFormat::Movie,
+        )
+        .expect_err("a movie has no size to be");
+        assert!(why.contains("output height"), "names a way out: {why}");
+        assert!(why.contains("PNG sequence"), "names the other: {why}");
+        // …and the sequence is what "as on screen" has always been, untouched.
+        let seq = plan_render(
+            &cut,
+            24,
+            RenderScope::WholeCut,
+            on_screen,
+            RenderFormat::Sequence,
+        )
+        .expect("the sequence follows the window");
+        assert_eq!((seq.width, seq.height), on_screen.viewport);
+    }
+
+    #[test]
+    fn the_cuts_own_refusals_still_come_first_for_a_movie() {
+        // Reaching the encoder ceiling means everything before it was fine, which is what lets its
+        // sentence name one control. An empty cut at an impossible size must still say "no shots".
+        let sizing = FrameSizing {
+            height: Some(2160),
+            aspect: 2.39,
+            ..stage()
+        };
+        let why = plan_render(
+            &Cutscene::default(),
+            24,
+            RenderScope::WholeCut,
+            sizing,
+            RenderFormat::Movie,
+        )
+        .expect_err("an empty cut");
+        assert!(why.contains("no shots"), "{why}");
+    }
+
+    #[test]
+    fn a_delivery_name_the_engine_does_not_offer_is_refused_rather_than_defaulted() {
+        assert_eq!(RenderFormat::from_key("movie"), Some(RenderFormat::Movie));
+        assert_eq!(
+            RenderFormat::from_key("sequence"),
+            Some(RenderFormat::Sequence)
+        );
+        // Not `Some(Movie)`: a render that quietly became a movie when the author asked for something
+        // else would deliver the wrong thing and say nothing.
+        assert_eq!(RenderFormat::from_key("mp4"), None);
+        assert_eq!(RenderFormat::from_key(""), None);
+        // Every offered value round-trips through the name a UI sends back.
+        for f in RenderFormat::all() {
+            assert_eq!(RenderFormat::from_key(f.key()), Some(f));
+        }
+    }
+
+    #[test]
+    fn one_cut_delivered_both_ways_is_named_the_same_thing() {
+        // The movie and the sequence share a sanitiser, so `Skid Weld Line` is one name written twice
+        // rather than two names written once.
+        assert_eq!(render_movie_name("Skid Weld Line"), "Skid Weld Line.mp4");
+        assert_eq!(
+            render_frame_name("Skid Weld Line", 0),
+            "Skid Weld Line.0000.png"
+        );
+        assert_eq!(render_movie_name("a/b:c"), "a-b-c.mp4");
+        assert_eq!(render_movie_name(""), "frame.mp4");
     }
 
     #[test]

@@ -77,6 +77,24 @@ glam = { version = "0.30", features = ["bytemuck"] }
 # offscreen render-evidence bench (examples/mesh_frame_bench.rs). Desktop-only crate (not in the wasm funnel).
 png = "0.18"
 
+# ADR-182 — the platform's own H.264 encoder, for turning a rendered cut into a movie file.
+#
+# WINDOWS-ONLY AND WRAPPED. Media Foundation has shipped a hardware-backed H.264 encoder in the box
+# since Windows 7, so the alternative to this dependency is bundling a binary (a licence question and
+# a download) or linking a C encoder (a build toolchain on every contributor's machine). The crate is
+# already in this lockfile — Tauri and webview2-com pull it — so this adds features, not a tree.
+#
+# `windows::` types never leave `src/video.rs`; a CI grep gate holds that line, which is invariant 5
+# ("every pre-1.0 dependency wrapped behind a project-owned trait, no foreign types in public APIs")
+# made checkable rather than merely stated. `diag.rs` declares its four Win32 symbols by hand instead,
+# and that stays right for four symbols — COM interface vtables are not four symbols.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
+
 [dev-dependencies]
 # The shader compiler wgpu itself uses, at wgpu's own version — so a WGSL mistake is a TEST failure on
 # any machine, instead of a runtime panic on a machine with a GPU. Every colour conversion this renderer

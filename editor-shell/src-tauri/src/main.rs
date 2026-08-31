@@ -21,6 +21,7 @@ mod native_drop_import;
 mod render;
 mod scene_pick;
 mod terrain;
+mod video;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Sender};
@@ -2952,6 +2953,8 @@ enum EngineCmd {
         /// [`metrocalk_editor_shell::RENDER_HEIGHTS`]. `None` writes the composed picture at whatever
         /// size the window is making it, which is what every render before ADR-177 did.
         height: Option<u32>,
+        /// ADR-182 — what this render delivers: one movie, or one file per frame.
+        format: metrocalk_editor_shell::RenderFormat,
         reply: Sender<metrocalk_editor_shell::RenderReply>,
     },
     /// Cinematics — what a render WOULD produce, without producing it.
@@ -2966,6 +2969,10 @@ enum EngineCmd {
         /// The output height being considered. The plan answers with the pixel size it implies, so the
         /// dialog states the size above the button rather than multiplying an aspect in TypeScript.
         height: Option<u32>,
+        /// ADR-182 — the delivery being considered. It changes the ANSWER: a movie carries a bit rate
+        /// and has an encoder ceiling over it, and both of those are refusals the author must read
+        /// before the click rather than after four minutes of rendering.
+        format: metrocalk_editor_shell::RenderFormat,
         reply: Sender<metrocalk_editor_shell::RenderReply>,
     },
     /// Cinematics — how far the running render has got. The one read a progress bar polls.
@@ -10639,9 +10646,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 folder,
                 stem,
                 height,
+                format,
                 reply,
             } => {
-                use metrocalk_editor_shell::{plan_render, RenderReply, RenderScope};
+                use metrocalk_editor_shell::{plan_render, RenderFormat, RenderReply, RenderScope};
                 if matches!(cinema_render.as_ref(), Some(job) if !job.finished) {
                     let _ = reply.send(RenderReply::refusal(
                         "A render is already running — wait for it, or stop it first.",
@@ -10678,7 +10686,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
                 let scope = shot.map_or(RenderScope::WholeCut, RenderScope::Shot);
                 let sizing = render_sizing(&shared, &cut, height);
-                let plan = match plan_render(&cut, fps, scope, sizing) {
+                let plan = match plan_render(&cut, fps, scope, sizing, format) {
                     Ok(plan) => plan,
                     Err(why) => {
                         let _ = reply.send(RenderReply::refusal(why));
@@ -10693,6 +10701,32 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     )));
                     continue;
                 }
+                // ADR-182 — OPEN THE MOVIE FIRST, before the camera is taken and before a single
+                // instant is posed. An encoder that will not start is a refusal, and a refusal after
+                // the camera has been taken is an editor stuck inside a shot; a refusal after the
+                // first pose is a viewport that flickered into a cutscene and back for nothing. Every
+                // reason this can fail — no Media Foundation, a size the encoder will not accept, a
+                // folder that cannot be written — is knowable here.
+                let stem = metrocalk_editor_shell::sanitise_stem(&stem);
+                let movie_path = folder.join(metrocalk_editor_shell::render_movie_name(&stem));
+                let movie = if plan.format == RenderFormat::Movie {
+                    let spec = video::MovieSpec {
+                        width: plan.width,
+                        height: plan.height,
+                        fps: plan.fps,
+                        bitrate: plan.bitrate,
+                    };
+                    match video::MovieWriter::create(&movie_path, spec) {
+                        Ok(writer) => Some(writer),
+                        Err(why) => {
+                            let _ = reply.send(RenderReply::refusal(why));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // Take the camera through the SAME door the timeline preview uses, and pose the first
                 // instant immediately — so the viewport shows frame 1 the moment the render starts
                 // rather than staying on the editor view until the first capture returns.
@@ -10707,8 +10741,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let first = metrocalk_editor_shell::preview_time(&state.cut, plan.instant(0));
                 let Some(playback) = state.cut.playback_at(first) else {
                     // Nothing was started, so nothing may be left behind: an offscreen size that
-                    // outlived its refusal would leave the viewport drawing into a texture forever.
+                    // outlived its refusal would leave the viewport drawing into a texture forever,
+                    // and an opened movie would leave a zero-frame `.mp4` beside a sentence saying
+                    // nothing was rendered.
                     shared.lock().unwrap().render_size = None;
+                    drop(movie);
+                    let _ = std::fs::remove_file(&movie_path);
                     let _ = reply.send(RenderReply::refusal(
                         "the first frame of that render is past the end of the cutscene",
                     ));
@@ -10723,13 +10761,25 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     playback,
                     &mut state.plans,
                 );
-                let pending = shared.lock().unwrap().request_frame();
+                // ADR-182 — A MOVIE ASKS FOR PIXELS, NOT A PNG. Same request, same `pose_epoch`
+                // rule, same rectangle; only the last step of the readback differs, and a PNG on the
+                // way to an encoder is a deflate of every frame that the next line decodes and drops.
+                let pending = {
+                    let mut st = shared.lock().unwrap();
+                    if movie.is_some() {
+                        st.request_raw_frame()
+                    } else {
+                        st.request_frame()
+                    }
+                };
                 let offscreen = height.is_some();
                 let job = CinemaRenderJob {
                     owner: entity,
                     key: id.clone(),
                     folder,
-                    stem: metrocalk_editor_shell::sanitise_stem(&stem),
+                    stem,
+                    movie,
+                    movie_path,
                     next: 0,
                     written: 0,
                     bytes: 0,
@@ -10763,9 +10813,10 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 fps,
                 shot,
                 height,
+                format,
                 reply,
             } => {
-                use metrocalk_editor_shell::{plan_render, RenderReply, RenderScope};
+                use metrocalk_editor_shell::{plan_render, RenderFormat, RenderReply, RenderScope};
                 let Some(entity) =
                     EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
                 else {
@@ -10777,24 +10828,44 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
                 let scope = shot.map_or(RenderScope::WholeCut, RenderScope::Shot);
                 let sizing = render_sizing(&shared, &cut, height);
-                let answer = match plan_render(&cut, fps, scope, sizing) {
-                    Ok(plan) => RenderReply {
-                        entity: Some(id),
-                        frames: plan.frames,
-                        fps: plan.fps,
-                        seconds: plan.seconds,
-                        // The SAME two numbers the files will carry, from the same function the job
-                        // runs — so the size above the button is the size in the IHDR.
-                        width: plan.width,
-                        height: plan.height,
-                        message: format!(
-                            "{} frames · {:.1}s at {} fps · {}x{}",
-                            plan.frames, plan.seconds, plan.fps, plan.width, plan.height
-                        ),
-                        ..RenderReply::default()
-                    },
-                    Err(why) => RenderReply::refusal(why),
-                };
+                // ADR-182 — ASK THE MACHINE, not a table about machines. `plan_render` has already
+                // refused a size no H.264 encoder takes; what is left is THIS device's own answer,
+                // which differs between the software encoder Windows falls back to and the hardware
+                // one on the GPU that just drew the frames — and the only honest way to have it is to
+                // build the encoder at the real size and throw it away. Cheap, and it runs once per
+                // change of a control rather than once per frame.
+                let answer =
+                    match plan_render(&cut, fps, scope, sizing, format).and_then(|plan| match plan
+                        .format
+                    {
+                        RenderFormat::Movie => video::probe(video::MovieSpec {
+                            width: plan.width,
+                            height: plan.height,
+                            fps: plan.fps,
+                            bitrate: plan.bitrate,
+                        })
+                        .map(|()| plan),
+                        RenderFormat::Sequence => Ok(plan),
+                    }) {
+                        Ok(plan) => RenderReply {
+                            entity: Some(id),
+                            frames: plan.frames,
+                            fps: plan.fps,
+                            seconds: plan.seconds,
+                            // The SAME two numbers the files will carry, from the same function the job
+                            // runs — so the size above the button is the size in the IHDR.
+                            width: plan.width,
+                            height: plan.height,
+                            format: plan.format,
+                            bitrate: plan.bitrate,
+                            message: format!(
+                                "{} frames · {:.1}s at {} fps · {}x{}",
+                                plan.frames, plan.seconds, plan.fps, plan.width, plan.height
+                            ),
+                            ..RenderReply::default()
+                        },
+                        Err(why) => RenderReply::refusal(why),
+                    };
                 let _ = reply.send(answer);
             }
             EngineCmd::CinemaRenderStatus { reply } => {
@@ -23075,6 +23146,15 @@ struct CinemaRenderJob {
     folder: std::path::PathBuf,
     /// The name they share.
     stem: String,
+    /// ADR-182 — the movie being encoded, or `None` for a PNG sequence.
+    ///
+    /// OPENED BEFORE THE CAMERA IS TAKEN and finalised in [`CinemaRenderJob::finish`] — the same one
+    /// exit `render_size` is cleared on, for the same reason: a render ends six ways, and a container
+    /// closed on five of them is a file that plays on five of them.
+    movie: Option<video::MovieWriter>,
+    /// Where that movie is. Held even for a sequence, so the ledger has one place to name the output
+    /// from and the refusal paths have one file to remove.
+    movie_path: std::path::PathBuf,
     /// The next frame index to pose. Advances on a written frame AND on a failed one, so a job can
     /// never sit on one bad frame forever.
     next: u32,
@@ -23134,6 +23214,8 @@ impl CinemaRenderJob {
             width: self.width,
             height: self.height,
             offscreen: self.offscreen,
+            format: self.plan.format,
+            bitrate: self.plan.bitrate,
             fps: self.plan.fps,
             seconds: self.plan.seconds,
             folder: self.folder.display().to_string(),
@@ -23155,6 +23237,20 @@ impl CinemaRenderJob {
         }
     }
 
+    /// ADR-182 — the movie this job delivers, by file name, or `None` for a sequence.
+    ///
+    /// Keyed on the PLAN's format rather than on whether the writer is still held: `finish` takes the
+    /// writer to close it, so a sentence built after that point would stop naming the file exactly
+    /// when it finally exists.
+    fn movie_name(&self) -> Option<String> {
+        if self.plan.format != metrocalk_editor_shell::RenderFormat::Movie {
+            return None;
+        }
+        self.movie_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    }
+
     /// Close the job with a sentence, let go of the capture it was waiting on, and give the viewport
     /// its own size back.
     ///
@@ -23169,6 +23265,21 @@ impl CinemaRenderJob {
                 st.forget_frame(req);
             }
             st.render_size = None;
+        }
+        // ADR-182 — CLOSE THE CONTAINER HERE, on every one of the six endings, because an MP4 that was
+        // never finalised is a file the operating system will show at the right size and no player
+        // will open. A cancelled render keeps what it encoded, exactly as a cancelled sequence keeps
+        // the frames it wrote — so the close is unconditional and its failure is appended to the
+        // outcome rather than replacing it, which would throw away the sentence saying WHY it ended.
+        let mut outcome = outcome;
+        if let Some(movie) = self.movie.take() {
+            match movie.finish(&self.movie_path) {
+                Ok(bytes) => self.bytes = bytes,
+                Err(why) => {
+                    self.failures.push(why.clone());
+                    outcome = format!("{outcome} — but the movie could not be closed: {why}");
+                }
+            }
         }
         self.finished = true;
         self.outcome = Some(outcome);
@@ -23232,28 +23343,49 @@ fn advance_cinema_render(
                 }
                 return false;
             }
-            render::FrameTake::Ready { png, width, height } => {
+            render::FrameTake::Ready {
+                pixels,
+                width,
+                height,
+            } => {
                 active.pending = None;
                 active.width = width;
                 active.height = height;
-                let path = active
-                    .folder
-                    .join(metrocalk_editor_shell::render_frame_name(
-                        &active.stem,
-                        active.next,
-                    ));
-                match std::fs::write(&path, &png) {
+                // ADR-182 — ONE FRAME, TWO DELIVERIES, ONE ACCOUNT OF WHAT HAPPENED TO IT. Both arms
+                // advance `next`, both count a success in `written` and both put their own sentence in
+                // `failures`, so the ledger, the progress bar and the five-in-a-row stop rule read the
+                // same numbers whichever one ran. The movie's `bytes` is the file's own size, taken
+                // once at `finish` — a running total of encoded frame sizes would be a number nobody
+                // can check against the thing on disk.
+                let outcome = match active.movie.as_mut() {
+                    Some(movie) => movie
+                        .push_rgba(&pixels)
+                        .map_err(|why| format!("frame {}: {why}", active.next + 1)),
+                    None => {
+                        let path = active
+                            .folder
+                            .join(metrocalk_editor_shell::render_frame_name(
+                                &active.stem,
+                                active.next,
+                            ));
+                        std::fs::write(&path, &pixels)
+                            .map(|()| active.bytes += pixels.len() as u64)
+                            .map_err(|e| {
+                                format!(
+                                    "frame {} could not be written to {}: {e}",
+                                    active.next + 1,
+                                    path.display()
+                                )
+                            })
+                    }
+                };
+                match outcome {
                     Ok(()) => {
                         active.written += 1;
-                        active.bytes += png.len() as u64;
                         active.consecutive_failures = 0;
                     }
-                    Err(e) => {
-                        active.failures.push(format!(
-                            "frame {} could not be written to {}: {e}",
-                            active.next + 1,
-                            path.display()
-                        ));
+                    Err(why) => {
+                        active.failures.push(why);
                         active.consecutive_failures += 1;
                     }
                 }
@@ -23290,10 +23422,19 @@ fn advance_cinema_render(
         let lost = active.failures.len();
         let seconds = active.started.elapsed().as_secs_f32();
         let outcome = if lost == 0 {
-            format!(
-                "Rendered {written} frames at {}x{} in {seconds:.1}s",
-                active.width, active.height
-            )
+            // ADR-182 — A SEQUENCE'S OUTPUT IS THE FOLDER, A MOVIE'S IS ONE FILE. "Rendered 120
+            // frames" is the whole answer for a folder of 120 files and only half of it for a movie,
+            // where the next question is which of the things in that folder is the film.
+            match active.movie_name() {
+                Some(name) => format!(
+                    "Rendered {written} frames at {}x{} in {seconds:.1}s into {name}",
+                    active.width, active.height
+                ),
+                None => format!(
+                    "Rendered {written} frames at {}x{} in {seconds:.1}s",
+                    active.width, active.height
+                ),
+            }
         } else {
             format!(
                 "Rendered {written} of {} frames — {lost} could not be written",
@@ -23328,7 +23469,14 @@ fn advance_cinema_render(
         playback,
         &mut state.plans,
     );
-    active.pending = Some(shared.lock().unwrap().request_frame());
+    active.pending = Some({
+        let mut st = shared.lock().unwrap();
+        if active.movie.is_some() {
+            st.request_raw_frame()
+        } else {
+            st.request_frame()
+        }
+    });
     active.last_progress = std::time::Instant::now();
     true
 }
@@ -24286,6 +24434,32 @@ fn cinema_preview(
     })
 }
 
+/// ADR-182 — the delivery a render command was asked for.
+///
+/// `None` on the wire is the DEFAULT and not an error: every caller that predates this asked for a
+/// render without naming a delivery, and the honest answer to "render this" is the engine's own
+/// default one. A name that is not one of the two IS an error, for the reason an unoffered frame rate
+/// is — a render that quietly became something else would deliver the wrong thing and say nothing.
+fn render_format(name: Option<&str>) -> Option<metrocalk_editor_shell::RenderFormat> {
+    match name {
+        None => Some(metrocalk_editor_shell::RenderFormat::default()),
+        Some(key) => metrocalk_editor_shell::RenderFormat::from_key(key),
+    }
+}
+
+/// The sentence for a delivery this build does not offer, naming the ones it does.
+fn unknown_format(name: Option<&str>) -> String {
+    format!(
+        "{} is not a delivery this build renders - choose {}.",
+        name.unwrap_or_default(),
+        metrocalk_editor_shell::RenderFormat::all()
+            .iter()
+            .map(|f| f.key())
+            .collect::<Vec<_>>()
+            .join(" or ")
+    )
+}
+
 /// ADR-175 — the folder a rendered sequence goes into, chosen by the author.
 ///
 /// A folder and not a file, because a render writes a numbered SEQUENCE: asking for one file name and
@@ -24319,9 +24493,13 @@ fn cinema_render_start(
     folder: Option<String>,
     stem: String,
     height: Option<u32>,
+    format: Option<String>,
 ) -> metrocalk_editor_shell::RenderReply {
     ipc();
     use metrocalk_editor_shell::RenderReply;
+    let Some(delivery) = render_format(format.as_deref()) else {
+        return RenderReply::refusal(unknown_format(format.as_deref()));
+    };
     let Some(folder) = folder.or_else(|| pick_render_folder(&app)) else {
         return RenderReply::refusal("Render canceled — no folder was chosen.");
     };
@@ -24335,6 +24513,7 @@ fn cinema_render_start(
             folder,
             stem,
             height,
+            format: delivery,
             reply,
         })
         .is_err()
@@ -24352,8 +24531,12 @@ fn cinema_render_plan(
     fps: u32,
     shot: Option<usize>,
     height: Option<u32>,
+    format: Option<String>,
 ) -> metrocalk_editor_shell::RenderReply {
     ipc();
+    let Some(delivery) = render_format(format.as_deref()) else {
+        return metrocalk_editor_shell::RenderReply::refusal(unknown_format(format.as_deref()));
+    };
     let (reply, rx) = mpsc::channel();
     if state
         .tx
@@ -24362,6 +24545,7 @@ fn cinema_render_plan(
             fps,
             shot,
             height,
+            format: delivery,
             reply,
         })
         .is_err()
@@ -24449,9 +24633,15 @@ fn viewport_capture(
         // render thread takes that same lock at the top of every frame.
         let taken = state.shared.lock().unwrap().take_frame(req);
         match taken {
-            render::FrameTake::Ready { png, width, height } => {
-                let bytes = png.len() as u64;
-                if let Err(e) = std::fs::write(&path, &png) {
+            render::FrameTake::Ready {
+                pixels,
+                width,
+                height,
+            } => {
+                // A still is asked for with `request_frame`, so these bytes are a PNG. The raw door is
+                // `request_raw_frame`, and only a movie render goes through it.
+                let bytes = pixels.len() as u64;
+                if let Err(e) = std::fs::write(&path, &pixels) {
                     return RenderReply::refusal(format!("{path} could not be written: {e}"));
                 }
                 return RenderReply {

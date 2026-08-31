@@ -627,6 +627,10 @@ const RENDER_IDLE = {
   width: 0,
   height: 0,
   offscreen: false,
+  // ADR-182 — a render delivers a MOVIE unless the author asks for the frames, so this is the state
+  // the dialog opens in and the one a capture has to be taken of.
+  format: "movie" as const,
+  bitrate: 0,
   fps: 24,
   seconds: 0,
   folder: "",
@@ -651,9 +655,13 @@ const RENDER_DONE = {
   offscreen: true,
   seconds: 13.3,
   folder: "C:/renders/skid-weld-line",
-  bytes: 319 * 486_000,
+  // ADR-182 — a movie is ONE file, so what it weighs is that file rather than 319 lossless frames.
+  // 13.3s of 2582x1080 at 8.0 Mbit/s is about 13 MB, against the ~155 MB the same cut costs as 319
+  // lossless PNGs (the number this fixture carried before ADR-182).
+  bytes: 13_337_000,
+  bitrate: 8_022_528,
   elapsedMs: 41_800,
-  message: "Rendered 319 frames at 2582x1080 in 41.8s",
+  message: "Rendered 319 frames at 2582x1080 in 41.8s into Skid Weld Line.mp4",
 };
 
 /** ADR-175 - the same cutscene with a render PLAN behind it. Delivered in scope, because the frame a
@@ -667,13 +675,26 @@ const renderingCutsceneClient = () =>
   ({
     ...cutsceneClient(),
     cinemaList: () => Promise.resolve({ ...CUTSCENE, delivery: "scope" as const }),
-    cinemaRenderPlan: (id: string, fps: number, shot: number | null, height: number | null = null) => {
+    cinemaRenderPlan: (
+      id: string,
+      fps: number,
+      shot: number | null,
+      height: number | null = null,
+      format: "movie" | "sequence" | null = null,
+    ) => {
       const seconds = shot === null ? CUTSCENE.seconds : (CUTSCENE.rows[shot]?.effectiveSeconds ?? 0);
       const frames = Math.max(1, Math.round(seconds * fps));
       // ADR-177 - the size is the ENGINE's answer in the product; here it is the same arithmetic over
       // this fixture's scope delivery, so the sentence photographed is the one a real plan produces.
       const width = height === null ? 1920 : Math.round((height * 2.39) / 2) * 2;
       const tall = height ?? 803;
+      // ADR-182 — the bit rate is the ENGINE's `bitrate_for` in the product; here it is the same
+      // arithmetic over this fixture, so the sentence photographed is one a real plan produces.
+      const chosen = format ?? "movie";
+      const bitrate =
+        chosen === "movie"
+          ? Math.min(120_000_000, Math.max(2_000_000, Math.floor((width * tall * fps * 12) / 100)))
+          : 0;
       return Promise.resolve({
         ...RENDER_IDLE,
         entity: id,
@@ -682,6 +703,8 @@ const renderingCutsceneClient = () =>
         seconds,
         width,
         height: tall,
+        format: chosen,
+        bitrate,
         message: `${frames} frames \u00b7 ${seconds.toFixed(1)}s at ${fps} fps \u00b7 ${width}x${tall}`,
       });
     },
@@ -1300,13 +1323,22 @@ export const SCENES: Scene[] = [
       "because the stage is still the right answer for a quick look. The description names the " +
       "delivery frame the cut is composed for, because that is what decides the SHAPE of every " +
       "file - and the width follows from it, which is why the picker asks for a HEIGHT and not a " +
-      "resolution. The primary button says the number: 'Render 319 frames', never a bare 'Render'",
+      "resolution. ADR-182: the dialog now opens on a MOVIE - one H.264 MP4 - because a render is the "
+      + "thing that leaves the editor and 319 numbered PNGs are not something anybody can watch. "
+      + "Check that the delivery sits beside WHAT is being filmed and ahead of the rate, the size "
+      + "and the name, because it changes what all three of those mean; that the cost line states "
+      + "the bit rate the encoder is handed (about 8.0 Mbit/s) "
+      + "beside the frame count; and that 'As on screen' is NOT offered here - a movie declares its "
+      + "frame size once, before the first sample, and the stage's size is a measurement that moves. "
+      + "The lossless sequence is one control away and is still the right answer for a compositor. "
+      + "The primary button says the number: 'Render 319 frames', never a bare 'Render'",
     viewport: { width: 1400, height: 900 },
     setup: selectAnimatedEntity,
     click: ["[data-testid='cutscene-render']"],
     expect: {
       present: [
         ["[data-testid='render-dialog']", 1],
+        ["[data-testid='render-format']", 1],
         ["[data-testid='render-scope']", 1],
         ["[data-testid='render-fps']", 1],
         ["[data-testid='render-size']", 1],
@@ -1318,13 +1350,16 @@ export const SCENES: Scene[] = [
         // The frame the cut is composed for - the fixture delivers in scope, and the shape of every
         // written file follows from it.
         "2.39:1 scope",
-        // The cost, and the fact that it is a count of FILES.
+        // The cost, and the fact that it is a count of FRAMES.
         "319 frames",
-        "PNG",
+        // ADR-182 - what the render DELIVERS, and what one costs, stated above the button that pays
+        // for it. The bit rate is the engine's `bitrate_for`, never a multiplication done here.
+        "Deliver as",
+        "MP4",
+        "8.0 Mbit/s",
         // ADR-177 - the size is a choice, and the pixels it comes to are stated before the click.
         "Frame size",
         "2582 × 1080",
-        "As on screen",
       ],
       text_absent: [
         "null",
@@ -1333,10 +1368,15 @@ export const SCENES: Scene[] = [
         "0 frames",
         // The sentence this dialog used to end on, before a size could be chosen.
         "the size of the composed picture on screen",
+        // ADR-182 - a movie has ONE size for its whole length, so the stage is not one of its
+        // options. Present-and-refused would be worse than absent: the author would pick it, read a
+        // sentence, and undo what they just did.
+        "As on screen",
       ],
       unclipped: [
         "[data-testid='render-start']",
         "[data-testid='render-cost']",
+        "[data-testid='render-format']",
         "[data-testid='render-scope']",
         "[data-testid='render-size']",
       ],
@@ -1350,7 +1390,11 @@ export const SCENES: Scene[] = [
   {
     id: "cutscene-render-ledger",
     looking_for:
-      "WHERE THE FRAMES WENT. A render is 319 files in a folder, and 'done' is not an answer to " +
+      "WHERE THE MOVIE WENT. 'Done' is not an answer to 'where is it' - which is exactly what a " +
+      "status-bar toast could say and no more. ADR-182: the delivery is one H.264 MP4, so this " +
+      "ledger names ONE file rather than a numbered range; check that it does, and that a reader " +
+      "can answer 'where is my film' without leaving this dialog. " +
+      "A render is 319 frames, and 'done' is not an answer to " +
       "'where are they' - which is exactly what a status-bar toast could say and no more. The " +
       "options are GONE and their space is the ledger: how many frames exist, the pixel size they " +
       "were actually written at (2582x1080 - the delivery the author chose, not the shape of the " +
@@ -1371,7 +1415,17 @@ export const SCENES: Scene[] = [
       ],
       // The settings are gone, not merely disabled.
       absent: ["[data-testid='render-fps']", "[data-testid='render-scope']"],
-      text_present: ["319", "2582", "1080", "Rendered", "renders"],
+      text_present: [
+        "319",
+        "2582",
+        "1080",
+        "Rendered",
+        "renders",
+        // ADR-182 - ONE file, named, rather than `take.0000.png … take.0318.png` over a folder
+        // holding a single movie.
+        "Skid Weld Line.mp4",
+        "encoded as one H.264 movie",
+      ],
       text_absent: ["null", "undefined", "NaN"],
       unclipped: ["[data-testid='render-ledger-folder']", "[data-testid='render-done']"],
     },

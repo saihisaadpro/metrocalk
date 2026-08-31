@@ -45,6 +45,7 @@ import type {
   ConditionSpec,
   ShotSpec,
   CinemaPreviewReply,
+  RenderFormat,
   RenderReply,
   CinemaReply,
   DeliveryFrame,
@@ -353,6 +354,7 @@ export interface EditorClient {
     fps: number,
     shot: number | null,
     height?: number | null,
+    format?: RenderFormat | null,
   ): Promise<RenderReply>;
   /** ADR-175 — start writing a cutscene out as a numbered PNG sequence. Returns as soon as the job
    *  is accepted, carrying the plan it accepted; progress is read with `cinemaRenderStatus`.
@@ -364,6 +366,7 @@ export interface EditorClient {
     stem: string,
     folder?: string | null,
     height?: number | null,
+    format?: RenderFormat | null,
   ): Promise<RenderReply>;
   /** How far the running render has got, or the ledger of the last one. */
   cinemaRenderStatus(): Promise<RenderReply>;
@@ -1065,11 +1068,11 @@ export class TauriClient implements EditorClient {
   cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply> {
     return this.core.invoke<CinemaPreviewReply>("cinema_preview", { id, seconds, active }).catch((e: unknown) => { console.error("cinema_preview failed", e); throw e; });
   }
-  cinemaRenderPlan(id: string, fps: number, shot: number | null, height: number | null = null): Promise<RenderReply> {
-    return this.core.invoke<RenderReply>("cinema_render_plan", { id, fps, shot, height }).catch((e: unknown) => { console.error("cinema_render_plan failed", e); throw e; });
+  cinemaRenderPlan(id: string, fps: number, shot: number | null, height: number | null = null, format: RenderFormat | null = null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_plan", { id, fps, shot, height, format }).catch((e: unknown) => { console.error("cinema_render_plan failed", e); throw e; });
   }
-  cinemaRenderStart(id: string, fps: number, shot: number | null, stem: string, folder: string | null = null, height: number | null = null): Promise<RenderReply> {
-    return this.core.invoke<RenderReply>("cinema_render_start", { id, fps, shot, stem, folder, height }).catch((e: unknown) => { console.error("cinema_render_start failed", e); throw e; });
+  cinemaRenderStart(id: string, fps: number, shot: number | null, stem: string, folder: string | null = null, height: number | null = null, format: RenderFormat | null = null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_start", { id, fps, shot, stem, folder, height, format }).catch((e: unknown) => { console.error("cinema_render_start failed", e); throw e; });
   }
   cinemaRenderStatus(): Promise<RenderReply> {
     return this.core.invoke<RenderReply>("cinema_render_status").catch((e: unknown) => { console.error("cinema_render_status failed", e); throw e; });
@@ -1620,6 +1623,8 @@ const MOCK_RENDER_IDLE: RenderReply = {
   width: 0,
   height: 0,
   offscreen: false,
+  format: "sequence",
+  bitrate: 0,
   fps: 0,
   seconds: 0,
   folder: "",

@@ -4,7 +4,7 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type MatchStatus, type RenderReply, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type MatchStatus, type RenderFormat, type RenderReply, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
 
 /** The render a test drives. MUTABLE and module-scoped on purpose: a render is the one thing in this
  *  client with a life longer than a single call — start, poll, poll, done — and a stub that answered
@@ -22,6 +22,15 @@ function plannedSize(height: number | null): [number, number] {
   return [even(Math.round(height * 2.39)), even(height)];
 }
 
+/** ADR-182 — what the ENGINE's `bitrate_for` and `MAX_MOVIE_DIMENSION` answer, restated for the same
+ *  reason `plannedSize` restates `render_frame_size`: these tests are about whether the dialog SHOWS
+ *  the engine's answer and whether a refusal reaches the control that caused it, and a stub that
+ *  returned one fixed number could not tell a dialog that asks from one that guesses. */
+const MOVIE_CEILING = 4096;
+function plannedBitrate(width: number, height: number, fps: number): number {
+  return Math.min(120_000_000, Math.max(2_000_000, Math.floor((width * height * fps * 12) / 100)));
+}
+
 const RENDER_FIXTURE: RenderReply = {
   running: false,
   done: false,
@@ -31,6 +40,8 @@ const RENDER_FIXTURE: RenderReply = {
   width: 0,
   height: 0,
   offscreen: false,
+  format: "movie",
+  bitrate: 0,
   fps: 24,
   seconds: 0,
   folder: "",
@@ -54,6 +65,8 @@ export function resetTestClientRender(): void {
     width: 0,
     height: 0,
     offscreen: false,
+    format: "movie",
+    bitrate: 0,
     fps: 24,
     seconds: 0,
     folder: "",
@@ -469,13 +482,29 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     // A render that ACTUALLY ADVANCES. A stub answering one fixed row would let a panel that never
     // polls pass every assertion about progress, which is the one thing these tests exist to catch:
     // each `cinemaRenderStatus` call writes one more frame until the plan is full, then goes `done`.
-    cinemaRenderPlan: vi.fn((id: string, fps: number, shot: number | null, height: number | null = null) => {
+    cinemaRenderPlan: vi.fn((id: string, fps: number, shot: number | null, height: number | null = null, format: RenderFormat | null = null) => {
       const seconds = shot === null ? 12.5 : 2.5;
       const frames = Math.max(1, Math.round(seconds * fps));
       const [w, h] = plannedSize(height);
-      return Promise.resolve({ ...RENDER_FIXTURE, entity: id, fps, frames, seconds, width: w, height: h, message: `${frames} frames · ${seconds.toFixed(1)}s at ${fps} fps · ${w}x${h}` });
+      const chosen: RenderFormat = format ?? "movie";
+      // A movie has ONE size for its whole length, so "as on screen" is not one it can have. Mirrored
+      // from the engine so a test can never be green against a pair the real build refuses.
+      if (chosen === "movie" && height === null) {
+        const why = "A movie is encoded at one fixed size, and the stage changes size while you work. Choose an output height, or render a PNG sequence, which follows the window.";
+        return Promise.resolve({ ...RENDER_FIXTURE, entity: id, fps, format: chosen, message: why, reason: why });
+      }
+      // The one refusal a MOVIE has and a sequence does not, mirrored from the engine: a 2160-line
+      // scope master is 5162 wide, which no H.264 encoder will take. It must arrive as a sentence
+      // naming the size and the way out, not as a render that fails after four minutes.
+      if (chosen === "movie" && (w > MOVIE_CEILING || h > MOVIE_CEILING)) {
+        const why = `${w} x ${h} is larger than the ${MOVIE_CEILING} pixels H.264 encodes reliably. Choose a shorter height, or render a PNG sequence, which has no such limit.`;
+        return Promise.resolve({ ...RENDER_FIXTURE, entity: id, fps, format: chosen, width: w, height: h, message: why, reason: why });
+      }
+      const bitrate = chosen === "movie" ? plannedBitrate(w, h, fps) : 0;
+      return Promise.resolve({ ...RENDER_FIXTURE, entity: id, fps, frames, seconds, width: w, height: h, format: chosen, bitrate, message: `${frames} frames · ${seconds.toFixed(1)}s at ${fps} fps · ${w}x${h}` });
     }),
-    cinemaRenderStart: vi.fn((id: string, fps: number, shot: number | null, stem: string, _folder: string | null = null, height: number | null = null) => {
+    cinemaRenderStart: vi.fn((id: string, fps: number, shot: number | null, stem: string, _folder: string | null = null, height: number | null = null, format: RenderFormat | null = null) => {
+      RENDER_FIXTURE.format = format ?? "movie";
       RENDER_FIXTURE.running = true;
       RENDER_FIXTURE.done = false;
       RENDER_FIXTURE.entity = id;
@@ -492,6 +521,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
       RENDER_FIXTURE.width = height === null ? 0 : planW;
       RENDER_FIXTURE.height = height === null ? 0 : planH;
       RENDER_FIXTURE.folder = "C:/renders/skid-weld-line";
+      RENDER_FIXTURE.bitrate = RENDER_FIXTURE.format === "movie" ? plannedBitrate(planW, planH, fps) : 0;
       RENDER_FIXTURE.failures = [];
       RENDER_FIXTURE.message = `Rendering frame 1 of ${RENDER_FIXTURE.frames}`;
       RENDER_FIXTURE.reason = null;
@@ -509,7 +539,10 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
         if (RENDER_FIXTURE.written >= RENDER_FIXTURE.frames) {
           RENDER_FIXTURE.running = false;
           RENDER_FIXTURE.done = true;
-          RENDER_FIXTURE.message = `Rendered ${RENDER_FIXTURE.frames} frames at ${RENDER_FIXTURE.width}x${RENDER_FIXTURE.height} in 2.4s`;
+          RENDER_FIXTURE.message =
+            RENDER_FIXTURE.format === "movie"
+              ? `Rendered ${RENDER_FIXTURE.frames} frames at ${RENDER_FIXTURE.width}x${RENDER_FIXTURE.height} in 2.4s into ${RENDER_FIXTURE.stem}.mp4`
+              : `Rendered ${RENDER_FIXTURE.frames} frames at ${RENDER_FIXTURE.width}x${RENDER_FIXTURE.height} in 2.4s`;
         } else {
           RENDER_FIXTURE.message = `Rendering frame ${RENDER_FIXTURE.written + 1} of ${RENDER_FIXTURE.frames}`;
         }

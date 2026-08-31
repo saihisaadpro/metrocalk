@@ -1211,6 +1211,13 @@ pub struct FrameRequest {
     pub req: u64,
     /// The lowest [`SceneState::pose_epoch`] a frame may have been drawn at and still answer this.
     pub min_epoch: u64,
+    /// ADR-182 — hand back tightly-packed RGBA8 instead of an encoded PNG.
+    ///
+    /// A movie render encodes each frame itself, so a PNG on the way there is a full deflate of half a
+    /// megabyte that is decoded again one line later and thrown away. Asking for the pixels is not an
+    /// optimisation of the file path — it is the file path: the only consumer of a raw frame is an
+    /// encoder, and the only consumer of a PNG is a file.
+    pub raw: bool,
 }
 
 /// A serviced frame capture: the PNG, or the sentence saying why there is none.
@@ -1218,8 +1225,11 @@ pub struct FrameRequest {
 pub struct FrameResult {
     /// The request this answers.
     pub req: u64,
-    /// The image, in the delivery frame's own pixels.
-    pub png: Option<Vec<u8>>,
+    /// The image, in the delivery frame's own pixels: PNG bytes, or — when the request asked for it —
+    /// tightly-packed RGBA8, four bytes per pixel, `width * height * 4` long. The requester knows
+    /// which it asked for, so this carries no tag: a second field that is `Some` only when the first
+    /// is `None` is the two-answers-in-one-Option shape [`FrameTake`] exists to avoid.
+    pub pixels: Option<Vec<u8>>,
     /// The written size. Reported even on failure as `0 x 0`, so a caller never has to infer it.
     pub width: u32,
     pub height: u32,
@@ -1233,9 +1243,10 @@ pub struct FrameResult {
 pub enum FrameTake {
     /// No frame has been drawn at the requested pose yet. Keep polling.
     Pending,
-    /// The picture, and the pixel size it was written at.
+    /// The picture, and the pixel size it was written at. PNG bytes, or RGBA8 when the request was
+    /// [`FrameRequest::raw`].
     Ready {
-        png: Vec<u8>,
+        pixels: Vec<u8>,
         width: u32,
         height: u32,
     },
@@ -1891,9 +1902,26 @@ impl SceneState {
 
     /// Ask for the next frame drawn at the current pose, as a PNG. Returns the request id to poll with.
     pub fn request_frame(&mut self) -> u64 {
+        self.request_frame_as(false)
+    }
+
+    /// ADR-182 — ask for the next frame as raw RGBA8 rather than as an encoded PNG.
+    ///
+    /// The same request, the same `pose_epoch` rule and the same rectangle; only the last step of the
+    /// readback differs. A movie render takes this door because the encoder wants pixels, and a PNG in
+    /// between is a compress-then-decompress of every frame for nothing.
+    pub fn request_raw_frame(&mut self) -> u64 {
+        self.request_frame_as(true)
+    }
+
+    fn request_frame_as(&mut self, raw: bool) -> u64 {
         let req = self.next_request();
         let min_epoch = self.pose_epoch;
-        self.frame_requests.push(FrameRequest { req, min_epoch });
+        self.frame_requests.push(FrameRequest {
+            req,
+            min_epoch,
+            raw,
+        });
         req
     }
 
@@ -1903,9 +1931,9 @@ impl SceneState {
             return FrameTake::Pending;
         };
         let got = self.frame_results.remove(pos);
-        match (got.png, got.reason) {
-            (Some(png), _) => FrameTake::Ready {
-                png,
+        match (got.pixels, got.reason) {
+            (Some(pixels), _) => FrameTake::Ready {
+                pixels,
                 width: got.width,
                 height: got.height,
             },
@@ -5746,40 +5774,63 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             };
             if !due.is_empty() {
                 let rect = capture_rect;
-                // ADR-177 — an offscreen render reads back ITS OWN colour target, which is created with
-                // `COPY_SRC` unconditionally. Only the swapchain path depends on the adapter allowing
-                // its surface to be copied, and only that path has to refuse.
-                let captured = match offscreen.as_ref() {
-                    Some(o) => capture_presented_frame(&device, &queue, &o.color, format, rect),
-                    None if can_capture => {
-                        let surface_texture = &frame
-                            .as_ref()
-                            .expect("the window path always acquires a frame")
-                            .texture;
-                        capture_presented_frame(&device, &queue, surface_texture, format, rect)
-                    }
-                    None => Err("this graphics adapter does not allow the viewport to be copied, so a frame cannot be written to a file".to_string()),
-                };
-                let mut st = shared.lock().unwrap();
+                // ONE READBACK PER KIND ACTUALLY ASKED FOR, and the map is off the GPU either way.
+                // Two requests due on the same frame is already rare (a still saved while a render
+                // runs); two due in DIFFERENT kinds is rarer still, and each of them wants a different
+                // last step over the same pixels. Filling the slot lazily means the ordinary case —
+                // one render job asking for one raw frame — reads back once and never encodes a PNG.
+                let mut captured: [Option<Result<Vec<u8>, String>>; 2] = [None, None];
+                let mut answers: Vec<FrameResult> = Vec::with_capacity(due.len());
                 for request in due {
-                    let result = match &captured {
-                        Ok(png) => FrameResult {
+                    let slot = usize::from(request.raw);
+                    if captured[slot].is_none() {
+                        // ADR-177 — an offscreen render reads back ITS OWN colour target, which is
+                        // created with `COPY_SRC` unconditionally. Only the swapchain path depends on
+                        // the adapter allowing its surface to be copied, and only that path refuses.
+                        captured[slot] = Some(match offscreen.as_ref() {
+                            Some(o) => capture_presented_frame(
+                                &device, &queue, &o.color, format, rect, request.raw,
+                            ),
+                            None if can_capture => {
+                                let surface_texture = &frame
+                                    .as_ref()
+                                    .expect("the window path always acquires a frame")
+                                    .texture;
+                                capture_presented_frame(
+                                    &device,
+                                    &queue,
+                                    surface_texture,
+                                    format,
+                                    rect,
+                                    request.raw,
+                                )
+                            }
+                            None => Err("this graphics adapter does not allow the viewport to be copied, so a frame cannot be written to a file".to_string()),
+                        });
+                    }
+                    let result = match captured[slot]
+                        .as_ref()
+                        .expect("the slot was filled on the line above")
+                    {
+                        Ok(pixels) => FrameResult {
                             req: request.req,
-                            png: Some(png.clone()),
+                            pixels: Some(pixels.clone()),
                             width: rect[2],
                             height: rect[3],
                             reason: None,
                         },
                         Err(why) => FrameResult {
                             req: request.req,
-                            png: None,
+                            pixels: None,
                             width: 0,
                             height: 0,
                             reason: Some(why.clone()),
                         },
                     };
-                    st.frame_results.push(result);
+                    answers.push(result);
                 }
+                let mut st = shared.lock().unwrap();
+                st.frame_results.extend(answers);
                 // A caller that timed out or was cancelled must not be able to grow this without bound.
                 let excess = st.frame_results.len().saturating_sub(16);
                 st.frame_results.drain(0..excess);
@@ -7005,12 +7056,17 @@ fn render_thumbnail(
 /// finished frame already in it — nothing is re-rendered and nothing is graded a second time. Every
 /// failure is a sentence rather than a `None`, because the caller's whole job is telling an author why
 /// a file they asked for does not exist.
+///
+/// ADR-182 — the readback and the ENCODE are separate steps, because they have separate consumers. A
+/// still and a PNG sequence want the file; a movie wants the pixels and does its own compression, and
+/// a PNG in between would be a deflate of every frame that the next line decodes and discards.
 fn capture_presented_frame(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
     format: wgpu::TextureFormat,
     rect: [u32; 4],
+    raw: bool,
 ) -> Result<Vec<u8>, String> {
     let [x, y, width, height] = rect;
     if width == 0 || height == 0 {
@@ -7066,6 +7122,9 @@ fn capture_presented_frame(
     drop(data);
     buf.unmap();
 
+    if raw {
+        return Ok(rgba);
+    }
     let mut png_bytes: Vec<u8> = Vec::new();
     {
         let mut pe = png::Encoder::new(&mut png_bytes, width, height);

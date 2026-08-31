@@ -2179,6 +2179,11 @@ export interface RenderReply {
   /** ADR-177 — whether the frames are drawn into targets of their own rather than read off the window.
    *  Changes what is true about the render: an offscreen one does not need the window in front. */
   offscreen: boolean;
+  /** ADR-182 — what this render delivers: one movie, or one file per frame. */
+  format: RenderFormat;
+  /** ADR-182 — the bit rate a movie is encoded at, in bits per second. `0` for a sequence, which has
+   *  no such number: PNG is lossless and its size is whatever the picture costs. */
+  bitrate: number;
   fps: number;
   /** The span of the cutscene clock being filmed. */
   seconds: number;
@@ -2205,6 +2210,15 @@ export type RenderScopeIndex = number | null;
  *  one number and nobody can ask for a size the shot was not composed for. The engine states the four
  *  it offers in `RENDER_HEIGHTS` and refuses anything else by name. */
 export type RenderHeight = number | null;
+
+/** ADR-182 — what a render delivers.
+ *
+ *  A MOVIE OR A SEQUENCE, and nothing in between. `"movie"` is one H.264 MP4 the author can double-
+ *  click; `"sequence"` is the numbered PNG per frame ADR-175 shipped, which is lossless and is what a
+ *  compositor wants. The engine states the same two in `RenderFormat` and refuses anything else by
+ *  name — and refuses `"movie"` itself, in a sentence, on a machine or at a size whose encoder will
+ *  not take it, so the author reads that BEFORE the render rather than after it. */
+export type RenderFormat = "movie" | "sequence";
 
 export interface ConditionSpec {
   kind: string;
