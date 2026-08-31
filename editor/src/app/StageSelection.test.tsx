@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { playStore } from "../store/play";
 import { projectionStore } from "../store/projection";
 import { toastStore } from "../store/toasts";
+import { uiStore } from "../store/ui";
 import { walletStore } from "../store/wallet";
 
 interface Spies {
@@ -24,6 +25,9 @@ interface Spies {
   region: ReturnType<typeof vi.fn>;
   selectionIds: ReturnType<typeof vi.fn>;
   undo: ReturnType<typeof vi.fn>;
+  /** The seam every selection made AWAY from the stage goes through. Watched, not replaced: what
+   *  matters is that the engine is told the WHOLE set, which is the half the front end owns. */
+  select: ReturnType<typeof vi.fn>;
 }
 const sessions: Spies[] = [];
 
@@ -37,17 +41,22 @@ vi.mock("../transport/session", async (importOriginal) => {
       const region = vi.fn(() => Promise.resolve(["a", "b", "c"]));
       const selectionIds = vi.fn(() => Promise.resolve(["a", "b"]));
       const undo = vi.fn(() => Promise.resolve(true));
+      const select = vi.fn(client.selectEntities.bind(client));
+      client.selectEntities = select as unknown as typeof client.selectEntities;
       client.undo = undo as unknown as typeof client.undo;
       client.viewportPick = pick as unknown as typeof client.viewportPick;
       client.viewportPickRegion = region as unknown as typeof client.viewportPickRegion;
       client.selectionIds = selectionIds as unknown as typeof client.selectionIds;
-      sessions.push({ pick, region, selectionIds, undo });
+      sessions.push({ pick, region, selectionIds, undo, select });
       return client;
     },
   };
 });
 
 const { App } = await import("./App");
+// The command palette is a `React.lazy` chunk and the first test to open it would pay the whole cold
+// import inside its own timeout. Resolving it here spends that once, before any test's clock starts.
+await import("../panels/CommandPalette");
 
 const spies = () => sessions[sessions.length - 1];
 const undoSpy = () => spies().undo;
@@ -274,5 +283,108 @@ describe("modified clicks on the stage", () => {
     expect(spies().pick.mock.calls[1]?.[2]).toMatchObject({ cycle: true, extend: false, toggle: false });
     // Alt is not a selection mode: it moves the HIT, so it must NOT cost a second round trip.
     expect(spies().selectionIds.mock.calls.length).toBe(afterToggle);
+  });
+});
+
+// ── the verbs no gesture can express ──────────────────────────────────────────────────────────────
+//
+// ADR-158 gave the stage the four gestures the ENGINE already understood. Scope ("all", "none", "the
+// rest") and kind ("everything like this") are not gestures at all: no rectangle can express them,
+// and the imported-assembly case — 378 copies of one bolt, scattered and mostly occluded — is the one
+// a marquee provably cannot reach.
+
+const status = () => uiStore.getState().status;
+
+async function openPalette() {
+  render(<App />);
+  await waitFor(() => expect(projectionStore.getState().order.length).toBeGreaterThan(0));
+  await act(async () => {
+    fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
+  });
+  return screen.findByTestId("command-palette", {}, { timeout: 10_000 });
+}
+
+function paletteRow(palette: HTMLElement, label: string): HTMLElement | undefined {
+  return Array.from(palette.querySelectorAll("[role='option']")).find((o) =>
+    (o.textContent ?? "").includes(label),
+  ) as HTMLElement | undefined;
+}
+
+describe("selecting without a gesture", () => {
+  // THREE MOUNTS, NOT SIX, AND THE REASON IS MEASURED. Every case here renders the whole shell and
+  // waits on the palette's lazily-imported chunk; adding six of them to this file turned a 79/79
+  // suite into one where OTHER files timed out at their own budgets — contention, not a defect in
+  // them (`test-setup.ts` has the argument). Assertions that share a scene share a mount.
+  it("the palette carries all four verbs — off the SHIPPED list — and Select similar explains its refusal", async () => {
+    const palette = await openPalette();
+
+    for (const label of ["Select all", "Select none", "Invert selection", "Select similar"]) {
+      expect(paletteRow(palette, label), label).toBeTruthy();
+    }
+    // A disabled control that says WHY (`<ux_quality>` 4 and 6) rather than a row that does nothing
+    // when pressed and gives no reason. Nothing is selected on a fresh shell, so this is its state.
+    const similar = paletteRow(palette, "Select similar");
+    expect(similar?.getAttribute("aria-disabled")).toBe("true");
+    expect(similar?.textContent).toContain("Select an object first");
+  });
+
+  it("Ctrl+A selects everything and tells the ENGINE the whole set — but inside a text field it belongs to the field", async () => {
+    render(<App />);
+    await waitFor(() => expect(projectionStore.getState().order.length).toBeGreaterThan(0));
+    const all = projectionStore.getState().order;
+
+    const field = document.createElement("input");
+    document.body.appendChild(field);
+    await act(async () => {
+      fireEvent.keyDown(field, { key: "a", ctrlKey: true });
+    });
+    // Select-all-TEXT is the field's, and stealing it would be the same defect as stealing Ctrl-Z.
+    expect(projectionStore.getState().multiSelect).toEqual([]);
+    expect(spies().select).not.toHaveBeenCalled();
+    field.remove();
+
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: "a", ctrlKey: true });
+    });
+    expect(projectionStore.getState().multiSelect).toEqual(all);
+    // The WHOLE set, not a primary — the failure `select_entities` exists to make impossible.
+    expect(spies().select).toHaveBeenLastCalledWith(all);
+    expect(status()).toBe(`Selected all ${all.length} objects`);
+  });
+
+  it("Select similar reaches the copies no box contains; Invert takes the complement", async () => {
+    render(<App />);
+    await waitFor(() => expect(projectionStore.getState().order.length).toBeGreaterThan(0));
+    act(() => {
+      projectionStore.getState().bulkLoad([
+        { id: "b1", name: "Bolt", parentId: null, components: { MeshRenderer: { mesh: "mtkasset:bolt" } } },
+        { id: "beam", name: "Beam", parentId: null, components: { MeshRenderer: { mesh: "mtkasset:beam" } } },
+        { id: "b2", name: "Bolt", parentId: null, components: { MeshRenderer: { mesh: "mtkasset:bolt" } } },
+      ]);
+      projectionStore.getState().select("b1");
+    });
+
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
+    });
+    await act(async () => {
+      fireEvent.click(paletteRow(await screen.findByTestId("command-palette", {}, { timeout: 10_000 }), "Select similar")!);
+    });
+
+    // The scattered set a rectangle cannot reach: the beam BETWEEN the two bolts is left alone, and
+    // the sentence names what the match was made on rather than only counting.
+    await waitFor(() => expect(projectionStore.getState().multiSelect).toEqual(["b1", "b2"]));
+    expect(spies().select).toHaveBeenLastCalledWith(["b1", "b2"]);
+    expect(status()).toBe("Selected 2 objects sharing the geometry of Bolt");
+
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
+    });
+    await act(async () => {
+      fireEvent.click(paletteRow(await screen.findByTestId("command-palette", {}, { timeout: 10_000 }), "Invert selection")!);
+    });
+
+    expect(projectionStore.getState().multiSelect).toEqual(["beam"]);
+    expect(status()).toContain("inverted");
   });
 });

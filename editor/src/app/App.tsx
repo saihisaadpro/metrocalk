@@ -10,7 +10,7 @@
 
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { createSession, isTauri, type EditorClient } from "../transport/session";
-import { projectionStore, useDisplayedEntity, useEntityOrder, useSelectedId } from "../store/projection";
+import { projectionStore, useDisplayedEntity, useEntityOrder, useMultiSelect, useSelectedId } from "../store/projection";
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
@@ -42,6 +42,7 @@ import { normalizeSurfacePoint } from "./viewportCoordinates";
 import { isMarqueeDrag, marqueeBox, marqueeMode, marqueeResult } from "./marquee";
 import { StageMarquee } from "./StageMarquee";
 import { selectionSentence, entityLabel } from "../store/selectionText";
+import { selectAllWith, selectionCommands } from "./selectionCommands";
 
 // WHAT MAY BE DEFERRED, AND WHY THE LIST IS SHORT. A chunk that loads on demand is absent until the
 // gesture that needs it — so the only safe candidates are surfaces a user REACHES FOR: Pipe Forge
@@ -207,6 +208,7 @@ export function App() {
   const paused = usePaused();
   const order = useEntityOrder();
   const selectedId = useSelectedId();
+  const multiSelect = useMultiSelect();
   const selectedEntity = useDisplayedEntity(selectedId ?? "");
   const editablePipeId = selectedId && selectedEntity?.components.PipeRecipe ? selectedId : null;
   const sceneEmpty = order.length === 0;
@@ -439,6 +441,14 @@ export function App() {
         setCommandsOpen(true);
         return;
       }
+      // Ctrl/Cmd-A — select every object. Guarded on `editingText` for the same reason Ctrl-Z is: a
+      // text field owns select-all-text, and nothing else owns this chord.
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "a") {
+        if (editingText) return;
+        e.preventDefault();
+        selectAll();
+        return;
+      }
       const redoGesture =
         (e.ctrlKey || e.metaKey) &&
         (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"));
@@ -569,6 +579,19 @@ export function App() {
     void client.gizmoSelect(id);
   };
 
+  // SELECTING WITHOUT A GESTURE (ADR-176). ADR-158 gave the stage the four gestures the engine
+  // understood; these are the verbs no gesture can express. Both halves of the selection, always —
+  // the store the Inspector reads AND the engine model the picture is outlined from — through the
+  // same `selectEntities` seam the outliner uses.
+  const applySelection = (ids: string[], sentence: string) => {
+    projectionStore.getState().setSelection(ids);
+    void client
+      .selectEntities(ids)
+      .catch((e) => console.error("selectEntities failed (engine selection may be out of sync)", e));
+    setStatus(sentence);
+  };
+  const selectAll = selectAllWith({ apply: applySelection });
+
   const importAsset = () => {
     void client.importAssetDialog().then((id) => {
       selectCreated(id);
@@ -597,6 +620,13 @@ export function App() {
     { id: "create-entity", label: "Create empty entity", category: "Create", description: "Add a named object at the origin", execute: async () => selectCreated(await client.createEntity(0, 1, 0, "Entity")) },
     { id: "create-light", label: "Add point light", category: "Create", description: "Add a warm point light above the origin", execute: async () => selectCreated(await client.addLight("point", 0, 4, 0, 1, 0.96, 0.9, 60)) },
     { id: "import-asset", label: "Import asset…", category: "Create", description: "Choose a supported 3D, image, or CAD file", execute: async () => selectCreated(await client.importAssetDialog()) },
+    // From the one exported list, so the rows a `shots` capture photographs are the rows that ship.
+    ...selectionCommands({
+      apply: applySelection,
+      say: setStatus,
+      hasSelection: multiSelect.length > 0,
+      sceneEmpty,
+    }),
     { id: "view-frame-all", label: "Frame all", category: "View", description: "Fit the whole scene in the viewport", execute: () => client.frameAll() },
     { id: "view-top", label: "Top view", category: "View", execute: () => client.viewPreset("top") },
     { id: "view-front", label: "Front view", category: "View", execute: () => client.viewPreset("front") },
