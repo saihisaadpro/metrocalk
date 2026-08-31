@@ -175,6 +175,23 @@ export function SectionHeader({ children, style }: { children: ReactNode; style?
   );
 }
 
+/** A dialog's visible name — the element `Modal`'s `ariaLabelledBy` points at.
+ *
+ *  WHY THIS IS NOT `SectionHeader`. The constitution's rule is that a panel group must not draw its own
+ *  heading, and `SectionHeader` is the answer to it: a styled `div`, because a group label inside a
+ *  panel is not a document landmark. A DIALOG's name is the opposite case — `role="dialog"` takes its
+ *  accessible name from a real heading, and a `div` cannot give it one. So the rule and the requirement
+ *  point in opposite directions, and the resolution is a second shared authority rather than a waiver
+ *  per dialog: one place that says a dialog title is an `h2` at `text.panelTitle`, and every dialog
+ *  after this one inherits it instead of inventing its own font stack again. */
+export function DialogTitle({ children, id, style }: { children: ReactNode; id?: string; style?: CSSProperties }) {
+  return (
+    <h2 id={id} style={{ ...text.panelTitle, fontSize: fontSize.heading, margin: 0, ...style }}>
+      {children}
+    </h2>
+  );
+}
+
 /** A scrollable region with a styled scrollbar (never raw browser scrollbars). */
 export function ScrollArea({ children, style, ...rest }: { children: ReactNode; style?: CSSProperties } & { "data-testid"?: string; id?: string }) {
   return (

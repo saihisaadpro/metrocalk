@@ -13,7 +13,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Modal } from "../theme/Popover";
-import { Button, SelectField, TextField } from "../theme/primitives";
+import { Button, DialogTitle, SelectField, TextField } from "../theme/primitives";
 import { Callout, Field, FieldGrid, Metric, MetricGrid, ProgressBar } from "../theme/fields";
 import { Icon } from "../theme/icons";
 import { color, elevation, font, fontSize, radius, space } from "../theme/tokens";
@@ -205,9 +205,9 @@ export function RenderDialog({
         }}
       >
         <header style={{ display: "grid", gap: space.xxs }}>
-          <h2 id={headingId} style={{ margin: 0, font: font.ui, fontSize: fontSize.heading }}>
+          <DialogTitle id={headingId}>
             <Icon name="clapper" size="md" /> Render {name}
-          </h2>
+          </DialogTitle>
           <p
             id={describedId}
             style={{ margin: 0, fontSize: fontSize.meta, color: color.text.secondary }}

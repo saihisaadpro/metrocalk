@@ -35,7 +35,7 @@ import { subjectAimStore, useSubjectAim } from "../store/subjectAim";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
-import { Button, ReadOut, SelectField, Slider, Toolbar, ToolbarGroup, ToolbarSeparator } from "../theme/primitives";
+import { Button, ReadOut, SectionHeader, SelectField, Slider, Toolbar, ToolbarGroup, ToolbarSeparator } from "../theme/primitives";
 import { Callout, Field, FieldGrid } from "../theme/fields";
 import { EmptyPanelState } from "../theme/workspace";
 import {
@@ -703,16 +703,9 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
 
       {active && catalog && (
         <section data-testid="cutscene-shot-editor" style={{ display: "grid", gap: space.xs, minWidth: 0 }}>
-          <h3
-            style={{
-              margin: 0,
-              font: font.ui,
-              fontSize: fontSize.body,
-              color: color.text.primary,
-            }}
-          >
+          <SectionHeader>
             Shot {active.index + 1} of {rows.length}
-          </h3>
+          </SectionHeader>
           <p data-testid="cutscene-shot-reads" style={{ margin: 0, fontSize: fontSize.meta, color: color.text.secondary }}>
             {active.reads}
           </p>
@@ -1008,9 +1001,7 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
       )}
 
       <section style={{ display: "grid", gap: space.xs, minWidth: 0 }}>
-        <h3 style={{ margin: 0, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
-          Add a shot
-        </h3>
+        <SectionHeader>Add a shot</SectionHeader>
         <ShotCatalogue
           specs={specs}
           minColumn={150}

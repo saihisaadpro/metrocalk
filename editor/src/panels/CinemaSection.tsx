@@ -14,18 +14,11 @@ import { usePlaying } from "../store/play";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
-import { Button } from "../theme/primitives";
-import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { Button, SectionHeader } from "../theme/primitives";
+import { color, fontSize, radius, space } from "../theme/tokens";
 import type { CinemaReply, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 import { ShotCatalogue } from "./ShotCatalogue";
-
-const sectionH3 = {
-  margin: `0 0 ${space.xs}px`,
-  font: font.ui,
-  fontSize: fontSize.body,
-  color: color.text.primary,
-} as const;
 
 const metaText = {
   fontSize: fontSize.meta,
@@ -148,7 +141,7 @@ export function CinemaSection({ client, onOpenTimeline }: CinemaSectionProps) {
 
   return (
     <section data-testid="cinema-section">
-      <h3 style={sectionH3}>Cinematics</h3>
+      <SectionHeader>Cinematics</SectionHeader>
 
       {playing && (
         <div
