@@ -23,6 +23,7 @@ import {
 } from "../../src/panels/AssetLabPanel";
 import { STAGE_MIN } from "../../src/app/layout";
 import { CommandPalette } from "../../src/panels/CommandPalette";
+import { ContextMenu } from "../../src/panels/ContextMenu";
 import { selectionCommands } from "../../src/app/selectionCommands";
 import { StageMarquee } from "../../src/app/StageMarquee";
 import { BindingGraph } from "../../src/graph/BindingGraph";
@@ -1027,6 +1028,7 @@ export const SCENES: Scene[] = [
   ...assetScenes(),
   ...modelScenes(),
   ...selectionVerbScenes(),
+  ...contextMenuScenes(),
   ...shellScenes(),
   ...selectionScenes(),
 ];
@@ -1675,6 +1677,147 @@ function selectionVerbScenes(): Scene[] {
             hasSelection: false,
             sceneEmpty: false,
           })}
+        />
+      ),
+    },
+  ];
+}
+
+/** THE MENU THAT OPENS ON WHAT IS SELECTED (ADR-183).
+ *
+ *  The editor produces large selections from three places — the marquee, Ctrl+A, and `Select similar`,
+ *  which on the Skid Weld Line answers with 378 identical bolts — and this menu asked the engine about
+ *  one id and acted on one object. The change is not that a verb was added; it is that every row now
+ *  carries the number of selected objects it acts on, and the two rows that honestly cannot take the
+ *  whole set say so ON THE ROW, before the click.
+ *
+ *  That claim is exactly the kind a capture answers and a unit test cannot: a vitest case can assert
+ *  the string `this one only` is in the DOM, and only a picture says whether a person scanning six
+ *  rows at speed sees which two of them are narrower than the rest — or whether the scope notes and
+ *  the refusal reasons, which share a treatment, blur into one grey column of small text. */
+function contextMenuScenes(): Scene[] {
+  // A selection of 378, most of them the same bolt — the assembly case, at its real size, because the
+  // digits are part of what is being judged. `Select similar` reads this projection directly.
+  const seedAssembly = () => {
+    const rows = [];
+    for (let i = 0; i < 378; i += 1) {
+      rows.push({
+        id: `bolt-${i}`,
+        name: "Bolt M12 — Hex Head, Zinc",
+        parentId: null,
+        components: { Transform: {}, MeshRenderer: { mesh: "mtkasset:bolt-m12" } },
+      });
+    }
+    rows.push({
+      id: "girder",
+      name: "Overhead Crane Assembly Rev C — Long Travel Girder",
+      parentId: null,
+      components: { Transform: {}, MeshRenderer: { mesh: "mtkasset:girder" } },
+    });
+    projectionStore.getState().bulkLoad(rows as never);
+  };
+
+  /** The engine's own answer shape. `appliesTo` IS the availability — there is no third state. */
+  const act = (action: string, label: string, appliesTo: number, mutates: boolean, reason?: string) => ({
+    action,
+    label,
+    available: appliesTo > 0,
+    reason: appliesTo > 0 ? undefined : reason,
+    mutates,
+    appliesTo,
+  });
+
+  const actionsClient = (count: number, items: ReturnType<typeof act>[]) =>
+    ({
+      entityActionsFor: () => Promise.resolve({ count, missing: 0, items }),
+    }) as unknown as EditorClient;
+
+  return [
+    {
+      id: "ctxmenu-selection",
+      looking_for:
+        "the menu over 378 selected objects: a subject line stating the scope BEFORE the first verb; " +
+        "`Delete` taking the whole set and saying nothing extra; `Duplicate` marked `this one only` " +
+        "and `Make dynamic` marked `212 of 378`, because those are the two facts a person needs " +
+        "before the click and not in the toast after it; `Bind…` greyed with its reason; and " +
+        "`Select similar` naming what it would match on. What a reader checks: the scope notes are " +
+        "distinguishable from the refusal reasons rather than blurring into one grey column, no row " +
+        "wraps into its neighbour, and the six labels are still scannable at a glance",
+      viewport: { width: 900, height: 560 },
+      expect: {
+        present: [
+          ["[data-testid='ctxmenu']", 1],
+          ["[data-testid='ctxmenu-subject']", 1],
+          // Five registry rows plus `Select similar`, which shares their keyboard ring.
+          ["[data-testid='ctxitem']", 6],
+          // The scope is a STRUCTURED signal, not copy: a test keyed on the wording would break the
+          // first time the sentence changed, and a wording change is not a scope change.
+          ["[data-action='remove'][data-applies-to='378']", 1],
+          ["[data-action='duplicate'][data-applies-to='1']", 1],
+          ["[data-action='selectsimilar'][data-applies-to='378']", 1],
+        ],
+        text_present: [
+          "378 objects selected",
+          "Delete",
+          "this one only",
+          "212 of 378",
+          "sharing the geometry of Bolt M12 — Hex Head, Zinc",
+          // Every "no" explained, in words rather than a grey row that does nothing.
+          "requires no capabilities",
+        ],
+        text_absent: ["null", "undefined", "NaN"],
+        // A row whose scope note ran past the surface would still satisfy `text_present`, because
+        // `textContent` does not know where anything is.
+        unclipped: ["[data-testid='ctxmenu']"],
+      },
+      setup: seedAssembly,
+      render: () => (
+        <ContextMenu
+          client={actionsClient(378, [
+            act("bind", "Bind…", 0, false, "requires no capabilities, so there is nothing to bind"),
+            act("remove", "Delete", 378, true),
+            act("duplicate", "Duplicate", 1, true),
+            act("focus", "Focus", 378, false),
+            act("inspect", "Inspect", 378, false),
+            act("makedynamic", "Make dynamic", 212, true),
+          ])}
+          ids={Array.from({ length: 378 }, (_, i) => `bolt-${i}`)}
+          onClose={() => {}}
+        />
+      ),
+    },
+    {
+      id: "ctxmenu-one-object",
+      looking_for:
+        "the SAME menu over one object. Nothing carries a scope note, because over one object every " +
+        "verb acts on that object and a suffix on every row is noise — this is the picture that says " +
+        "whether the rule `say it only when it is news` actually produces a quieter menu, or whether " +
+        "the set version above is simply the normal one with extra text",
+      viewport: { width: 900, height: 560 },
+      expect: {
+        present: [
+          ["[data-testid='ctxmenu-subject']", 1],
+          ["[data-testid='ctxitem']", 6],
+          ["[data-action='remove'][data-applies-to='1']", 1],
+        ],
+        text_present: ["Overhead Crane Assembly Rev C — Long Travel Girder", "Delete", "Duplicate"],
+        // The scope vocabulary belongs to a set. Over one object it must not appear at all.
+        text_absent: ["this one only", "of 1", "objects selected", "null", "undefined"],
+        unclipped: ["[data-testid='ctxmenu']"],
+      },
+      setup: seedAssembly,
+      render: () => (
+        <ContextMenu
+          client={actionsClient(1, [
+            act("bind", "Bind…", 0, false, "requires no capabilities, so there is nothing to bind"),
+            act("remove", "Delete", 1, true),
+            act("duplicate", "Duplicate", 1, true),
+            act("focus", "Focus", 1, false),
+            act("inspect", "Inspect", 1, false),
+            act("makedynamic", "Make dynamic", 1, true),
+          ])}
+          ids={["girder"]}
+          onClose={() => {}}
         />
       ),
     },
