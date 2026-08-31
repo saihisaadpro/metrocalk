@@ -15,6 +15,7 @@ import {
   type HTMLAttributes,
   type KeyboardEvent,
   type ReactNode,
+  type Ref,
 } from "react";
 import { Popover, PopoverSurface, type Placement } from "./Popover";
 import { Icon } from "./icons";
@@ -397,6 +398,14 @@ export function MenuPopup({
 }
 
 export interface PopupMenuItemProps extends Omit<ButtonProps, "children" | "onClick" | "disabled"> {
+  /** The row's own button, so a CONTAINER can manage focus across the rows.
+   *
+   *  A menu that follows the WAI-ARIA pattern keeps exactly one item in the tab order and moves focus
+   *  with the arrow keys, which means the menu — not the row — decides who is focused. Without this the
+   *  only rows a container could drive were the ones it drew itself, so `ContextMenu` drew its own
+   *  `<button>` and the editor had a third spelling of a menu row (ADR-151's subject, again). React 19
+   *  passes `ref` as an ordinary prop, so it rides `...rest` into the shared `Button`. */
+  ref?: Ref<HTMLButtonElement>;
   label: ReactNode;
   description?: ReactNode;
   leading?: ReactNode;
