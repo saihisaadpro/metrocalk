@@ -57,6 +57,7 @@ const ContextMenu = lazy(() => import("../panels/ContextMenu").then((module) => 
 // The export dialog reads the format catalogue and holds the fidelity ledger; a session that never
 // exports should not pay for either at boot (ADR-174).
 const ExportDialog = lazy(() => import("../panels/ExportDialog").then((module) => ({ default: module.ExportDialog })));
+const ImportDialog = lazy(() => import("../panels/ImportDialog").then((module) => ({ default: module.ImportDialog })));
 
 // The collapsed side rails carry only what that dock actually holds. The sub-engines are NOT repeated
 // here — they live on the Engines rail, which is always visible, and listing them twice in different
@@ -269,6 +270,7 @@ export function App() {
   const [bottomOpen, setBottomOpen] = useState(false);
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [vw, setVw] = useState(effectiveViewportWidth);
   const [leftDockCollapsed, setLeftDockCollapsed] = useRememberedBoolean("left-collapsed", false);
   const [rightDockCollapsed, setRightDockCollapsed] = useRememberedBoolean("right-collapsed", vw < 1200);
@@ -733,12 +735,10 @@ export function App() {
     void client.gizmoSelect(id);
   };
 
-  const importAsset = () => {
-    void client.importAssetDialog().then((id) => {
-      selectCreated(id);
-      if (id) openEngine("model");
-    });
-  };
+  // ADR-178 — every way into an import opens the SAME dialog. It used to call the native picker
+  // straight from four places (the menu, the palette, the empty state, "import another" after a
+  // drop), which is four callers each writing their own idea of what happens afterwards.
+  const importAsset = () => setImportOpen(true);
 
   const commands: EditorCommand[] = [
     // Generated from the SAME list the rail renders, so the palette can never drift out of sync with it.
@@ -760,7 +760,7 @@ export function App() {
     { id: "tool-pipe", label: "Draw pipe", category: "Create", description: "Author and bake a routed PBR asset in the viewport", keywords: ["pipe forge", "procedural"], disabled: playing, disabledReason: "Stop Play before authoring", execute: () => chooseTool("pipe") },
     { id: "create-entity", label: "Create empty entity", category: "Create", description: "Add a named object at the origin", execute: async () => selectCreated(await client.createEntity(0, 1, 0, "Entity")) },
     { id: "create-light", label: "Add point light", category: "Create", description: "Add a warm point light above the origin", execute: async () => selectCreated(await client.addLight("point", 0, 4, 0, 1, 0.96, 0.9, 60)) },
-    { id: "import-asset", label: "Import asset…", category: "Create", description: "Choose a supported 3D, image, or CAD file", execute: async () => selectCreated(await client.importAssetDialog()) },
+    { id: "import-asset", label: "Import a file…", category: "File", description: "See what this build reads, then choose a file", keywords: ["fbx", "gltf", "glb", "obj", "step", "3dxml", "usd", "import"], execute: () => setImportOpen(true) },
     // The palette had no File category at all, so the one command with a real cost attached — writing
     // the scene out — was reachable only by finding the menu it lived in.
     { id: "file-export", label: "Export scene…", category: "File", description: "Choose a format, see what it carries, and write the scene", keywords: ["glb", "gltf", "usd", "usda", "step", "save as", "write"], execute: () => setExportOpen(true) },
@@ -836,6 +836,7 @@ export function App() {
         compact={layout.collapsed}
         onOpenCommands={() => setCommandsOpen(true)}
         onExport={() => setExportOpen(true)}
+        onImport={() => setImportOpen(true)}
         onOpenLeftDock={() => setDrawer("left")}
         onOpenRightDock={() => setDrawer("right")}
       />
@@ -1364,6 +1365,20 @@ export function App() {
               setStatus(`${command.label} could not be completed`);
             }}
           />
+        </Suspense>
+      )}
+      {importOpen && (
+        <Suspense
+          fallback={(
+            <Modal open onClose={() => setImportOpen(false)} ariaLabel="Import dialog loading">
+              <div className="mtk-workspace-state" role="status" aria-live="polite">
+                <span className="mtk-spinner" aria-hidden="true" />
+                <span>Loading import…</span>
+              </div>
+            </Modal>
+          )}
+        >
+          <ImportDialog open client={client} onClose={() => setImportOpen(false)} />
         </Suspense>
       )}
       {exportOpen && (

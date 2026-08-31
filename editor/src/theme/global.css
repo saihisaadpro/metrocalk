@@ -980,12 +980,20 @@ body > [role="dialog"][aria-modal="true"] {
   background: var(--mtk-overlay-scrim) !important;
 }
 
-/* ── The export task dialog (ADR-174) ────────────────────────────────────────────────────────────
-   A rail of writable formats beside a pane that holds the SAME region through all three moments of
-   the workflow — the options, the run, and the exporter's ledger. The pane scrolls; the footer does
-   not, so the one primary action is never the thing below the fold. */
-.mtk-export { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: 420px; }
-.mtk-export__rail {
+/* ── THE TASK DIALOG (ADR-174 export, ADR-178 import) ─────────────────────────────────
+   A rail of choices beside a pane that holds the SAME region through all three moments of a
+   workflow — the options, the gesture, and the engine's own account of what it did. The pane
+   scrolls; the footer does not, so the one primary action is never the thing below the fold.
+
+   IT WAS `.mtk-export__*` UNTIL THE SECOND DIALOG NEEDED IT. Import is the mirror of export — a
+   catalogue of formats, a fidelity claim per format, a decision with consequences, an account
+   afterwards — and the two arriving three days apart is exactly how this editor came to hold three
+   vocabularies for a titled group. So the anatomy is named for the SHAPE and not for one of its two
+   users, and the third task dialog inherits it instead of copying forty rules a fourth time. */
+/* 256px, not 232: the longest name in the READ catalogue is `Radiance HDR (equirectangular)` and at
+   232 the rail truncated it mid-word. A rail exists so every choice can be READ at a glance. */
+.mtk-taskdialog { display: grid; grid-template-columns: 256px minmax(0, 1fr); min-height: 420px; }
+.mtk-taskdialog__rail {
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -994,20 +1002,20 @@ body > [role="dialog"][aria-modal="true"] {
 }
 /* Type comes from `DialogTitle` (`text.panelTitle` at `fontSize.heading`), so this rule states only
    the box — a second font stack here would be the per-dialog styling the shared title exists to end. */
-.mtk-export__title {
+.mtk-taskdialog__title {
   margin: 0;
   padding: var(--mtk-space-6) var(--mtk-space-6) var(--mtk-space-3);
 }
 /* The rail sits inside a column that already paints the panel surface and draws the divider, so its
    own copies of both would double the hairline and re-tint the tint. */
-.mtk-export .mtk-nav-rail {
+.mtk-taskdialog .mtk-nav-rail {
   flex: 1 1 auto;
   width: auto;
   padding: var(--mtk-space-2) var(--mtk-space-3);
   background: transparent;
   border-right: none;
 }
-.mtk-export__subject {
+.mtk-taskdialog__subject {
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1019,17 +1027,17 @@ body > [role="dialog"][aria-modal="true"] {
   border-radius: var(--mtk-radius-lg);
   background: var(--mtk-bg-raised);
 }
-.mtk-export__subject-name {
+.mtk-taskdialog__subject-name {
   overflow: hidden;
   font: 600 13px/1.3 var(--mtk-font-ui);
   color: var(--mtk-text);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.mtk-export__subject-count { font-size: 12px; color: var(--mtk-text-muted); }
+.mtk-taskdialog__subject-count { font-size: 12px; color: var(--mtk-text-muted); }
 
-.mtk-export__pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.mtk-export__body {
+.mtk-taskdialog__pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.mtk-taskdialog__body {
   display: flex;
   flex-direction: column;
   gap: var(--mtk-space-6);
@@ -1038,24 +1046,24 @@ body > [role="dialog"][aria-modal="true"] {
   padding: var(--mtk-space-6) var(--mtk-space-7);
   overflow: hidden auto;
 }
-.mtk-export__head { display: flex; align-items: center; gap: var(--mtk-space-3); flex-wrap: wrap; }
+.mtk-taskdialog__head { display: flex; align-items: center; gap: var(--mtk-space-3); flex-wrap: wrap; }
 /* Type from `SectionHeader variant="panel"`; the rule keeps only the box. */
-.mtk-export__format { margin: 0; }
-.mtk-export__ext { font: 12px/1 var(--mtk-font-mono); color: var(--mtk-text-muted); }
-.mtk-export__note { margin: 0; font-size: 13px; line-height: 1.5; color: var(--mtk-text-secondary); }
+.mtk-taskdialog__format { margin: 0; }
+.mtk-taskdialog__ext { font: 12px/1 var(--mtk-font-mono); color: var(--mtk-text-muted); }
+.mtk-taskdialog__note { margin: 0; font-size: 13px; line-height: 1.5; color: var(--mtk-text-secondary); }
 /* A heading and the block it labels are ONE unit: 6px apart, 16px from the next unit. Without the
    grouping every legend sat at the body's 16px from both its own list and the block above it, so
    "what was written" and "what it cost" read as four unrelated strips instead of two sections. */
-.mtk-export__block { display: grid; gap: var(--mtk-space-3); align-content: start; }
-.mtk-export__report { display: grid; gap: var(--mtk-space-6); align-content: start; }
+.mtk-taskdialog__block { display: grid; gap: var(--mtk-space-3); align-content: start; }
+.mtk-taskdialog__report { display: grid; gap: var(--mtk-space-6); align-content: start; }
 /* Type from `SectionHeader variant="eyebrow"` (`text.eyebrow`); the rule keeps only the box. */
-.mtk-export__legend {
+.mtk-taskdialog__legend {
   margin: 0;
 }
 
 /* Two columns of nine capabilities: at the dialog's width one column would run past the fold and
    make "what does this write" a scroll rather than a glance. */
-.mtk-export__carries {
+.mtk-taskdialog__carries {
   display: grid;
   gap: var(--mtk-space-3) var(--mtk-space-6);
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -1063,7 +1071,7 @@ body > [role="dialog"][aria-modal="true"] {
   padding: 0;
   list-style: none;
 }
-.mtk-export__carry {
+.mtk-taskdialog__carry {
   display: flex;
   align-items: center;
   gap: var(--mtk-space-3);
@@ -1073,15 +1081,35 @@ body > [role="dialog"][aria-modal="true"] {
 }
 /* Carried and not-carried differ by MARK first (check vs dash) and only then by weight, so the
    distinction survives greyscale and a colour-vision difference. */
-.mtk-export__carry[data-carried="true"] { color: var(--mtk-text); }
-.mtk-export__carry[data-carried="true"] > svg { color: var(--mtk-success); }
+.mtk-taskdialog__carry[data-carried="true"] { color: var(--mtk-text); }
+.mtk-taskdialog__carry[data-carried="true"] > svg { color: var(--mtk-success); }
 /* `--mtk-text-faint` measured 3.73:1 on the dialog's white and this is body text, not an inactive
    control's label, so it is held to 4.5:1 (WCAG 2.2 SC 1.4.3). The MARK may sit at the 3:1 that
    applies to a graphic, which is what keeps the two states distinguishable at a glance. */
-.mtk-export__carry[data-carried="false"] { color: var(--mtk-text-muted); }
-.mtk-export__carry[data-carried="false"] > svg { color: var(--mtk-text-faint); }
+.mtk-taskdialog__carry[data-carried="false"] { color: var(--mtk-text-muted); }
+.mtk-taskdialog__carry[data-carried="false"] > svg { color: var(--mtk-text-faint); }
 
-.mtk-export__cost {
+/* The readable-extension set, as a wrapping row of mono pills. A comma-separated sentence of
+   nineteen extensions reads as prose and is scanned as prose; a pill per extension is scanned as a
+   SET, which is what it is, and the wrap needs no breakpoint of its own. */
+.mtk-taskdialog__exts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mtk-space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mtk-taskdialog__exts li {
+  padding: 2px var(--mtk-space-3);
+  border: 1px solid var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-sm);
+  background: var(--mtk-bg-inset);
+  font: 12px/1.5 var(--mtk-font-mono);
+  color: var(--mtk-text-secondary);
+}
+
+.mtk-taskdialog__cost {
   display: flex;
   align-items: flex-start;
   gap: var(--mtk-space-3);
@@ -1093,10 +1121,11 @@ body > [role="dialog"][aria-modal="true"] {
   line-height: 1.5;
   color: var(--mtk-text-secondary);
 }
-.mtk-export__cost > svg { flex: none; margin-top: 2px; color: var(--mtk-warn); }
-.mtk-export__cost strong { color: var(--mtk-text); }
+.mtk-taskdialog__cost > svg { flex: none; margin-top: 2px; color: var(--mtk-warn); }
+.mtk-taskdialog__cost strong { color: var(--mtk-text); }
+.mtk-taskdialog__cost p { margin: 0; }
 
-.mtk-export__counts {
+.mtk-taskdialog__counts {
   display: flex;
   gap: var(--mtk-space-6);
   flex-wrap: wrap;
@@ -1104,10 +1133,10 @@ body > [role="dialog"][aria-modal="true"] {
   padding: 0;
   list-style: none;
 }
-.mtk-export__counts li { display: flex; align-items: baseline; gap: var(--mtk-space-2); }
-.mtk-export__counts strong { font: 600 18px/1.2 var(--mtk-font-ui); color: var(--mtk-text); }
-.mtk-export__counts span { font-size: 12px; color: var(--mtk-text-muted); }
-.mtk-export__path {
+.mtk-taskdialog__counts li { display: flex; align-items: baseline; gap: var(--mtk-space-2); }
+.mtk-taskdialog__counts strong { font: 600 18px/1.2 var(--mtk-font-ui); color: var(--mtk-text); }
+.mtk-taskdialog__counts span { font-size: 12px; color: var(--mtk-text-muted); }
+.mtk-taskdialog__path {
   margin: 0;
   overflow: hidden;
   padding: var(--mtk-space-2) var(--mtk-space-3);
@@ -1118,14 +1147,20 @@ body > [role="dialog"][aria-modal="true"] {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.mtk-export__ledger { display: grid; gap: var(--mtk-space-3); margin: 0; padding: 0; list-style: none; }
+.mtk-taskdialog__ledger { display: grid; gap: var(--mtk-space-3); margin: 0; padding: 0; list-style: none; }
 /* A FIXED badge track, not `auto`: `preserved`, `converted` and `omitted` are three widths, and an
    auto track starts each feature name at a different x — three rows that never line up. */
-.mtk-export__ledger li { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: var(--mtk-space-4); align-items: start; }
-.mtk-export__ledger .mtk-badge { justify-self: start; }
-.mtk-export__ledger strong { display: block; font: 600 13px/1.4 var(--mtk-font-ui); color: var(--mtk-text); }
-.mtk-export__ledger span { font-size: 12px; line-height: 1.5; color: var(--mtk-text-secondary); }
-.mtk-export__failure {
+.mtk-taskdialog__ledger li { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: var(--mtk-space-4); align-items: start; }
+/* THE SAME LIST, A DIFFERENT FIRST COLUMN. The 88px track above is sized for the export ledger's
+   status WORDS (`preserved` / `converted` / `omitted`), which is exactly right there and wrong here:
+   an import's badge is a COUNT, so 88px left a hundred pixels of nothing between `235` and
+   `Exact B-rep` and the two read as unrelated columns rather than as one row. A count needs room for
+   five digits and no more. */
+.mtk-taskdialog__ledger--counts li { grid-template-columns: 52px minmax(0, 1fr); align-items: baseline; }
+.mtk-taskdialog__ledger .mtk-badge { justify-self: start; }
+.mtk-taskdialog__ledger strong { display: block; font: 600 13px/1.4 var(--mtk-font-ui); color: var(--mtk-text); }
+.mtk-taskdialog__ledger span { font-size: 12px; line-height: 1.5; color: var(--mtk-text-secondary); }
+.mtk-taskdialog__failure {
   display: flex;
   align-items: flex-start;
   gap: var(--mtk-space-3);
@@ -1134,10 +1169,10 @@ body > [role="dialog"][aria-modal="true"] {
   border-radius: var(--mtk-radius-lg);
   background: var(--mtk-danger-bg);
 }
-.mtk-export__failure > svg { flex: none; margin-top: 1px; color: var(--mtk-danger); }
-.mtk-export__failure p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--mtk-text); }
+.mtk-taskdialog__failure > svg { flex: none; margin-top: 1px; color: var(--mtk-danger); }
+.mtk-taskdialog__failure p { margin: 0; font-size: 13px; line-height: 1.5; color: var(--mtk-text); }
 
-.mtk-export__foot {
+.mtk-taskdialog__foot {
   display: flex;
   align-items: center;
   gap: var(--mtk-space-4);
@@ -1150,11 +1185,11 @@ body > [role="dialog"][aria-modal="true"] {
 /* Below the rail's own breakpoint the dialog stacks: the rail becomes the horizontal strip
    `.mtk-nav-rail` already turns into, and the pane takes the full width under it. */
 @media (max-width: 860px) {
-  .mtk-export { grid-template-columns: minmax(0, 1fr); min-height: 0; }
-  .mtk-export__rail { border-right: none; border-bottom: 1px solid var(--mtk-border-subtle); }
-  .mtk-export__title { padding-bottom: 0; }
-  .mtk-export__body { padding: var(--mtk-space-5); }
-  .mtk-export__foot { padding: var(--mtk-space-5); }
+  .mtk-taskdialog { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .mtk-taskdialog__rail { border-right: none; border-bottom: 1px solid var(--mtk-border-subtle); }
+  .mtk-taskdialog__title { padding-bottom: 0; }
+  .mtk-taskdialog__body { padding: var(--mtk-space-5); }
+  .mtk-taskdialog__foot { padding: var(--mtk-space-5); }
 }
 
 /* ── Inspector property rows + collapsible groups (M14.3 / ADR-059) ── */
@@ -1776,12 +1811,19 @@ body > [role="dialog"][aria-modal="true"] {
 .mtk-nav-rail__icon { display: inline-flex; flex: none; color: var(--mtk-text-muted); }
 .mtk-nav-rail__label { overflow: hidden; min-width: 0; text-overflow: ellipsis; white-space: nowrap; }
 .mtk-nav-rail__badge { flex: none; margin-left: auto; }
+/* IT WRAPS, IT DOES NOT SCROLL. The rail's whole argument is that every choice is visible at once
+   — read its own doc comment — and the narrow form used to be `overflow: auto hidden`, which is the
+   horizontal strip with items past the edge that `Toolbar`'s comment calls out and that this
+   component was built to replace. Four items fit on one line either way; eleven (every format this
+   build can READ) do not, and a strip would have put six of them off screen with nothing on screen
+   to say they existed. Wrapping is never worse than clipping. */
 @media (max-width: 860px) {
   .mtk-nav-rail {
     flex-direction: row;
+    flex-wrap: wrap;
     width: auto;
     padding: var(--mtk-space-3) var(--mtk-space-4);
-    overflow: auto hidden;
+    overflow: hidden;
     border-right: none;
     border-bottom: 1px solid var(--mtk-border-subtle);
   }

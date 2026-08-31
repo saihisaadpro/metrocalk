@@ -169,31 +169,82 @@ test("import surfaces ONE near-duplicate toast when the provenance projection re
 
 test("import surfaces NO toast when the asset is not a near-duplicate", async () => {
   const client = clientWith((cmd) => {
-    if (cmd === "import_asset_dialog") return Promise.resolve("ent-8");
+    if (cmd === "import_asset_dialog")
+      return Promise.resolve({ entityId: "ent-8", outcome: "imported", message: "Imported unique.glb." });
     if (cmd === "asset_provenance")
       return Promise.resolve({ kind: "imported", source: "unique.glb", nearDuplicateOf: null });
     return Promise.resolve(null);
   });
 
-  const id = await client.importAssetDialog();
+  const reply = await client.importAssetDialog();
 
-  expect(id).toBe("ent-8");
+  expect(reply.entityId).toBe("ent-8");
   expect(texts()).toEqual([]);
 });
 
-test("a cancelled import (null id) queries no provenance and posts no toast", async () => {
+// ADR-178 — A DISMISSED FILE DIALOG AND AN UNREADABLE FILE ARE DIFFERENT ANSWERS. The reply used to
+// be `string | null` and `null` was both, so no caller could tell them apart and every one of them
+// wrote the same "cancelled or unsupported". The transport now carries the outcome; these two cases
+// assert that it survives the wire AND that neither one queries provenance for an entity that does
+// not exist.
+test("a cancelled import queries no provenance, posts no toast, and SAYS it was cancelled", async () => {
   const invoked: string[] = [];
   const client = clientWith((cmd) => {
     invoked.push(cmd);
-    if (cmd === "import_asset_dialog") return Promise.resolve(null);
+    if (cmd === "import_asset_dialog")
+      return Promise.resolve({
+        entityId: null,
+        outcome: "cancelled",
+        message: "No file was chosen. Nothing in the scene changed.",
+      });
     return Promise.resolve(null);
   });
 
-  const id = await client.importAssetDialog();
+  const reply = await client.importAssetDialog();
 
-  expect(id).toBeNull();
+  expect(reply.entityId).toBeNull();
+  expect(reply.outcome).toBe("cancelled");
   expect(texts()).toEqual([]);
   expect(invoked).not.toContain("asset_provenance");
+});
+
+test("a refused import is reported as FAILED, not as a cancellation", async () => {
+  const invoked: string[] = [];
+  const client = clientWith((cmd) => {
+    invoked.push(cmd);
+    if (cmd === "import_asset_dialog")
+      return Promise.resolve({
+        entityId: null,
+        outcome: "failed",
+        message: "sketch.dwg could not be read by this build.",
+      });
+    return Promise.resolve(null);
+  });
+
+  const reply = await client.importAssetDialog();
+
+  expect(reply.outcome).toBe("failed");
+  expect(reply.message).toContain("could not be read");
+  expect(invoked).not.toContain("asset_provenance");
+});
+
+test("a chosen format narrows the native dialog's filter to that format's extensions", async () => {
+  const seen: Record<string, unknown>[] = [];
+  const client = clientWith((cmd, args) => {
+    if (cmd === "import_asset_dialog") {
+      seen.push((args ?? {}) as Record<string, unknown>);
+      return Promise.resolve({ entityId: null, outcome: "cancelled", message: "No file was chosen." });
+    }
+    return Promise.resolve(null);
+  });
+
+  await client.importAssetDialog(["stp", "step"]);
+  await client.importAssetDialog();
+
+  // Two calls, two DIFFERENT arguments: a narrowed filter, then the explicit "no filter" that the
+  // shell reads as every readable extension. `undefined` would be dropped from the payload, so the
+  // unfiltered case is sent as an explicit null rather than by omission.
+  expect(seen).toEqual([{ extensions: ["stp", "step"] }, { extensions: null }]);
 });
 
 test("a provenance-hint failure never breaks the import (best-effort)", async () => {

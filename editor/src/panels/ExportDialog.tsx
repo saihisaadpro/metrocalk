@@ -191,9 +191,9 @@ export function ExportDialog({ open, onClose, client }: ExportDialogProps) {
 
   return (
     <Modal open onClose={onClose} id="exportDialog" ariaLabelledBy="exportDialogTitle" initialFocusRef={confirmRef}>
-      <DialogSurface flush data-testid="exportDialog" className="mtk-export" style={{ ["--mtk-dialog-width" as string]: "820px" }}>
-        <div className="mtk-export__rail">
-          <DialogTitle id="exportDialogTitle" className="mtk-export__title">Export scene</DialogTitle>
+      <DialogSurface flush data-testid="exportDialog" className="mtk-taskdialog" style={{ ["--mtk-dialog-width" as string]: "820px" }}>
+        <div className="mtk-taskdialog__rail">
+          <DialogTitle id="exportDialogTitle" className="mtk-taskdialog__title">Export scene</DialogTitle>
           {writable.length > 0 && (
             <NavRail
               id="exportFormats"
@@ -212,21 +212,21 @@ export function ExportDialog({ open, onClose, client }: ExportDialogProps) {
               }))}
             />
           )}
-          <div className="mtk-export__subject" data-testid="exportSubject">
-            <span className="mtk-export__subject-name" title={path ?? undefined}>{subject}</span>
-            <span className="mtk-export__subject-count">
+          <div className="mtk-taskdialog__subject" data-testid="exportSubject">
+            <span className="mtk-taskdialog__subject-name" title={path ?? undefined}>{subject}</span>
+            <span className="mtk-taskdialog__subject-count">
               {entities.length === 1 ? "1 object in this scene" : `${entities.length} objects in this scene`}
             </span>
           </div>
         </div>
 
-        <div className="mtk-export__pane" id={active ? `exportPane-${active.id}` : undefined} role={active ? "tabpanel" : undefined}>
+        <div className="mtk-taskdialog__pane" id={active ? `exportPane-${active.id}` : undefined} role={active ? "tabpanel" : undefined}>
           {catalog == null ? (
-            <div className="mtk-export__body" data-testid="exportLoading">
-              <p className="mtk-export__note">Reading what this build can write…</p>
+            <div className="mtk-taskdialog__body" data-testid="exportLoading">
+              <p className="mtk-taskdialog__note">Reading what this build can write…</p>
             </div>
           ) : active == null ? (
-            <div className="mtk-export__body">
+            <div className="mtk-taskdialog__body">
               <EmptyPanelState
                 data-testid="exportEmpty"
                 icon={<Icon name="export" size="xl" />}
@@ -235,27 +235,27 @@ export function ExportDialog({ open, onClose, client }: ExportDialogProps) {
               />
             </div>
           ) : (
-            <div className="mtk-export__body" data-testid={`exportPane-${active.id}`}>
-              <header className="mtk-export__head">
-                <SectionHeader variant="panel" className="mtk-export__format">{active.label}</SectionHeader>
+            <div className="mtk-taskdialog__body" data-testid={`exportPane-${active.id}`}>
+              <header className="mtk-taskdialog__head">
+                <SectionHeader variant="panel" className="mtk-taskdialog__format">{active.label}</SectionHeader>
                 <Badge tone={FIDELITY_TONE[active.fidelity] ?? "neutral"} title={FIDELITY_COPY[active.fidelity]?.hint}>
                   {FIDELITY_COPY[active.fidelity]?.label ?? active.fidelity}
                 </Badge>
-                <span className="mtk-export__ext">.{arg}</span>
+                <span className="mtk-taskdialog__ext">.{arg}</span>
               </header>
-              <p className="mtk-export__note">{active.note}</p>
+              <p className="mtk-taskdialog__note">{active.note}</p>
 
               {result == null ? (
                 <>
-                  <section className="mtk-export__block">
-                  <SectionHeader variant="eyebrow" className="mtk-export__legend" id="exportCarriesLegend">What this format writes</SectionHeader>
-                  <ul className="mtk-export__carries" aria-labelledby="exportCarriesLegend" data-testid="exportCarries">
+                  <section className="mtk-taskdialog__block">
+                  <SectionHeader variant="eyebrow" className="mtk-taskdialog__legend" id="exportCarriesLegend">What this format writes</SectionHeader>
+                  <ul className="mtk-taskdialog__carries" aria-labelledby="exportCarriesLegend" data-testid="exportCarries">
                     {CARRIES.map((c) => {
                       const carried = active.carries[c.key];
                       return (
                         <li
                           key={c.key}
-                          className="mtk-export__carry"
+                          className="mtk-taskdialog__carry"
                           data-carried={carried}
                           data-testid={`exportCarry-${c.key}`}
                         >
@@ -273,7 +273,7 @@ export function ExportDialog({ open, onClose, client }: ExportDialogProps) {
                   </section>
 
                   {omissions.length > 0 && (
-                    <div className="mtk-export__cost" data-testid="exportCost">
+                    <div className="mtk-taskdialog__cost" data-testid="exportCost">
                       <Icon name="warning" size="sm" />
                       <div>
                         <strong>
@@ -294,7 +294,7 @@ export function ExportDialog({ open, onClose, client }: ExportDialogProps) {
             </div>
           )}
 
-          <footer className="mtk-export__foot">
+          <footer className="mtk-taskdialog__foot">
             {result?.ok ? (
               <>
                 <Button data-testid="exportAgain" variant="secondary" onClick={() => setResult(null)}>
@@ -342,7 +342,7 @@ export function ExportDialog({ open, onClose, client }: ExportDialogProps) {
 function ExportLedger({ result }: { result: SceneExportResponse }) {
   if (!result.ok) {
     return (
-      <div className="mtk-export__failure" data-testid="exportFailure" role="status">
+      <div className="mtk-taskdialog__failure" data-testid="exportFailure" role="status">
         <Icon name="warning" size="md" />
         <p>{result.message}</p>
       </div>
@@ -355,10 +355,10 @@ function ExportLedger({ result }: { result: SceneExportResponse }) {
     ["animations", result.animations],
   ];
   return (
-    <div className="mtk-export__report" data-testid="exportResult" role="status">
-      <section className="mtk-export__block">
-        <SectionHeader variant="eyebrow" className="mtk-export__legend">What was written</SectionHeader>
-        <ul className="mtk-export__counts">
+    <div className="mtk-taskdialog__report" data-testid="exportResult" role="status">
+      <section className="mtk-taskdialog__block">
+        <SectionHeader variant="eyebrow" className="mtk-taskdialog__legend">What was written</SectionHeader>
+        <ul className="mtk-taskdialog__counts">
           {counts.map(([label, value]) => (
             <li key={label} data-testid={`exportCount-${label}`}>
               <strong>{value}</strong>
@@ -367,19 +367,19 @@ function ExportLedger({ result }: { result: SceneExportResponse }) {
           ))}
         </ul>
         {result.exportedPath != null && (
-          <p className="mtk-export__path" data-testid="exportPath" title={result.exportedPath}>
+          <p className="mtk-taskdialog__path" data-testid="exportPath" title={result.exportedPath}>
             {result.exportedPath}
           </p>
         )}
       </section>
-      <section className="mtk-export__block">
-      <SectionHeader variant="eyebrow" className="mtk-export__legend">What it cost</SectionHeader>
+      <section className="mtk-taskdialog__block">
+      <SectionHeader variant="eyebrow" className="mtk-taskdialog__legend">What it cost</SectionHeader>
       {result.fidelity.length === 0 ? (
-        <p className="mtk-export__note" data-testid="exportNoFidelity">
+        <p className="mtk-taskdialog__note" data-testid="exportNoFidelity">
           The exporter reported nothing changed or omitted.
         </p>
       ) : (
-        <ul className="mtk-export__ledger" data-testid="exportFidelity">
+        <ul className="mtk-taskdialog__ledger" data-testid="exportFidelity">
           {result.fidelity.map((entry, index) => (
             <li key={`${entry.feature}-${index}`} data-status={entry.status}>
               <Badge tone={STATUS_TONE[entry.status] ?? "neutral"}>{entry.status}</Badge>

@@ -2299,6 +2299,31 @@ enum ImportAssetResult {
     Cancelled,
 }
 
+/// Which of the three things happened, said out loud (ADR-178).
+///
+/// `import_asset_dialog` used to reply `Option<String>` and collapse `Failed` and `Cancelled` into
+/// the same `None` — the engine KNEW which one and threw it away at the last statement before the
+/// wire. That is the "explain every no" rule broken in the one place the no is produced: the only
+/// sentence the caller could honestly write was "the dialog was dismissed, or the file could not be
+/// read", which is two answers joined by "or" and therefore neither.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum ImportOutcome {
+    Imported,
+    Cancelled,
+    Failed,
+}
+
+/// The reply `import_asset_dialog` sends: the placed entity when there is one, and always which of
+/// the three outcomes it was, with the sentence to show for it.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ImportDialogResponse {
+    entity_id: Option<String>,
+    outcome: ImportOutcome,
+    message: String,
+}
+
 /// Commands to the engine thread (which owns the `!Send` Engine).
 enum EngineCmd {
     Connect(Channel<ProjectionDelta>),
@@ -24983,37 +25008,100 @@ fn cancel_native_import(state: State<AppState>, batch_id: u64) -> bool {
 /// M11.1 — **File → Import**: open a native file dialog filtered to 3D/asset formats, then import the
 /// chosen file (the human path; the native dialog is the local-GUI step). Reply the new entity id, or
 /// `None` if cancelled / unsupported.
+///
+/// ADR-178 — `extensions` NARROWS the filter to one format the import dialog offered. Omitted, empty,
+/// or naming nothing this build can read, it is every readable extension, which is what this command
+/// has always done: a caller that asks for a format this build lacks gets the whole set rather than
+/// an empty file dialog showing nothing, because "no files match" is the one answer that looks like a
+/// broken picker rather than a refusal.
 #[tauri::command]
-fn import_asset_dialog(app: tauri::AppHandle, state: State<AppState>) -> Option<String> {
+fn import_asset_dialog(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    extensions: Option<Vec<String>>,
+) -> ImportDialogResponse {
     ipc();
-    let path = app
+    // DERIVED from `metrocalk_editor_shell::formats`, never hand-maintained: a hand-written list
+    // silently drifts from what the build can actually read (KTX2 was importable and absent here,
+    // so the only way to open one was automation).
+    let readable = metrocalk_editor_shell::import_extensions();
+    let asked: Vec<&'static str> = extensions
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|e| {
+            let want = e.trim_start_matches('.').to_ascii_lowercase();
+            readable.iter().find(|r| ***r == *want).copied()
+        })
+        .collect();
+    // The filter's NAME is derived too. A narrowed filter that still said "3D models, CAD & assets"
+    // would name the whole set beside a list holding one member of it.
+    let (label, filter) = if asked.is_empty() {
+        ("3D models, CAD & assets".to_string(), readable.clone())
+    } else {
+        let named = metrocalk_editor_shell::format_catalog()
+            .iter()
+            .find(|f| f.extensions.iter().any(|x| asked.contains(x)))
+            .map(|f| f.label.to_string());
+        (named.unwrap_or_else(|| "Selected format".to_string()), asked)
+    };
+    let Some(chosen) = app
         .dialog()
         .file()
-        // DERIVED from `metrocalk_editor_shell::formats`, never hand-maintained: a hand-written list
-        // silently drifts from what the build can actually read (KTX2 was importable and absent here,
-        // so the only way to open one was automation).
-        .add_filter(
-            "3D models, CAD & assets",
-            &metrocalk_editor_shell::import_extensions(),
-        )
+        .add_filter(label, &filter)
         .blocking_pick_file()
         .and_then(|f| f.into_path().ok())
-        .map(|p| p.display().to_string())?;
+        .map(|p| p.display().to_string())
+    else {
+        return ImportDialogResponse {
+            entity_id: None,
+            outcome: ImportOutcome::Cancelled,
+            message: "No file was chosen. Nothing in the scene changed.".to_string(),
+        };
+    };
+    let name = std::path::Path::new(&chosen)
+        .file_name()
+        .map_or_else(|| chosen.clone(), |n| n.to_string_lossy().into_owned());
     let (reply, rx) = mpsc::channel();
     if state
         .tx
         .send(EngineCmd::ImportAsset {
-            path,
+            path: chosen,
             cancellation: None,
             reply,
         })
         .is_err()
     {
-        return None;
+        return ImportDialogResponse {
+            entity_id: None,
+            outcome: ImportOutcome::Failed,
+            message: "The engine is not accepting work. Nothing in the scene changed.".to_string(),
+        };
     }
     match recv_reply_within(&rx, IMPORT_REPLY_TIMEOUT) {
-        Ok(ImportAssetResult::Imported(id)) => Some(id),
-        Ok(ImportAssetResult::Failed | ImportAssetResult::Cancelled) | Err(_) => None,
+        Ok(ImportAssetResult::Imported(id)) => ImportDialogResponse {
+            entity_id: Some(id),
+            outcome: ImportOutcome::Imported,
+            message: format!("Imported {name}."),
+        },
+        Ok(ImportAssetResult::Cancelled) => ImportDialogResponse {
+            entity_id: None,
+            outcome: ImportOutcome::Cancelled,
+            message: format!("The import of {name} was cancelled. Nothing in the scene changed."),
+        },
+        Ok(ImportAssetResult::Failed) => ImportDialogResponse {
+            entity_id: None,
+            outcome: ImportOutcome::Failed,
+            message: format!(
+                "{name} could not be read by this build. Nothing in the scene changed — check the                  formats this build declares, or re-export the file."
+            ),
+        },
+        // A reply that never came is not a refusal: the importer is still working somewhere behind
+        // this dialog, so the sentence must not claim the scene is unchanged.
+        Err(_) => ImportDialogResponse {
+            entity_id: None,
+            outcome: ImportOutcome::Failed,
+            message: format!("The importer did not answer within its budget while reading {name}."),
+        },
     }
 }
 

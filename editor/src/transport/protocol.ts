@@ -767,6 +767,22 @@ export interface CadReportPart {
   sourceFormat: string | null;
 }
 
+/** ADR-178 — which of the three things happened when File→Import ran. Mirrors `ImportOutcome`.
+ *
+ *  It exists because the shell used to reply `string | null` and `null` meant BOTH "you dismissed the
+ *  file dialog" and "this build could not read that file". The engine distinguished them internally
+ *  and discarded the distinction at the last statement before the wire, which left the only honest
+ *  sentence a caller could write as two answers joined by "or". */
+export type ImportOutcomeKind = "imported" | "cancelled" | "failed";
+
+/** The reply File→Import sends: the placed entity when there is one, and always which outcome it was
+ *  with the sentence to show for it. Mirrors `ImportDialogResponse`. */
+export interface ImportDialogResponse {
+  entityId: string | null;
+  outcome: ImportOutcomeKind;
+  message: string;
+}
+
 /** The per-part CAD import report aggregated from the ECS — the fidelity breakdown (the header) + a capped
  *  part list (the queryable body). "Explain every no" applied to import; nothing silent. Mirrors
  *  `CadReportResp`. */

@@ -21,6 +21,7 @@ import type {
   MatchValidation,
   CatalogSearch,
   CadReport,
+  ImportDialogResponse,
   ReimportReport,
   ContactInfo,
   JointInfo,
@@ -540,8 +541,14 @@ export interface EditorClient {
   // ── M11.1 File→Import (ADR-040): drop any file → a working asset (FBX/glTF/OBJ/PNG via the MAGIC router) ─
   /** Import an asset file from a known path → the new entity id (the e2e path). */
   importAsset(path: string): Promise<string | null>;
-  /** File→Import: open the native file dialog + import the chosen file → the new entity id. */
-  importAssetDialog(): Promise<string | null>;
+  /** File→Import: open the native file dialog + import the chosen file.
+   *
+   *  `extensions` (ADR-178) narrows the native dialog's filter to one format the import dialog
+   *  offered. Omitted, it is every extension this build can read — the historical behaviour.
+   *
+   *  The reply NAMES the outcome. It used to be `string | null`, and `null` meant a dismissed dialog
+   *  and an unreadable file equally, so no caller could say which had happened. */
+  importAssetDialog(extensions?: readonly string[]): Promise<ImportDialogResponse>;
 
   // ── project lifecycle (M10.3 / ADR-033): New / Open / Save / Save As over the `.mtk` document ──────
   /** The current project state — path, unsaved-changes flag, recent projects. The File menu refreshes
@@ -1313,11 +1320,13 @@ export class TauriClient implements EditorClient {
       throw e;
     }
   }
-  async importAssetDialog(): Promise<string | null> {
+  async importAssetDialog(extensions?: readonly string[]): Promise<ImportDialogResponse> {
     try {
-      const id = await this.core.invoke<string | null>("import_asset_dialog");
-      await this.hintNearDuplicate(id);
-      return id;
+      const reply = await this.core.invoke<ImportDialogResponse>("import_asset_dialog", {
+        extensions: extensions == null ? null : [...extensions],
+      });
+      await this.hintNearDuplicate(reply.entityId);
+      return reply;
     } catch (e: unknown) {
       console.error("import_asset_dialog failed", e);
       throw e;
@@ -3471,8 +3480,14 @@ class MockClient implements EditorClient {
   importAsset(): Promise<string | null> {
     return Promise.resolve(null);
   }
-  importAssetDialog(): Promise<string | null> {
-    return Promise.resolve(null);
+  importAssetDialog(): Promise<ImportDialogResponse> {
+    return Promise.resolve({
+      entityId: null,
+      outcome: "failed",
+      // The dev MockCore has no native dialog and no MAGIC router. It says so, rather than replying
+      // "cancelled" — which would be a surface reporting a user gesture that never happened.
+      message: "Importing a file needs the packaged desktop editor — the native file dialog and the format readers are not in the browser build.",
+    });
   }
 
   // The dev MockCore has no real document; track a plausible in-memory project so the File menu renders.

@@ -33,6 +33,7 @@ import { Diagnostics } from "../../src/panels/Diagnostics";
 import { MaterialPanel } from "../../src/panels/MaterialPanel";
 import { MATERIAL_PRESETS, MaterialSphere } from "../../src/theme/materials";
 import { ExportDialog } from "../../src/panels/ExportDialog";
+import { ImportDialog } from "../../src/panels/ImportDialog";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { Reveal } from "../../src/panels/Reveal";
 import { RigPanel, type RigDocument } from "../../src/panels/RigPanel";
@@ -57,6 +58,7 @@ import type {
   RevealResponse,
   ShotRow,
   ShotSpec,
+  ImportDialogResponse,
   SceneExportResponse,
   StateMachine,
   SubjectCatalog,
@@ -1084,7 +1086,7 @@ function exportScenes(): Scene[] {
         // The rail is a COLUMN at this width — the pane sits BESIDE it, not under it. (Claimed on
         // the two regions, not on the tablist and the heading: the rail's box starts below its own
         // title, so those two never shared a line and never should have been asked to.)
-        same_line: [[".mtk-export__rail", ".mtk-export__pane"]],
+        same_line: [[".mtk-taskdialog__rail", ".mtk-taskdialog__pane"]],
       },
       { width: 1100, height: 760 },
     ),
@@ -1166,6 +1168,198 @@ function exportScenes(): Scene[] {
         ],
       },
       { width: 720, height: 800 },
+    ),
+  ];
+}
+
+/** === The import task dialog (ADR-178) ==========================================================
+ *
+ *  The mirror of the four above, and the surface File→Import never had: one menu item straight into
+ *  a native picker, with the per-part account in a different dock. What is worth photographing is
+ *  that the two dialogs are ONE anatomy — the same rail, pane, footer and marks, `.mtk-taskdialog__*`
+ *  since this scene needed it — and that the longer catalogue (ten readers against four writers) did
+ *  not force a second shape to hold it.
+ *
+ *  Same rule as the export catalogue: it comes from `createMockSession()`, not a fixture, because a
+ *  hand-written rail can photograph a membership the real registry cannot produce. */
+const importCatalogue = createMockSession().formatCatalog();
+
+const importClient = (reply?: ImportDialogResponse, report?: CadReport): EditorClient =>
+  ({
+    formatCatalog: () => importCatalogue,
+    importAssetDialog: () =>
+      Promise.resolve(
+        reply ?? {
+          entityId: null,
+          outcome: "cancelled" as const,
+          message: "No file was chosen. Nothing in the scene changed.",
+        },
+      ),
+    cadReport: () =>
+      Promise.resolve(
+        report ?? { total: 0, exactBrep: 0, tessellationOnly: 0, aiReconstructed: 0, proxy: 0, accessDenied: 0, failed: 0, parts: [] },
+      ),
+  }) as unknown as EditorClient;
+
+/** A 378-part crane, which is the real `Skid Weld Line` figure — an account of a CAD import is only
+ *  worth photographing at a size where the numbers have to line up. */
+const IMPORTED_CAD: CadReport = {
+  total: 378,
+  exactBrep: 235,
+  tessellationOnly: 130,
+  aiReconstructed: 0,
+  proxy: 13,
+  accessDenied: 0,
+  failed: 0,
+  parts: [],
+};
+
+const importSetup = () => {
+  projectStore.getState().refresh({ path: "C:/work/weld-cell-12.mtk", dirty: false, recents: [], error: null });
+  projectionStore.getState().bulkLoad([
+    { id: "e-girder", name: "Long Travel Girder", parentId: null, components: { Transform: {}, MeshRenderer: {} } },
+    { id: "e-pad", name: "Safety Pad", parentId: null, components: { Transform: {}, Collider: {} } },
+  ] as never);
+};
+
+const importScene = (
+  id: string,
+  looking_for: string,
+  expect: Expect,
+  viewport: { width: number; height: number },
+  extra: { click?: string[]; reply?: ImportDialogResponse; report?: CadReport } = {},
+): Scene => ({
+  id,
+  looking_for,
+  expect: {
+    ...expect,
+    absent: ["[data-icon-missing]", ...(expect.absent ?? [])],
+    text_absent: ["null", "undefined", "NaN", ...(expect.text_absent ?? [])],
+  },
+  viewport,
+  click: extra.click,
+  setup: importSetup,
+  render: () => <ImportDialog open client={importClient(extra.reply, extra.report)} onClose={() => { /* a capture never closes it */ }} />,
+});
+
+function importScenes(): Scene[] {
+  return [
+    importScene(
+      "import-dialog",
+      "THE IMPORT WORKFLOW AS ONE SURFACE, AND THE SAME SURFACE AS EXPORT. A reader is checking two " +
+      "things at once: that the decision is legible BEFORE the picker opens — every format this " +
+      "build can READ on one rail, the whole accepted extension set as a scannable row of mono pills " +
+      "rather than a comma sentence, and a primary action that says what it is about to open — and " +
+      "that this is visibly the export dialog's twin. Same rail, same pane, same footer, same marks. " +
+      "The old surface was one menu item and a native dropdown",
+      {
+        present: [
+          ["[data-testid='importDialog']", 1],
+          ["[role='tablist'][aria-label='Import formats'] [role='tab']", 11],
+          ["[data-testid='importExtensions'] li", 15],
+          ["[data-testid='importConfirm']", 1],
+        ],
+        text_present: ["Any supported file", "10 formats", ".3dxml", "Choose a file", "2 objects in this scene"],
+        unclipped: [
+          "[data-testid='importConfirm']",
+          "[data-testid='importSubject']",
+          "[role='tablist'][aria-label='Import formats'] [role='tab']",
+          "[data-testid='importExtensions'] li",
+        ],
+        same_line: [[".mtk-taskdialog__rail", ".mtk-taskdialog__pane"]],
+      },
+      { width: 1100, height: 860 },
+    ),
+    importScene(
+      "import-dialog-format",
+      "WHAT A READER DROPS, SAID BEFORE A FILE IS CHOSEN. STEP AP242 brings geometry, hierarchy, " +
+      "materials and engineering data — per-part colour is real AP242 and the registry says so — and " +
+      "none of the textures, skinning, animation, cameras or physics the checklist lists beside it. " +
+      "A reader is checking that the sentence names CAPABILITIES and " +
+      "never a count (nothing has been opened, so a number would be invented), that the checklist's " +
+      "two states differ by MARK before they differ by colour, and that the primary action now names " +
+      "the format it will filter the picker to",
+      {
+        present: [
+          ["[data-testid='importCarries'] li", 9],
+          ["[data-testid='importCost']", 1],
+        ],
+        text_present: ["STEP AP242", "Not brought in", "textures", "animation", "Choose a STEP AP242 file"],
+        stacked: [
+          ["[data-testid='importCarries']", "[data-testid='importCost']"],
+          ["[data-testid='importCost']", "[data-testid='importConfirm']"],
+        ],
+        unclipped: ["[data-testid='importCost']", "[data-testid='importConfirm']", "[data-testid='importCarries'] li"],
+      },
+      { width: 1100, height: 860 },
+      { click: ["#importFormats-step-tab"] },
+    ),
+    importScene(
+      "import-dialog-account",
+      "WHAT CAME IN, IN THE PLACE THE GESTURE HAPPENED. After a 378-part CAD import the options are " +
+      "replaced by the importer's own account: the sentence naming the file, the entity now selected " +
+      "in the scene, and the per-part honesty breakdown that until now lived only in a panel in the " +
+      "bottom dock nobody had a reason to open. A reader is checking that only the classes that " +
+      "OCCUR are drawn (six zeroes would be noise dressed as an account), that the counts line up on " +
+      "one badge track, and that the footer offers finishing rather than repeating what just happened",
+      {
+        present: [
+          ["[data-testid='importResult']", 1],
+          ["[data-testid='importFidelity'] li", 3],
+          ["[data-testid='importDone']", 1],
+        ],
+        absent: ["[data-testid='importCarries']", "[data-testid='importCost']"],
+        text_present: ["Imported Skid Weld Line A.1.stp", "Exact B-rep", "378 parts accounted for"],
+        unclipped: ["[data-testid='importEntity']", "[data-testid='importDone']", "[data-testid='importFidelity'] li"],
+        stacked: [["[data-testid='importEntity']", "[data-testid='importFidelity']"]],
+      },
+      { width: 1100, height: 860 },
+      {
+        click: ["[data-testid='importConfirm']"],
+        reply: { entityId: "cad-root-1", outcome: "imported", message: "Imported Skid Weld Line A.1.stp." },
+        report: IMPORTED_CAD,
+      },
+    ),
+    importScene(
+      "import-dialog-cancelled",
+      "A DISMISSED PICKER IS NOT A REFUSAL. The reply used to be an entity id or nothing, and nothing " +
+      "meant both that the person closed the dialog and that this build cannot read the file, so the " +
+      "only sentence the editor could write was “import cancelled or unsupported” — two answers " +
+      "joined by or. What a reader is checking is that this state is calm rather than alarming: it is " +
+      "drawn in the advisory treatment and not the failure one, it says what did NOT happen to the " +
+      "scene, and the way back to the action is still the primary control",
+      {
+        present: [["[data-testid='importRefused']", 1], ["[data-testid='importConfirm']", 1]],
+        absent: ["[data-testid='importDone']"],
+        text_present: ["No file was chosen", "Nothing in the scene changed"],
+        unclipped: ["[data-testid='importRefused']", "[data-testid='importConfirm']"],
+      },
+      { width: 1100, height: 800 },
+      { click: ["[data-testid='importConfirm']"] },
+    ),
+    importScene(
+      "import-dialog-narrow",
+      "ELEVEN CHOICES BELOW THE 860px THE RAIL IS WORTH. The rail turns into the horizontal strip it " +
+      "becomes everywhere else — and it WRAPS rather than scrolling, which is the change this scene " +
+      "exists to hold: a strip with six of eleven formats past the right edge is the exact pattern " +
+      "the rail was built to replace. What must survive the fold is every format reachable in one " +
+      "glance, the extension pills unclipped however many rows they settle on, and the primary " +
+      "action still pinned to a footer that does not scroll",
+      {
+        present: [
+          ["[role='tablist'][aria-label='Import formats'] [role='tab']", 11],
+          ["[data-testid='importExtensions'] li", 15],
+        ],
+        text_present: ["Choose a file"],
+        unclipped: [
+          "[role='tablist'][aria-label='Import formats'] [role='tab']",
+          "[data-testid='importConfirm']",
+          "[data-testid='importExtensions'] li",
+        ],
+        // The rail is ABOVE the pane here, not beside it — the stacked form, claimed as such.
+        stacked: [[".mtk-taskdialog__rail", ".mtk-taskdialog__pane"]],
+      },
+      { width: 720, height: 920 },
     ),
   ];
 }
@@ -1869,6 +2063,7 @@ export const SCENES: Scene[] = [
   ...terrainScenes(),
   ...shellScenes(),
   ...exportScenes(),
+  ...importScenes(),
 ];
 
 // ── the Terrain sub-engine's way in ───────────────────────────────────────────────────────────────

@@ -28,9 +28,12 @@ export interface FileMenuProps {
   /** Open the export task dialog. The dialog is owned by `App` so the command palette can reach the
    *  same one surface — a second instance behind the menu would be a second answer to one question. */
   onExport: () => void;
+  /** Open the import task dialog — owned by `App` for the same reason, and reached by four surfaces
+   *  (this menu, the palette, the empty state, "import another" after a drop). */
+  onImport: () => void;
 }
 
-export function FileMenu({ client, onExport }: FileMenuProps) {
+export function FileMenu({ client, onExport, onImport }: FileMenuProps) {
   const { path, dirty, recents } = useProjectInfo();
   const [open, setOpen] = useState(false);
   // A guarded action awaiting "discard unsaved changes?" confirmation, or `null` when none is pending.
@@ -106,21 +109,6 @@ export function FileMenu({ client, onExport }: FileMenuProps) {
     setOpen(false);
   }
 
-  /** M11.1 (ADR-040) — File→Import: open the native file dialog, import the chosen file through the MAGIC
-   *  router (FBX/glTF/OBJ/PNG), select the placed entity. "Drop any file → a working asset." */
-  async function importFile() {
-    setOpen(false);
-    const id = await client.importAssetDialog();
-    if (id) {
-      projectionStore.getState().select(id);
-      projectStore.getState().markDirty();
-      setStatus(`imported · ${id}`);
-      pushToast("imported an asset", "success");
-    } else {
-      setStatus("import cancelled or unsupported");
-    }
-  }
-
   /** ADR-175 — keep the picture currently on the stage as a PNG.
    *
    *  Under Export and not under Project, because that is what it is: the scene leaving the engine in a
@@ -189,7 +177,18 @@ export function FileMenu({ client, onExport }: FileMenuProps) {
           <PopupMenuGroup label="Project">
             <MenuItem id="fileNew" label="New project" onClick={() => guarded(() => client.newProject(), "New", "new project")} />
             <MenuItem id="fileOpen" label="Open…" onClick={() => guarded(() => client.openProject(), "Open", "opened")} />
-            <MenuItem id="fileImport" label="Import asset…" onClick={() => void importFile()} />
+            {/* ADR-178 — the mirror of `fileExport`. This used to go straight to the native picker,
+                so the only place the character of a reader could be stated was nowhere, and the only
+                place its outcome could be stated was a status line reading `imported · e-42`. */}
+            <MenuItem
+              id="fileImport"
+              label="Import a file…"
+              title="See what this build can read and what each reader carries, then choose a file"
+              onClick={() => {
+                setOpen(false);
+                onImport();
+              }}
+            />
             <MenuItem id="fileSave" label="Save" onClick={() => void save(false)} />
             <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void save(true)} />
           </PopupMenuGroup>

@@ -51,6 +51,22 @@ export const CARRIES: readonly CarrySpec[] = [
 export const writesScenes = (spec: FormatSpec): boolean =>
   spec.available && (spec.direction === "export" || spec.direction === "both");
 
+/** True when this format can be READ by this build — the import dialog's membership rule, and the
+ *  same predicate `formats::import_extensions` applies on the Rust side to build the native file
+ *  dialog's filter. Ten formats satisfy it against four that satisfy [`writesScenes`], which is why
+ *  the import rail is the longer of the two and why it had to be allowed to wrap. */
+export const readsScenes = (spec: FormatSpec): boolean =>
+  spec.available && (spec.direction === "import" || spec.direction === "both");
+
+/** Every extension a format accepts, lower-cased and dotted, ready to read (`.stp · .step`). */
+export const extensionList = (spec: FormatSpec): string[] =>
+  spec.extensions.map((e) => `.${e.toLowerCase()}`);
+
+/** Every extension this build can open, deduplicated and sorted — the TypeScript half of
+ *  `formats::import_extensions()`, derived from the same catalogue rather than restated. */
+export const readableExtensions = (specs: readonly FormatSpec[]): string[] =>
+  [...new Set(specs.filter(readsScenes).flatMap((s) => s.extensions.map((e) => e.toLowerCase())))].sort();
+
 /**
  * The `format` argument `scene_export` accepts for a spec — its CANONICAL extension.
  *

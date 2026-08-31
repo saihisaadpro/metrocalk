@@ -38,7 +38,7 @@ const info = (over: Partial<ProjectInfo> = {}): ProjectInfo => ({
 
 test("opening the menu refreshes project state and shows the actions", async () => {
   const projectState = vi.fn(() => Promise.resolve(info({ path: "a.mtk" })));
-  render(<FileMenu client={fakeClient({ projectState })} onExport={onExport} />);
+  render(<FileMenu client={fakeClient({ projectState })} onExport={onExport} onImport={vi.fn()} />);
 
   const trigger = screen.getByTestId("fileMenu");
   expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
@@ -58,7 +58,7 @@ test("opening the menu refreshes project state and shows the actions", async () 
 });
 
 test("File menu follows desktop keyboard navigation and returns focus on Escape", () => {
-  render(<FileMenu client={fakeClient()} onExport={onExport} />);
+  render(<FileMenu client={fakeClient()} onExport={onExport} onImport={vi.fn()} />);
   const trigger = screen.getByTestId("fileMenu");
   fireEvent.click(trigger);
   const menu = screen.getByRole("menu", { name: /File/ });
@@ -76,7 +76,7 @@ test("Export hands the whole decision to the dialog instead of writing from the 
   // the surface that can state the cost first (ADR-174), so what is asserted is that the menu itself
   // reaches no exporter: `sceneExport` is never called, and the menu closes behind the dialog.
   const sceneExport = vi.fn();
-  render(<FileMenu client={fakeClient({ sceneExport })} onExport={onExport} />);
+  render(<FileMenu client={fakeClient({ sceneExport })} onExport={onExport} onImport={vi.fn()} />);
 
   fireEvent.click(screen.getByTestId("fileMenu"));
   await waitFor(() => expect(screen.getByTestId("fileExport")).toBeTruthy());
@@ -87,10 +87,27 @@ test("Export hands the whole decision to the dialog instead of writing from the 
   expect(screen.queryByRole("menu", { name: /File/ })).toBeNull();
 });
 
+test("Import hands the whole decision to the dialog instead of opening the picker from the menu", async () => {
+  // The mirror of the Export claim above (ADR-178). The menu used to call the native file dialog
+  // directly, which is why the only thing it could say afterwards was "import cancelled or
+  // unsupported" — two answers joined by "or", from a caller with no way to tell them apart.
+  const onImport = vi.fn();
+  const importAssetDialog = vi.fn();
+  render(<FileMenu client={fakeClient({ importAssetDialog })} onExport={onExport} onImport={onImport} />);
+
+  fireEvent.click(screen.getByTestId("fileMenu"));
+  await waitFor(() => expect(screen.getByTestId("fileImport")).toBeTruthy());
+  fireEvent.click(screen.getByTestId("fileImport"));
+
+  expect(onImport).toHaveBeenCalledTimes(1);
+  expect(importAssetDialog).not.toHaveBeenCalled();
+  expect(screen.queryByRole("menu", { name: /File/ })).toBeNull();
+});
+
 test("New on a clean project runs immediately (no guard)", async () => {
   const newProject = vi.fn(() => Promise.resolve(info()));
   const previousSession = projectStore.getState().sessionId;
-  render(<FileMenu client={fakeClient({ projectState: () => Promise.resolve(info({ dirty: false })), newProject })} onExport={onExport} />);
+  render(<FileMenu client={fakeClient({ projectState: () => Promise.resolve(info({ dirty: false })), newProject })} onExport={onExport} onImport={vi.fn()} />);
 
   fireEvent.click(screen.getByTestId("fileMenu"));
   await waitFor(() => expect(screen.getByTestId("fileNew")).toBeTruthy());
@@ -104,7 +121,7 @@ test("New on a clean project runs immediately (no guard)", async () => {
 test("New on a DIRTY project guards: Cancel aborts, Discard proceeds", async () => {
   const newProject = vi.fn(() => Promise.resolve(info()));
   const client = fakeClient({ projectState: () => Promise.resolve(info({ dirty: true })), newProject });
-  render(<FileMenu client={client} onExport={onExport} />);
+  render(<FileMenu client={client} onExport={onExport} onImport={vi.fn()} />);
 
   // Open → refresh marks the store dirty.
   fireEvent.click(screen.getByTestId("fileMenu"));
@@ -129,7 +146,7 @@ test("New on a DIRTY project guards: Cancel aborts, Discard proceeds", async () 
 
 test("Save on a TITLED project is never guarded (no data loss) and dispatches save_project", async () => {
   const saveProject = vi.fn(() => Promise.resolve(info({ path: "a.mtk" })));
-  render(<FileMenu client={fakeClient({ projectState: () => Promise.resolve(info({ path: "a.mtk", dirty: true })), saveProject })} onExport={onExport} />);
+  render(<FileMenu client={fakeClient({ projectState: () => Promise.resolve(info({ path: "a.mtk", dirty: true })), saveProject })} onExport={onExport} onImport={vi.fn()} />);
 
   fireEvent.click(screen.getByTestId("fileMenu"));
   await waitFor(() => expect(projectStore.getState().dirty).toBe(true));
@@ -147,7 +164,7 @@ test("Save on an UNTITLED project routes to Save As (no 'saved' on an unnamed do
   render(
     <FileMenu
       client={fakeClient({ projectState: () => Promise.resolve(info({ path: null, dirty: true })), saveProject, saveProjectAs })}
-      onExport={onExport}
+      onExport={onExport} onImport={vi.fn()}
     />,
   );
 
@@ -165,7 +182,7 @@ test("Save on an UNTITLED project routes to Save As (no 'saved' on an unnamed do
 
 test("Save As dispatches the always-dialog save", async () => {
   const saveProjectAs = vi.fn(() => Promise.resolve(info({ path: "b.mtk" })));
-  render(<FileMenu client={fakeClient({ saveProjectAs })} onExport={onExport} />);
+  render(<FileMenu client={fakeClient({ saveProjectAs })} onExport={onExport} onImport={vi.fn()} />);
   fireEvent.click(screen.getByTestId("fileMenu"));
   await waitFor(() => expect(screen.getByTestId("fileSaveAs")).toBeTruthy());
   fireEvent.click(screen.getByTestId("fileSaveAs"));
@@ -178,7 +195,7 @@ test("recent projects render and open by path", async () => {
     projectState: () => Promise.resolve(info({ recents: ["proj/alpha.mtk", "proj/beta.mtk"], dirty: false })),
     openProject,
   });
-  render(<FileMenu client={client} onExport={onExport} />);
+  render(<FileMenu client={client} onExport={onExport} onImport={vi.fn()} />);
 
   fireEvent.click(screen.getByTestId("fileMenu"));
   await waitFor(() => expect(document.querySelectorAll(".fileRecentItem").length).toBe(2));
@@ -199,7 +216,7 @@ test("opening a project clears a stale selection (modules stay connected to the 
   const client = fakeClient({
     projectState: () => Promise.resolve(info({ recents: ["x.mtk"], dirty: false })),
   });
-  render(<FileMenu client={client} onExport={onExport} />);
+  render(<FileMenu client={client} onExport={onExport} onImport={vi.fn()} />);
   fireEvent.click(screen.getByTestId("fileMenu"));
   await waitFor(() => expect(document.querySelector(".fileRecentItem")).toBeTruthy());
   fireEvent.click(document.querySelector(".fileRecentItem") as HTMLElement);

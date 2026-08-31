@@ -4,7 +4,7 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type MatchStatus, type RenderReply, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type ImportDialogResponse, type MatchStatus, type RenderReply, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
 
 /** The render a test drives. MUTABLE and module-scoped on purpose: a render is the one thing in this
  *  client with a life longer than a single call — start, poll, poll, done — and a stub that answered
@@ -605,7 +605,9 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     catalogSearch: () => Promise.resolve({ items: [] }),
     addItem: vi.fn(() => Promise.resolve({ created: "e-new", balance: null, seam: null })),
     importAsset: vi.fn(() => Promise.resolve("imported-1")),
-    importAssetDialog: vi.fn(() => Promise.resolve("imported-1")),
+    importAssetDialog: vi.fn(() =>
+      Promise.resolve({ entityId: "imported-1", outcome: "imported", message: "Imported crane.step." } as ImportDialogResponse),
+    ),
     projectState: () => Promise.resolve({ path: null, dirty: false, recents: [], error: null }),
     newProject: vi.fn(() => Promise.resolve({ path: null, dirty: false, recents: [], error: null })),
     openProject: vi.fn(() => Promise.resolve({ path: "p.mtk", dirty: false, recents: ["p.mtk"], error: null })),

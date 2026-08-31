@@ -10,7 +10,7 @@ test("exposes honest undo and redo actions in the primary editor toolbar", async
     <EditorHeader
       client={fakeClient({ undo, redo })}
       onOpenCommands={vi.fn()}
-      onExport={vi.fn()}
+      onExport={vi.fn()} onImport={vi.fn()}
     />,
   );
 
@@ -34,7 +34,7 @@ test("keeps both dock drawers and command search reachable in the compact header
       client={fakeClient()}
       compact
       onOpenCommands={openCommands}
-      onExport={vi.fn()}
+      onExport={vi.fn()} onImport={vi.fn()}
       onOpenLeftDock={openLeft}
       onOpenRightDock={openRight}
     />,
