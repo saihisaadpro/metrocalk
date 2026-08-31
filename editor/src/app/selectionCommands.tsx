@@ -1,10 +1,15 @@
-//! **The four selection verbs, as data** (ADR-176).
+//! **The selection verbs, as data** (ADR-176, extended by ADR-185).
 //!
 //! Three of them have no gesture and no gesture could be invented for them — "everything", "nothing",
-//! "the rest" are not shapes you can draw on a stage. The fourth asks a question about what the
+//! "the rest" are not shapes you can draw on a stage. `Select similar` asks a question about what the
 //! objects ARE rather than where they are, which a rectangle cannot ask either. So the command palette
 //! is not a convenience route to these; it is the only route, and whether the group reads as a group
 //! is the whole of whether they are discoverable.
+//!
+//! `Find objects…` leads the group because it is the verb the other four cannot express: a set that is
+//! neither everything, nor nothing, nor the inverse, nor a resemblance to something already in hand —
+//! "the 41 objects whose name contains WELD", "every light". It is the only row here that does not
+//! change the selection itself; it opens the box that can.
 //!
 //! WHY THEY LIVE IN THEIR OWN MODULE RATHER THAN INLINE IN `App` WITH THE OTHERS. Because they have to
 //! be PHOTOGRAPHED. `App` builds its command list inside its own render, so a `shots` scene over these
@@ -17,6 +22,11 @@ import type { EditorCommand } from "../panels/CommandPalette";
 import { similarTo } from "./selectSimilar";
 
 export interface SelectionCommandDeps {
+  /** Open the Scene workspace and put the caret in its search box (ADR-185). Finding is the fifth verb
+   *  in this group because it is the one that answers "which objects" for the other four: a query is
+   *  the only way to name a set that is neither everything, nothing, the inverse, nor a resemblance to
+   *  something already in hand. */
+  find(): void;
   /** State the whole selection — both halves, the store the Inspector reads AND the engine model the
    *  picture is outlined from. A verb that moved only the store would put 378 objects in the Inspector
    *  and outline none of them, which is the failure ADR-158 collapsed three selections into one to
@@ -60,9 +70,20 @@ function selectSimilarWith(deps: Pick<SelectionCommandDeps, "apply" | "say">): (
   };
 }
 
-/** The Selection category, in the order it reads: scope, scope, scope, then kind. */
+/** The Selection category, in the order it reads: find, then scope, scope, scope, then kind. */
 export function selectionCommands(deps: SelectionCommandDeps): EditorCommand[] {
   return [
+    {
+      id: "select-find",
+      label: "Find objects…",
+      category: "Selection",
+      shortcut: ["Ctrl", "F"],
+      description: "Search the scene by name, or by what the objects are — then select every match",
+      keywords: ["search", "filter", "where", "locate", "kind", "lights", "cameras"],
+      disabled: deps.sceneEmpty,
+      disabledReason: "The scene is empty",
+      execute: deps.find,
+    },
     {
       id: "select-all",
       label: "Select all",

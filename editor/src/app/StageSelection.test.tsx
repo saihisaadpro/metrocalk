@@ -319,10 +319,10 @@ describe("selecting without a gesture", () => {
   // waits on the palette's lazily-imported chunk; adding six of them to this file turned a 79/79
   // suite into one where OTHER files timed out at their own budgets — contention, not a defect in
   // them (`test-setup.ts` has the argument). Assertions that share a scene share a mount.
-  it("the palette carries all four verbs — off the SHIPPED list — and Select similar explains its refusal", async () => {
+  it("the palette carries all five verbs — off the SHIPPED list — and Select similar explains its refusal", async () => {
     const palette = await openPalette();
 
-    for (const label of ["Select all", "Select none", "Invert selection", "Select similar"]) {
+    for (const label of ["Find objects", "Select all", "Select none", "Invert selection", "Select similar"]) {
       expect(paletteRow(palette, label), label).toBeTruthy();
     }
     // A disabled control that says WHY (`<ux_quality>` 4 and 6) rather than a row that does nothing
@@ -354,6 +354,37 @@ describe("selecting without a gesture", () => {
     // The WHOLE set, not a primary — the failure `select_entities` exists to make impossible.
     expect(spies().select).toHaveBeenLastCalledWith(all);
     expect(status()).toBe(`Selected all ${all.length} objects`);
+  });
+
+  it("Ctrl+F opens the Scene workspace and puts the caret in the box that searches it", async () => {
+    // The chord every person already knows for "where is it" was unbound (ADR-185): the scene search
+    // box was reachable only by opening the Scene workspace and clicking into it, and the outliner is
+    // a `hidden` tabpanel in every other workspace — so the chord has to open the panel BEFORE it
+    // asks for focus, or it focuses something nobody can see.
+    render(<App />);
+    await waitFor(() => expect(projectionStore.getState().order.length).toBeGreaterThan(0));
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("tab", { name: /Build/ }));
+    });
+    expect(document.getElementById("engine-panel-scene")?.hasAttribute("hidden")).toBe(true);
+
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: "f", ctrlKey: true });
+    });
+    const box = screen.getByRole("searchbox", { name: "Search scene objects" });
+    expect(document.getElementById("engine-panel-scene")?.hasAttribute("hidden")).toBe(false);
+    expect(document.activeElement).toBe(box);
+
+    // Inside a text field the chord belongs to the field, for the same reason Ctrl-Z and Ctrl-A do.
+    const field = document.createElement("input");
+    document.body.appendChild(field);
+    field.focus();
+    await act(async () => {
+      fireEvent.keyDown(field, { key: "f", ctrlKey: true });
+    });
+    expect(document.activeElement).toBe(field);
+    field.remove();
   });
 
   it("Select similar reaches the copies no box contains; Invert takes the complement", async () => {

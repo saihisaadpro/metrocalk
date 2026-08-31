@@ -302,6 +302,14 @@ body {
 .mtk-input::placeholder,
 .mtk-textarea::placeholder,
 .mtk-search::placeholder { color: var(--mtk-text-muted); opacity: 1; }
+/* A search field that draws its OWN clear control hides the browser's. `type="search"` gets a
+   Blink-drawn cancel button that this design system does not own — it has no accessible name, no
+   token, no hover state, and it sizes itself — so a field that already offers a labelled `Clear`
+   ships TWO clear controls side by side the moment anything is typed, at different sizes, and the
+   browser's is the louder one. Found by reading the outliner capture; every selector assertion in
+   that scene passed. The default is deliberately unchanged: the fields with no clear of their own
+   still need the browser's. */
+.mtk-search--own-clear::-webkit-search-cancel-button { display: none; }
 .mtk-input:focus,
 .mtk-select:focus,
 .mtk-textarea:focus,

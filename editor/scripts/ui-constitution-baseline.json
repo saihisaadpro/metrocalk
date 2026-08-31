@@ -100,6 +100,13 @@
       "literal-motion": 0,
       "unitless-length": 0
     },
+    "src/app/sceneQuery.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
     "src/app/selectionCommands.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
@@ -122,6 +129,13 @@
       "unitless-length": 0
     },
     "src/app/StageMarquee.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
+    "src/app/stateSelection.ts": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
@@ -304,7 +318,7 @@
       "unitless-length": 0
     },
     "src/panels/Hierarchy.tsx": {
-      "raw-native-control": 1,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,

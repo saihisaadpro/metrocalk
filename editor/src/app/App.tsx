@@ -44,6 +44,8 @@ import { StageMarquee } from "./StageMarquee";
 import { selectionSentence, entityLabel } from "../store/selectionText";
 import { deleteSelection } from "./deleteSelection";
 import { selectAllWith, selectionCommands } from "./selectionCommands";
+import { stateSelection } from "./stateSelection";
+import { requestObjectSearch } from "../store/find";
 
 // WHAT MAY BE DEFERRED, AND WHY THE LIST IS SHORT. A chunk that loads on demand is absent until the
 // gesture that needs it — so the only safe candidates are surfaces a user REACHES FOR: Pipe Forge
@@ -393,6 +395,19 @@ export function App() {
     }
   }
 
+  /**
+   * Ctrl/Cmd-F — the find chord, landing in the one box that searches the scene.
+   *
+   * The Scene workspace is opened FIRST because the outliner is a `hidden` tabpanel everywhere else,
+   * and focus into a `display:none` subtree is focus nobody can see. The request travels as store
+   * state rather than a ref, so the shell owns the keyboard and the panel owns its field — neither
+   * reaches into the other.
+   */
+  function findObjects() {
+    openEngine("scene");
+    requestObjectSearch();
+  }
+
   function activateDockRail(side: "left" | "right", workspace: string, anchor: HTMLButtonElement) {
     if (side === "left") setLeftWorkspace(workspace as LeftWorkspace);
     else setInspectorWorkspace(workspace as InspectorWorkspace);
@@ -442,6 +457,15 @@ export function App() {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setCommandsOpen(true);
+        return;
+      }
+      // Ctrl/Cmd-F — find objects. The one chord every person already knows for "where is it", and it
+      // was unbound: the scene search box was reachable only by opening the Scene workspace and
+      // clicking into it. Guarded on `editingText` because a text field owns the browser's own find.
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "f") {
+        if (editingText) return;
+        e.preventDefault();
+        findObjects();
         return;
       }
       // Ctrl/Cmd-A — select every object. Guarded on `editingText` for the same reason Ctrl-Z is: a
@@ -604,13 +628,7 @@ export function App() {
   // understood; these are the verbs no gesture can express. Both halves of the selection, always —
   // the store the Inspector reads AND the engine model the picture is outlined from — through the
   // same `selectEntities` seam the outliner uses.
-  const applySelection = (ids: string[], sentence: string) => {
-    projectionStore.getState().setSelection(ids);
-    void client
-      .selectEntities(ids)
-      .catch((e) => console.error("selectEntities failed (engine selection may be out of sync)", e));
-    setStatus(sentence);
-  };
+  const applySelection = (ids: string[], sentence: string) => stateSelection(client, ids, sentence);
   const selectAll = selectAllWith({ apply: applySelection });
 
   const importAsset = () => {
@@ -645,6 +663,7 @@ export function App() {
     ...selectionCommands({
       apply: applySelection,
       say: setStatus,
+      find: findObjects,
       hasSelection: multiSelect.length > 0,
       sceneEmpty,
     }),
