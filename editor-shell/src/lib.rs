@@ -53,6 +53,7 @@ pub mod scene_capture;
 pub mod sdf_intent;
 pub mod semantic;
 pub mod shape_forge;
+pub mod sketch;
 pub mod step_export;
 pub mod terrain_intent;
 pub mod transform_solver;
@@ -127,8 +128,13 @@ pub use capscene::{
     CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
 };
 pub use cinema_intent::{
-    add_shot_ops, cutscene_of, describe_shot, remove_shot_ops, reply_for as cinema_reply,
-    set_mood_ops, shot_specs, CinemaError, CinemaReply, ShotSpec, CINEMA_COMPONENT,
+    add_shot_ops, cutscene_of, describe_shot, framing_catalog, move_shot_ops, plan_render,
+    preview_time, remove_shot_ops, render_frame_name, reply_for as cinema_reply,
+    reply_with_names as cinema_reply_named, sanitise_stem, set_delivery_ops, set_mood_ops,
+    set_shot_framing_ops, set_shot_seconds_ops, set_shot_subject_ops, shot_specs, subject_catalog,
+    subject_chain, CinemaError, CinemaPreviewReply, CinemaReply, FramingCatalog, FramingEdit,
+    FramingOption, RenderPlan, RenderReply, RenderScope, ShotRow, ShotSpec, SubjectCandidate,
+    SubjectCatalog, CINEMA_COMPONENT, DEFAULT_RENDER_FPS, MAX_RENDER_FRAMES, RENDER_RATES,
 };
 pub use compose_ai::{ComposeAiError, Composer, DemoComposer, RemoteComposer};
 pub use constraint_intent::{

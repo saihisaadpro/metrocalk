@@ -54,10 +54,22 @@ describe("LIVE Rules in Play + truth-state debugger (M12.5)", () => {
     if (typeof sword !== "string") throw new Error(`create_entity returned ${JSON.stringify(sword)}`);
 
     // Seed its components (multi_edit = one undoable SetField per call).
-    await invoke("multi_edit", { ids: [sword], component: "KillCounter", field: "count", value: 0 });
-    await invoke("multi_edit", { ids: [sword], component: "Zone", field: "current", value: "BossArena" });
-    await invoke("multi_edit", { ids: [sword], component: "Flammable", field: "lit", value: false });
-    await invoke("multi_edit", { ids: [sword], component: "QuestState", field: "state", value: "Hunting" });
+    //
+    // THREE OF THESE FOUR COULD NOT HAVE WORKED BEFORE ADR-169. `multi_edit`'s `value` parameter was
+    // declared `f64`, so a string or a boolean argument failed to deserialise and the invoke rejected;
+    // the results were never checked, so the seeding silently did nothing and the rules below read
+    // whatever the defaults were. Widening the parameter to any scalar is what makes them real, and
+    // each one is now checked — an unchecked seed is how this went unnoticed.
+    for (const [component, field, value] of [
+      ["KillCounter", "count", 0],
+      ["Zone", "current", "BossArena"],
+      ["Flammable", "lit", false],
+      ["QuestState", "state", "Hunting"],
+    ]) {
+      const seeded = await invoke("multi_edit", { ids: [sword], component, field, value });
+      if (!seeded || seeded.ok !== true)
+        throw new Error(`seeding ${component}.${field} failed: ${JSON.stringify(seeded)}`);
+    }
 
     // r_count: When EnemyDied -> AdjustCounter count += 1.
     const count = {

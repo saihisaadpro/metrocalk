@@ -41,5 +41,10 @@ export default defineConfig(({ command }) => ({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
+    // Vitest's default per-test budget is 5 s, which is below the 15 s a single `waitFor` on a lazy
+    // workspace is now allowed (see `test-setup.ts` for why that number exists) — leaving it would
+    // just move the flake from the wait to the test around it. One number, one place; the shell
+    // tests that used to carry their own `10_000` no longer state it a second time.
+    testTimeout: 30_000,
   },
 }));

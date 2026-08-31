@@ -27,7 +27,14 @@ import { Icon, iconTokens } from "../../src/theme/icons";
 import { Inspector } from "../../src/inspector/Inspector";
 import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
+import { CutscenePanel } from "../../src/panels/CutscenePanel";
+import { SubjectAimBadge } from "../../src/panels/SubjectAimBadge";
 import { Diagnostics } from "../../src/panels/Diagnostics";
+import { MaterialPanel } from "../../src/panels/MaterialPanel";
+import { DescribeBar } from "../../src/panels/DescribeBar";
+import { MATERIAL_PRESETS, MaterialSphere } from "../../src/theme/materials";
+import { ExportDialog } from "../../src/panels/ExportDialog";
+import { ImportDialog } from "../../src/panels/ImportDialog";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { Reveal } from "../../src/panels/Reveal";
 import { RigPanel, type RigDocument } from "../../src/panels/RigPanel";
@@ -35,23 +42,31 @@ import RIG_MIXAMO from "../../src/panels/__fixtures__/rig-characterization.json"
 import RIG_BLOCKED from "../../src/panels/__fixtures__/rig-not-retargetable.json";
 import { MatchPanel } from "../../src/panels/MatchPanel";
 import { PhysicsPanel } from "../../src/panels/PhysicsPanel";
+import { TerrainPanel } from "../../src/panels/TerrainPanel";
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { assetShelfStore } from "../../src/store/assetShelf";
 import { projectionStore } from "../../src/store/projection";
+import { projectStore } from "../../src/store/project";
 import type {
   AnimationPropertyInfo,
   AnimationTrackInfo,
   AnimationWorkspaceInfo,
   CadReport,
   CadReportPart,
+  CinemaReply,
   EffectSpec,
+  FramingCatalog,
+  ImportDialogResponse,
   MatchValidation,
   RevealResponse,
   RoleRow,
   RoleSpec,
+  SceneExportResponse,
+  ShotRow,
   ShotSpec,
   StateMachine,
+  SubjectCatalog,
   TimelineTuple,
 } from "../../src/transport/protocol";
 import { createMockSession, type EditorClient } from "../../src/transport/session";
@@ -192,6 +207,13 @@ export type Scene = {
    *  did nothing would photograph the default state under a caption claiming another, which is worse
    *  than no capture at all. */
   click?: string[];
+  /** Text typed into a control the clicks reached, as `[selector, value]` pairs, after every click.
+   *
+   *  `page.$` searches the whole document rather than the frame, so this reaches a field inside a
+   *  PORTALLED dialog — which is where a command palette's query and a dialog's search have always
+   *  lived. The driver selects the field's existing contents first, so two scenes typing into the
+   *  same selector cannot depend on which ran before. */
+  type?: [selector: string, value: string][];
   setup?: () => void;
   render: () => ReactNode;
 };
@@ -437,6 +459,262 @@ const physicsClient = () =>
     setSimRunning: () => undefined,
     physicsContacts: () => Promise.resolve([]),
     physicsCheck: () => Promise.resolve([]),
+  }) as unknown as EditorClient;
+
+/** A FIVE-SHOT CUT WITH FIVE DIFFERENT LENGTHS, one of which films something else.
+ *
+ *  The lengths are the point. A cutscene whose shots all run the same time draws five equal bars, and
+ *  five equal bars are a LIST — the exact thing this panel replaced, redrawn horizontally. 2.5s, 4.0s,
+ *  1.6s, 3.0s and 2.2s over 13.3s is a picture that can only be produced by a surface that reads
+ *  `effectiveSeconds`.
+ *
+ *  Shot 1 frames the hall rather than the gun, because that is ordinary film grammar (establish the
+ *  place, then cut in) and because until this session every line in a shot list was captioned with the
+ *  cutscene's OWNER — so a wide of the hall read back as a wide of the one part standing in it.
+ *
+ *  The jump-cut warning is real output, not a fixture string: shots 4 and 5 are framed identically
+ *  back to back, which is what `Cutscene::problems` says that about. */
+const CUTSCENE_SHOTS = [
+  { id: "sh-1", size: "wide", angle: "three_quarter", motion: "pull_out", amount: 0.3, seconds: 2.5, subject: "hall", subjectName: "Assembly Hall", reads: "a wide shot of Assembly Hall from three-quarters, pulling out — 2.5s" },
+  { id: "sh-2", size: "full", angle: "three_quarter", motion: "push_in", amount: 0.35, seconds: 4.0, subject: "rig", subjectName: "Weld Gun 7", reads: "a full shot of Weld Gun 7 from three-quarters, pushing in — 4.0s" },
+  { id: "sh-3", size: "extreme_close", angle: "profile", motion: "hold", amount: 0, seconds: 1.6, subject: "rig", subjectName: "Weld Gun 7", reads: "a very close shot of Weld Gun 7 in profile, holding still — 1.6s" },
+  { id: "sh-4", size: "medium", angle: "low", motion: "orbit", amount: 0.5, seconds: 3.0, subject: "rig", subjectName: "Weld Gun 7", reads: "a medium shot of Weld Gun 7 from below, orbiting — 3.0s" },
+  { id: "sh-5", size: "medium", angle: "low", motion: "crane_up", amount: 0.6, seconds: 2.2, subject: "rig", subjectName: "Weld Gun 7", reads: "a medium shot of Weld Gun 7 from below, craning up — 2.2s" },
+] as const;
+
+const CUTSCENE: CinemaReply = (() => {
+  let start = 0;
+  const rows: ShotRow[] = CUTSCENE_SHOTS.map((shot, index) => {
+    const row: ShotRow = {
+      id: shot.id,
+      index,
+      reads: shot.reads,
+      seconds: shot.seconds,
+      effectiveSeconds: shot.seconds,
+      startSeconds: start,
+      // `Mood::Normal.blend_seconds()` is 0.6s, capped at half the shot; the first never blends,
+      // and a shot opens one 60Hz tick past its own window (`Cutscene::opens_at`).
+      blendSeconds: index === 0 ? 0 : Math.min(0.6, shot.seconds * 0.5),
+      openSeconds: index === 0 ? start : start + Math.min(0.6, shot.seconds * 0.5) + 1 / 60,
+      size: shot.size,
+      angle: shot.angle,
+      motion: shot.motion,
+      amount: shot.amount,
+      subject: shot.subject,
+      subjectName: shot.subjectName,
+    };
+    start += shot.seconds;
+    return row;
+  });
+  return {
+    entity: "rig",
+    shots: rows.length,
+    seconds: start,
+    mood: "normal",
+    delivery: "viewport",
+    reads: rows.map((row) => row.reads),
+    rows,
+    problems: [
+      'shots on "Weld Gun 7" are framed identically back to back — that reads as a jump cut; change the size or the angle',
+    ],
+    message: "",
+    reason: null,
+  };
+})();
+
+/** The framing vocabulary with the WIRE VALUES the Rust catalogue publishes. A scene that invented a
+ *  value would photograph a dropdown whose selected option the engine would refuse. */
+const FRAMING: FramingCatalog = {
+  sizes: [
+    { value: "extreme_wide", label: "Distant", blurb: "The subject is a speck in its world" },
+    { value: "wide", label: "Wide", blurb: "The whole subject with generous air around it" },
+    { value: "full", label: "Full", blurb: "The subject fills most of the height" },
+    { value: "medium", label: "Medium", blurb: "Closer — detail starts to read" },
+    { value: "close", label: "Close", blurb: "Tight on the subject" },
+    { value: "extreme_close", label: "Very close", blurb: "One thing, very large" },
+  ],
+  angles: [
+    { value: "front", label: "Front", blurb: "Facing the subject head-on" },
+    { value: "three_quarter", label: "Three-quarter", blurb: "Off to one side, slightly above" },
+    { value: "profile", label: "Profile", blurb: "Directly to the side" },
+    { value: "behind", label: "Behind", blurb: "Looking where it looks" },
+    { value: "low", label: "From below", blurb: "The subject towers" },
+    { value: "high", label: "From above", blurb: "The subject is small" },
+  ],
+  motions: [
+    { value: "hold", label: "Hold", blurb: "Locked off — the camera does not move" },
+    { value: "push_in", label: "Push in", blurb: "Creep toward the subject" },
+    { value: "pull_out", label: "Pull out", blurb: "Drift away" },
+    { value: "orbit", label: "Orbit", blurb: "Circle the subject" },
+    { value: "crane_up", label: "Crane up", blurb: "Rise while holding the aim" },
+    { value: "crane_down", label: "Crane down", blurb: "Descend while holding the aim" },
+  ],
+  minSeconds: 0.2,
+  maxSeconds: 20,
+  maxShots: 12,
+  stillMotions: ["hold"],
+  deliveries: [
+    { value: "viewport", label: "Match viewport", blurb: "Compose for the stage as it is now - no bars" },
+    { value: "widescreen", label: "16:9 widescreen", blurb: "The broadcast and web default" },
+    { value: "scope", label: "2.39:1 scope", blurb: "Anamorphic scope - the widest frame" },
+    { value: "academy", label: "4:3 academy", blurb: "Classic" },
+    { value: "square", label: "1:1 square", blurb: "Square" },
+    { value: "vertical", label: "9:16 vertical", blurb: "Vertical" },
+  ],
+};
+
+const CUTSCENE_CARDS: ShotSpec[] = [
+  { kind: "establish", label: "Establishing", blurb: "Show where we are before we look at anything closely", adds: "a wide, slowly pulling-out shot from the front" },
+  { kind: "hero", label: "Hero shot", blurb: "The workhorse — three-quarters on, pushing in", adds: "a full-body three-quarter shot that creeps closer" },
+  { kind: "closeup", label: "Close-up", blurb: "Tight and still — for the moment that matters", adds: "a close, locked-off shot in profile" },
+  { kind: "orbit", label: "Show it off", blurb: "Circle the object so every side reads", adds: "a medium shot orbiting a quarter turn" },
+  { kind: "reveal", label: "Crane reveal", blurb: "Lift away to show the world around it", adds: "a full shot craning upward" },
+  { kind: "vista", label: "The vista", blurb: "The subject is a speck in its world", adds: "an extreme-wide, locked-off shot from the front" },
+];
+
+/** WHAT A SHOT CAN BE POINTED AT, ranked by the scene's own hierarchy — the engine's own answer,
+ *  headings and all.
+ *
+ *  The `parts` counts are the reason the list is worth reading rather than scrolling: 378 and 1 are
+ *  how the whole line and the one bracket inside it tell themselves apart when their names do not.
+ *  `Datum A` has none, which is the row that proves the picker warns BEFORE the shot is aimed — a
+ *  subject with no drawn geometry is composed by the solver on its own origin, and from outside that
+ *  looks like a camera that went somewhere plausible and filmed nothing. */
+const SUBJECT_CATALOG: SubjectCatalog = {
+  owner: "rig",
+  ownerName: "Weld Gun 7",
+  current: "hall",
+  candidates: [
+    { id: "rig", name: "Weld Gun 7", group: "This object", parts: 1, framable: true, current: false },
+    { id: "cell", name: "Weld Cell A", group: "What it is part of", parts: 46, framable: true, current: false },
+    { id: "hall", name: "Assembly Hall", group: "What it is part of", parts: 378, framable: true, current: true },
+    { id: "nozzle", name: "Nozzle", group: "What it is made of", parts: 1, framable: true, current: false },
+    { id: "loom", name: "Cable Loom", group: "What it is made of", parts: 3, framable: true, current: false },
+    { id: "fixture", name: "Fixture 3", group: "Beside it", parts: 9, framable: true, current: false },
+    { id: "datum", name: "Datum A", group: "Beside it", parts: 0, framable: false, current: false },
+  ],
+  query: "",
+  matches: 7,
+  truncated: true,
+};
+
+const cutsceneClient = () =>
+  ({
+    cinemaCatalog: () => Promise.resolve(CUTSCENE_CARDS),
+    cinemaFramingCatalog: () => Promise.resolve(FRAMING),
+    cinemaSubjectCatalog: (_id: string, _index: number | null, query: string) =>
+      Promise.resolve(
+        query
+          ? {
+              ...SUBJECT_CATALOG,
+              query,
+              truncated: false,
+              candidates: SUBJECT_CATALOG.candidates
+                .filter((c) => c.name.toLowerCase().includes(query.toLowerCase()))
+                .map((c) => ({ ...c, group: "Matches" })),
+            }
+          : SUBJECT_CATALOG,
+      ),
+    cinemaList: () => Promise.resolve(CUTSCENE),
+    // The pose a shot solver would answer with. A capture cannot show the wgpu frame — the harness
+    // runs on a box with no GPU — so what is photographed here is the AUTHORING surface around it:
+    // the toggle in its pressed state and the read-out naming the moment. The live composite is the
+    // `.exe` run's job, and these two pieces of evidence answer different questions.
+    cinemaPreview: (id: string, seconds: number, active: boolean) =>
+      Promise.resolve({
+        active,
+        entity: active ? id : null,
+        seconds,
+        shotIndex: active ? 1 : null,
+        shots: CUTSCENE.rows.length,
+        reads: CUTSCENE.rows[1].reads,
+        subjectName: CUTSCENE.rows[1].subjectName,
+        progress: 0.25,
+        blending: false,
+        eye: [6.2, 3.1, 9.4] as [number, number, number],
+        lookAt: [0, 1.4, 0] as [number, number, number],
+        fovDeg: 50,
+        message: active ? `Previewing shot 2 of 5 at ${seconds.toFixed(1)}s` : "Preview off",
+        reason: null,
+      }),
+  }) as unknown as EditorClient;
+
+/** Nothing rendered yet - the zero row every render answer in this file is built from. */
+const RENDER_IDLE = {
+  running: false,
+  done: false,
+  entity: "rig",
+  frames: 0,
+  written: 0,
+  width: 0,
+  height: 0,
+  fps: 24,
+  seconds: 0,
+  folder: "",
+  stem: "Skid Weld Line",
+  bytes: 0,
+  elapsedMs: 0,
+  failures: [] as string[],
+  message: "",
+  reason: null as string | null,
+};
+
+/** A finished render, with the numbers a real one produces: the composed frame of a 2.39:1 delivery
+ *  on a 1920-wide stage is 1920x803, which is where the ledger's size comes from. */
+const RENDER_DONE = {
+  ...RENDER_IDLE,
+  done: true,
+  frames: 319,
+  written: 319,
+  width: 1920,
+  height: 803,
+  seconds: 13.3,
+  folder: "C:/renders/skid-weld-line",
+  bytes: 319 * 486_000,
+  elapsedMs: 41_800,
+  message: "Rendered 319 frames at 1920x803 in 41.8s",
+};
+
+/** ADR-175 - the same cutscene with a render PLAN behind it. Delivered in scope, because the frame a
+ *  cut is composed for decides the shape of every file the render writes, and a capture of the dialog
+ *  over a viewport-shaped cut could not show that.
+ *
+ *  The plan's numbers are the fixture's, and computing them is the ENGINE's job in the product: 13.3s
+ *  at 24 fps is 319 frames. A stub answering a different count would photograph a dialog whose cost
+ *  sentence and whose button disagreed - the defect the plan command exists to make impossible. */
+const renderingCutsceneClient = () =>
+  ({
+    ...cutsceneClient(),
+    cinemaList: () => Promise.resolve({ ...CUTSCENE, delivery: "scope" as const }),
+    cinemaRenderPlan: (id: string, fps: number, shot: number | null) => {
+      const seconds = shot === null ? CUTSCENE.seconds : (CUTSCENE.rows[shot]?.effectiveSeconds ?? 0);
+      const frames = Math.max(1, Math.round(seconds * fps));
+      return Promise.resolve({
+        ...RENDER_IDLE,
+        entity: id,
+        fps,
+        frames,
+        seconds,
+        message: `${frames} frames \u00b7 ${seconds.toFixed(1)}s at ${fps} fps`,
+      });
+    },
+    cinemaRenderStatus: () => Promise.resolve(RENDER_DONE),
+    cinemaRenderCancel: () => Promise.resolve(RENDER_DONE),
+  }) as unknown as EditorClient;
+
+/** The same client, one click further on: the render has finished and the dialog is its ledger. */
+const renderedCutsceneClient = () =>
+  ({
+    ...renderingCutsceneClient(),
+    cinemaRenderStart: () => Promise.resolve(RENDER_DONE),
+  }) as unknown as EditorClient;
+
+/** The same cutscene, delivered in scope. One field differs, and it changes what every shot in the
+ *  list is composed for — which is why it belongs to the CUT and not to a shot. */
+const deliveredCutsceneClient = () =>
+  ({
+    ...cutsceneClient(),
+    cinemaList: () => Promise.resolve({ ...CUTSCENE, delivery: "scope" as const }),
   }) as unknown as EditorClient;
 
 const selectAnimatedEntity = () => {
@@ -712,6 +990,393 @@ function graphScenes(): Scene[] {
   ];
 }
 
+/** === The export task dialog (ADR-174) ==========================================================
+ *
+ *  The workflow that used to be three items on a menu, each firing a write on click. There was
+ *  nothing to photograph before: the whole surface was a `PopupMenuGroup` and the answer arrived in
+ *  the status bar. These four are its first captures, and the reason they can exist at all is the
+ *  driver reaching a PORTALLED root — a `Modal` renders into `document.body`, so every claim below
+ *  would have found nothing a day ago.
+ *
+ *  The catalogue comes from `createMockSession()` rather than a fixture of its own: the dialog's
+ *  membership rule reads `direction` and `available`, so a hand-written list here could photograph a
+ *  rail the real registry cannot produce — the C6 failure reached through a screenshot. */
+const exportCatalogue = createMockSession().formatCatalog();
+
+const exportClient = (reply?: SceneExportResponse): EditorClient =>
+  ({
+    formatCatalog: () => exportCatalogue,
+    sceneExport: () => Promise.resolve(reply ?? {
+      ok: false,
+      message: "Complete-scene export is available in the packaged desktop editor.",
+      format: "glb",
+      exportedPath: null,
+      nodes: 0,
+      meshes: 0,
+      skins: 0,
+      animations: 0,
+      fidelity: [],
+    }),
+  }) as unknown as EditorClient;
+
+/** A weld cell holding the three things the scene outline can see a format drop: a camera, an
+ *  animated rig and two physics objects. Component names are the core's own (`core/src/stdlib.rs`). */
+const exportSetup = () => {
+  projectStore.getState().refresh({ path: "C:/work/weld-cell-12.mtk", dirty: true, recents: [], error: null });
+  projectionStore.getState().bulkLoad([
+    { id: "e-cam", name: "Shot Camera", parentId: null, components: { Transform: {}, Camera: {} } },
+    { id: "e-gun", name: "Weld Gun 7", parentId: null, components: { Transform: {}, MeshRenderer: {}, Animator: {} } },
+    { id: "e-girder", name: "Long Travel Girder", parentId: null, components: { Transform: {}, MeshRenderer: {} } },
+    { id: "e-crate", name: "Crate", parentId: null, components: { Transform: {}, MeshRenderer: {}, RigidBody: {} } },
+    { id: "e-pad", name: "Safety Pad", parentId: null, components: { Transform: {}, Collider: {} } },
+  ] as never);
+};
+
+const EXPORTED: SceneExportResponse = {
+  ok: true,
+  message: "Wrote 5 objects to weld-cell-12.glb",
+  format: "glb",
+  exportedPath: "C:/work/export/weld-cell-12.glb",
+  nodes: 5,
+  meshes: 3,
+  skins: 0,
+  animations: 1,
+  fidelity: [
+    { status: "preserved", feature: "hierarchy", count: 5, detail: "Every node kept its parent and its local transform." },
+    { status: "converted", feature: "authored_visibility", count: 1, detail: "Stored in node extras — glTF has no visibility flag, so a reader that ignores extras will show the object." },
+    { status: "omitted", feature: "physics", count: 2, detail: "glTF has no rigid-body or collider representation. Re-author these in the target application." },
+  ],
+};
+
+/** The dialog is a `Modal`: it portals to `document.body`, so the frame itself stays empty by design
+ *  and every claim below is evaluated against the portalled root. The window is the subject in all
+ *  four, so each states a `viewport` rather than a frame `width`. */
+const exportScene = (
+  id: string,
+  looking_for: string,
+  expect: Expect,
+  viewport: { width: number; height: number },
+  extra: { click?: string[]; reply?: SceneExportResponse } = {},
+): Scene => ({
+  id,
+  looking_for,
+  expect: {
+    ...expect,
+    // `Icon` draws an empty, still-sized box for a name the set lacks, so a blank control
+    // photographs like a working one. Standing claim on every scene here, not a per-scene choice.
+    absent: ["[data-icon-missing]", ...(expect.absent ?? [])],
+    text_absent: ["null", "undefined", "NaN", ...(expect.text_absent ?? [])],
+  },
+  viewport,
+  click: extra.click,
+  setup: exportSetup,
+  render: () => <ExportDialog open client={exportClient(extra.reply)} onClose={() => { /* a capture never closes it */ }} />,
+});
+
+function exportScenes(): Scene[] {
+  return [
+    exportScene(
+      "export-dialog",
+      "THE EXPORT WORKFLOW AS ONE SURFACE. What a reader is checking is that the decision is legible " +
+      "BEFORE the click: a rail of every format this build can write (not the three a menu once " +
+      "hardcoded), the chosen one's declared fidelity beside its name, the registry's honest sentence " +
+      "about what it does not do, and a nine-row checklist where carried and not-carried differ by " +
+      "MARK before they differ by colour. The primary action names the project it will write and sits " +
+      "in a footer that does not scroll — the old version's entire answer was a status line",
+      {
+        present: [
+          ["[data-testid='exportDialog']", 1],
+          ["[role='tablist'][aria-label='Export formats'] [role='tab']", 3],
+          ["[data-testid='exportCarries'] li", 9],
+          ["[data-testid='exportConfirm']", 1],
+        ],
+        text_present: ["glTF 2.0 / GLB", "Full", "Export weld-cell-12", "5 objects in this scene"],
+        unclipped: [
+          "[data-testid='exportConfirm']",
+          "[data-testid='exportSubject']",
+          "[role='tablist'][aria-label='Export formats'] [role='tab']",
+        ],
+        // The rail is a COLUMN at this width — the pane sits BESIDE it, not under it. (Claimed on
+        // the two regions, not on the tablist and the heading: the rail's box starts below its own
+        // title, so those two never shared a line and never should have been asked to.)
+        same_line: [[".mtk-taskdialog__rail", ".mtk-taskdialog__pane"]],
+      },
+      { width: 1100, height: 760 },
+    ),
+    exportScene(
+      "export-dialog-cost",
+      "THE SENTENCE THE OLD MENU COULD NOT SAY. STEP AP242 carries geometry, hierarchy, materials and " +
+      "engineering data — and none of the camera, animation or physics this scene contains. So the " +
+      "cost of choosing it is counted from the scene outline and stated in words, above the button " +
+      "that would pay it. A reader should be checking that the count is of OBJECTS (the crate carries " +
+      "a rigid body, the pad a collider: two physics bodies, not four components), that the block does " +
+      "not claim to have checked what it cannot see, and that it is inside the pane rather than in a " +
+      "gutter somewhere else",
+      {
+        present: [["[data-testid='exportCost']", 1]],
+        text_present: [
+          "STEP AP242",
+          "1 camera",
+          "1 animated object",
+          "2 physics bodies",
+          "Counted from the scene outline",
+        ],
+        stacked: [
+          ["[data-testid='exportCarries']", "[data-testid='exportCost']"],
+          ["[data-testid='exportCost']", "[data-testid='exportConfirm']"],
+        ],
+        unclipped: ["[data-testid='exportCost']", "[data-testid='exportConfirm']"],
+      },
+      { width: 1100, height: 760 },
+      { click: ["#exportFormats-step-tab"] },
+    ),
+    exportScene(
+      "export-dialog-ledger",
+      "WHAT IT BOUGHT, IN THE PLACE THE GESTURE HAPPENED. After the write the options are replaced by " +
+      "the exporter's own fidelity ledger — three decisions, each tagged preserved / converted / " +
+      "omitted, each with the sentence explaining it — plus the counts and the destination path in " +
+      "mono. The old flow put a truncated version of this in a toast that overwrites itself and a " +
+      "status line that is gone by the next action. A reader is checking that nothing here is a " +
+      "summary of something the user can no longer reach, and that the footer now offers finishing " +
+      "rather than repeating the action just taken",
+      {
+        present: [
+          ["[data-testid='exportResult']", 1],
+          ["[data-testid='exportFidelity'] li", 3],
+          ["[data-testid='exportDone']", 1],
+        ],
+        absent: ["[data-testid='exportCarries']", "[data-testid='exportCost']"],
+        text_present: [
+          "weld-cell-12.glb",
+          "authored_visibility",
+          "no rigid-body or collider representation",
+          "omitted",
+        ],
+        unclipped: ["[data-testid='exportPath']", "[data-testid='exportDone']"],
+        stacked: [["[data-testid='exportPath']", "[data-testid='exportFidelity']"]],
+      },
+      { width: 1100, height: 820 },
+      { click: ["[data-testid='exportConfirm']"], reply: EXPORTED },
+    ),
+    exportScene(
+      "export-dialog-narrow",
+      "THE SAME DIALOG BELOW THE 860px THE RAIL IS WORTH: the format list turns back into the " +
+      "horizontal strip `.mtk-nav-rail` already becomes elsewhere, and the pane takes the full width " +
+      "under it. What must survive the fold is everything the wide scene claims — every format still " +
+      "reachable in one glance rather than behind a scroll, the checklist unclipped however many " +
+      "columns it settles on, and the primary action still pinned to the footer",
+      {
+        present: [
+          ["[role='tablist'][aria-label='Export formats'] [role='tab']", 3],
+          ["[data-testid='exportCarries'] li", 9],
+        ],
+        text_present: ["Export weld-cell-12"],
+        // Every format on one row: a strip that scrolls past the edge is the pattern the rail exists
+        // to replace, and it must not come back through the responsive door.
+        same_line: [["#exportFormats-gltf-tab", "#exportFormats-usd-tab"]],
+        unclipped: [
+          "[role='tablist'][aria-label='Export formats'] [role='tab']",
+          "[data-testid='exportConfirm']",
+          "[data-testid='exportCarries'] li",
+        ],
+      },
+      { width: 720, height: 800 },
+    ),
+  ];
+}
+
+/** === The import task dialog (ADR-178) ==========================================================
+ *
+ *  The mirror of the four above, and the surface File→Import never had: one menu item straight into
+ *  a native picker, with the per-part account in a different dock. What is worth photographing is
+ *  that the two dialogs are ONE anatomy — the same rail, pane, footer and marks, `.mtk-taskdialog__*`
+ *  since this scene needed it — and that the longer catalogue (ten readers against four writers) did
+ *  not force a second shape to hold it.
+ *
+ *  Same rule as the export catalogue: it comes from `createMockSession()`, not a fixture, because a
+ *  hand-written rail can photograph a membership the real registry cannot produce. */
+const importCatalogue = createMockSession().formatCatalog();
+
+const importClient = (reply?: ImportDialogResponse, report?: CadReport): EditorClient =>
+  ({
+    formatCatalog: () => importCatalogue,
+    importAssetDialog: () =>
+      Promise.resolve(
+        reply ?? {
+          entityId: null,
+          outcome: "cancelled" as const,
+          message: "No file was chosen. Nothing in the scene changed.",
+        },
+      ),
+    cadReport: () =>
+      Promise.resolve(
+        report ?? { total: 0, exactBrep: 0, tessellationOnly: 0, aiReconstructed: 0, proxy: 0, accessDenied: 0, failed: 0, parts: [] },
+      ),
+  }) as unknown as EditorClient;
+
+/** A 378-part crane, which is the real `Skid Weld Line` figure — an account of a CAD import is only
+ *  worth photographing at a size where the numbers have to line up. */
+const IMPORTED_CAD: CadReport = {
+  total: 378,
+  exactBrep: 235,
+  tessellationOnly: 130,
+  aiReconstructed: 0,
+  proxy: 13,
+  accessDenied: 0,
+  failed: 0,
+  parts: [],
+};
+
+const importSetup = () => {
+  projectStore.getState().refresh({ path: "C:/work/weld-cell-12.mtk", dirty: false, recents: [], error: null });
+  projectionStore.getState().bulkLoad([
+    { id: "e-girder", name: "Long Travel Girder", parentId: null, components: { Transform: {}, MeshRenderer: {} } },
+    { id: "e-pad", name: "Safety Pad", parentId: null, components: { Transform: {}, Collider: {} } },
+  ] as never);
+};
+
+const importScene = (
+  id: string,
+  looking_for: string,
+  expect: Expect,
+  viewport: { width: number; height: number },
+  extra: { click?: string[]; reply?: ImportDialogResponse; report?: CadReport } = {},
+): Scene => ({
+  id,
+  looking_for,
+  expect: {
+    ...expect,
+    absent: ["[data-icon-missing]", ...(expect.absent ?? [])],
+    text_absent: ["null", "undefined", "NaN", ...(expect.text_absent ?? [])],
+  },
+  viewport,
+  click: extra.click,
+  setup: importSetup,
+  render: () => <ImportDialog open client={importClient(extra.reply, extra.report)} onClose={() => { /* a capture never closes it */ }} />,
+});
+
+function importScenes(): Scene[] {
+  return [
+    importScene(
+      "import-dialog",
+      "THE IMPORT WORKFLOW AS ONE SURFACE, AND THE SAME SURFACE AS EXPORT. A reader is checking two " +
+      "things at once: that the decision is legible BEFORE the picker opens — every format this " +
+      "build can READ on one rail, the whole accepted extension set as a scannable row of mono pills " +
+      "rather than a comma sentence, and a primary action that says what it is about to open — and " +
+      "that this is visibly the export dialog's twin. Same rail, same pane, same footer, same marks. " +
+      "The old surface was one menu item and a native dropdown",
+      {
+        present: [
+          ["[data-testid='importDialog']", 1],
+          ["[role='tablist'][aria-label='Import formats'] [role='tab']", 11],
+          ["[data-testid='importExtensions'] li", 15],
+          ["[data-testid='importConfirm']", 1],
+        ],
+        text_present: ["Any supported file", "10 formats", ".3dxml", "Choose a file", "2 objects in this scene"],
+        unclipped: [
+          "[data-testid='importConfirm']",
+          "[data-testid='importSubject']",
+          "[role='tablist'][aria-label='Import formats'] [role='tab']",
+          "[data-testid='importExtensions'] li",
+        ],
+        same_line: [[".mtk-taskdialog__rail", ".mtk-taskdialog__pane"]],
+      },
+      { width: 1100, height: 860 },
+    ),
+    importScene(
+      "import-dialog-format",
+      "WHAT A READER DROPS, SAID BEFORE A FILE IS CHOSEN. STEP AP242 brings geometry, hierarchy, " +
+      "materials and engineering data — per-part colour is real AP242 and the registry says so — and " +
+      "none of the textures, skinning, animation, cameras or physics the checklist lists beside it. " +
+      "A reader is checking that the sentence names CAPABILITIES and " +
+      "never a count (nothing has been opened, so a number would be invented), that the checklist's " +
+      "two states differ by MARK before they differ by colour, and that the primary action now names " +
+      "the format it will filter the picker to",
+      {
+        present: [
+          ["[data-testid='importCarries'] li", 9],
+          ["[data-testid='importCost']", 1],
+        ],
+        text_present: ["STEP AP242", "Not brought in", "textures", "animation", "Choose a STEP AP242 file"],
+        stacked: [
+          ["[data-testid='importCarries']", "[data-testid='importCost']"],
+          ["[data-testid='importCost']", "[data-testid='importConfirm']"],
+        ],
+        unclipped: ["[data-testid='importCost']", "[data-testid='importConfirm']", "[data-testid='importCarries'] li"],
+      },
+      { width: 1100, height: 860 },
+      { click: ["#importFormats-step-tab"] },
+    ),
+    importScene(
+      "import-dialog-account",
+      "WHAT CAME IN, IN THE PLACE THE GESTURE HAPPENED. After a 378-part CAD import the options are " +
+      "replaced by the importer's own account: the sentence naming the file, the entity now selected " +
+      "in the scene, and the per-part honesty breakdown that until now lived only in a panel in the " +
+      "bottom dock nobody had a reason to open. A reader is checking that only the classes that " +
+      "OCCUR are drawn (six zeroes would be noise dressed as an account), that the counts line up on " +
+      "one badge track, and that the footer offers finishing rather than repeating what just happened",
+      {
+        present: [
+          ["[data-testid='importResult']", 1],
+          ["[data-testid='importFidelity'] li", 3],
+          ["[data-testid='importDone']", 1],
+        ],
+        absent: ["[data-testid='importCarries']", "[data-testid='importCost']"],
+        text_present: ["Imported Skid Weld Line A.1.stp", "Exact B-rep", "378 parts accounted for"],
+        unclipped: ["[data-testid='importEntity']", "[data-testid='importDone']", "[data-testid='importFidelity'] li"],
+        stacked: [["[data-testid='importEntity']", "[data-testid='importFidelity']"]],
+      },
+      { width: 1100, height: 860 },
+      {
+        click: ["[data-testid='importConfirm']"],
+        reply: { entityId: "cad-root-1", outcome: "imported", message: "Imported Skid Weld Line A.1.stp." },
+        report: IMPORTED_CAD,
+      },
+    ),
+    importScene(
+      "import-dialog-cancelled",
+      "A DISMISSED PICKER IS NOT A REFUSAL. The reply used to be an entity id or nothing, and nothing " +
+      "meant both that the person closed the dialog and that this build cannot read the file, so the " +
+      "only sentence the editor could write was “import cancelled or unsupported” — two answers " +
+      "joined by or. What a reader is checking is that this state is calm rather than alarming: it is " +
+      "drawn in the advisory treatment and not the failure one, it says what did NOT happen to the " +
+      "scene, and the way back to the action is still the primary control",
+      {
+        present: [["[data-testid='importRefused']", 1], ["[data-testid='importConfirm']", 1]],
+        absent: ["[data-testid='importDone']"],
+        text_present: ["No file was chosen", "Nothing in the scene changed"],
+        unclipped: ["[data-testid='importRefused']", "[data-testid='importConfirm']"],
+      },
+      { width: 1100, height: 800 },
+      { click: ["[data-testid='importConfirm']"] },
+    ),
+    importScene(
+      "import-dialog-narrow",
+      "ELEVEN CHOICES BELOW THE 860px THE RAIL IS WORTH. The rail turns into the horizontal strip it " +
+      "becomes everywhere else — and it WRAPS rather than scrolling, which is the change this scene " +
+      "exists to hold: a strip with six of eleven formats past the right edge is the exact pattern " +
+      "the rail was built to replace. What must survive the fold is every format reachable in one " +
+      "glance, the extension pills unclipped however many rows they settle on, and the primary " +
+      "action still pinned to a footer that does not scroll",
+      {
+        present: [
+          ["[role='tablist'][aria-label='Import formats'] [role='tab']", 11],
+          ["[data-testid='importExtensions'] li", 15],
+        ],
+        text_present: ["Choose a file"],
+        unclipped: [
+          "[role='tablist'][aria-label='Import formats'] [role='tab']",
+          "[data-testid='importConfirm']",
+          "[data-testid='importExtensions'] li",
+        ],
+        // The rail is ABOVE the pane here, not beside it — the stacked form, claimed as such.
+        stacked: [[".mtk-taskdialog__rail", ".mtk-taskdialog__pane"]],
+      },
+      { width: 720, height: 920 },
+    ),
+  ];
+}
+
 export const SCENES: Scene[] = [
   {
     id: "icon-set-specimen",
@@ -962,6 +1627,382 @@ export const SCENES: Scene[] = [
     render: () => <AnimationWorkspace client={animationClient()} />,
   },
   {
+    id: "cutscene-timeline",
+    looking_for:
+      "A CUTSCENE AS A SEQUENCE IN TIME. What this panel replaced was a bulleted list of five " +
+      "sentences with a × beside each: no length on screen anywhere, no way to reorder, and no way " +
+      "to change a shot without deleting it and re-authoring everything after it — while the engine " +
+      "had carried a per-shot `seconds`, an ordered list and a six-by-six-by-six framing vocabulary " +
+      "the whole time. Check that the five bars are five DIFFERENT widths in the ratio 2.5 : 4.0 : " +
+      "1.6 : 3.0 : 2.2 — equal bars would mean the panel is drawing a list again — that each carries " +
+      "its own duration, and that the ruler above them is labelled in seconds with a playhead that " +
+      "has a handle. The first bar reads Assembly Hall, not Weld Gun 7: a shot may film something " +
+      "other than the object its cutscene hangs on, and every line in the old list was captioned " +
+      "with the owner. Below, the shot inspector: length, size, angle, move and strength, each one " +
+      "a control from the shared field family and each one edit landing as a single undoable commit. " +
+      "The jump-cut warning is the engine's own continuity check, shown where the shots are",
+    // The WINDOW, not a frame cap. `width` leaves the window at 620px and merely caps the frame, so
+    // a panel that measures its own container to decide how wide to draw a lane gets photographed
+    // fitting a 620px box under a caption about a full-window dock. Found by this scene: the last
+    // two shots of a five-shot cut were scrolled off the right-hand edge of the capture.
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    // Without the click this photographs the timeline with no shot inspector under it — a capture of
+    // half the panel under a caption describing all of it.
+    click: ["[data-testid='cutscene-clip']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-clip']", 5],
+        ["[data-testid='cutscene-shot-editor']", 1],
+        ["[data-testid='cutscene-problem']", 1],
+        // The framing vocabulary is on screen as three real selects, not as prose.
+        ["[data-testid='cutscene-size']", 1],
+        ["[data-testid='cutscene-angle']", 1],
+        ["[data-testid='cutscene-motion']", 1],
+        // ...and the catalogue is still one click away from the timeline it feeds.
+        ["[data-testid='shot-catalogue'] .mtk-btn", 6],
+      ],
+      text_present: [
+        "Assembly Hall",
+        "Weld Gun 7",
+        "Shot 1 of 5",
+        // The total, and the one number the old list could not show at all.
+        "13.3",
+        "jump cut",
+      ],
+      // The empty states this scene must NOT be photographing.
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      // A bar you cannot see is a shot you cannot select, and the shortest one here is 1.6s of 13.3.
+      min_width: [["[data-testid='cutscene-clip']", 24]],
+      unclipped: [
+        "[data-testid='cutscene-clip']",
+        "[data-testid='cutscene-shot-editor'] .mtk-select",
+        "[data-testid='cutscene-shot-editor'] .mtk-btn",
+        "[data-testid='cutscene-panel'] > .mtk-toolbar .mtk-btn",
+      ],
+      // The ruler labels sit ABOVE the lane they measure, and the inspector under the timeline.
+      stacked: [["[data-testid='cutscene-timeline']", "[data-testid='cutscene-shot-editor']"]],
+      // Earlier/Later/Remove are one row, not three: an order control that wrapped onto its own line
+      // is the toolbar having run out of width.
+      same_line: [["[data-testid='cutscene-earlier']", "[data-testid='cutscene-remove']"]],
+    },
+    render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-render",
+    looking_for:
+      "THE WAY A PICTURE GETS OUT OF THIS ENGINE. Until this dialog existed there was none: the " +
+      "shell wrote no image file anywhere, and every still of this project's own benchmark film was " +
+      "an operating-system screenshot taken by a script outside the engine - while the renderer had " +
+      "been reading its own frames back to PNG since M14.2 and the shot solver could pose the " +
+      "camera at any instant. Check that all three moments of the task are here and in this order: " +
+      "WHAT will be written (the scope, the rate, the name), WHAT IT COSTS stated above the button " +
+      "that pays it - a frame count that is the ENGINE's own plan, not this dialog's arithmetic - " +
+      "and the one thing the dialog cannot change, said before the click rather than discovered " +
+      "after it: a frame is written at the size of the composed picture on screen. The description " +
+      "names the delivery frame the cut is composed for, because that is what decides the SHAPE of " +
+      "every file. The primary button says the number: 'Render 319 frames', never a bare 'Render'",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-render']"],
+    expect: {
+      present: [
+        ["[data-testid='render-dialog']", 1],
+        ["[data-testid='render-scope']", 1],
+        ["[data-testid='render-fps']", 1],
+        ["[data-testid='render-stem']", 1],
+        ["[data-testid='render-cost']", 1],
+        ["[data-testid='render-start']", 1],
+      ],
+      text_present: [
+        // The frame the cut is composed for - the fixture delivers in scope, and the shape of every
+        // written file follows from it.
+        "2.39:1 scope",
+        // The cost, and the fact that it is a count of FILES.
+        "319 frames",
+        "PNG files",
+        // The limit, before the click.
+        "Frame size",
+      ],
+      text_absent: ["null", "undefined", "NaN", "0 frames"],
+      unclipped: [
+        "[data-testid='render-start']",
+        "[data-testid='render-cost']",
+        "[data-testid='render-scope']",
+      ],
+      // The cost sits ABOVE the button that pays it. Below it, it is a receipt.
+      stacked: [["[data-testid='render-cost']", "[data-testid='render-start']"]],
+      // Cancel and Render share the footer row rather than stacking into two full-width bars.
+      same_line: [["[data-testid='render-cancel']", "[data-testid='render-start']"]],
+    },
+    render: () => <CutscenePanel client={renderingCutsceneClient()} />,
+  },
+  {
+    id: "cutscene-render-ledger",
+    looking_for:
+      "WHERE THE FRAMES WENT. A render is 319 files in a folder, and 'done' is not an answer to " +
+      "'where are they' - which is exactly what a status-bar toast could say and no more. The " +
+      "options are GONE and their space is the ledger: how many frames exist, the pixel size they " +
+      "were actually written at (measured from the first captured frame, never guessed from the " +
+      "window), what they weigh, how long it took, and the destination path in mono, whole, " +
+      "wrapping rather than truncating. Check that the reader can answer 'where are my files' " +
+      "without leaving this dialog, and that no settings control is still on screen asking a " +
+      "question the reader has stopped having",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-render']", "[data-testid='render-start']"],
+    expect: {
+      present: [
+        ["[data-testid='render-ledger']", 1],
+        ["[data-testid='render-ledger-frames']", 1],
+        ["[data-testid='render-ledger-folder']", 1],
+        ["[data-testid='render-done']", 1],
+      ],
+      // The settings are gone, not merely disabled.
+      absent: ["[data-testid='render-fps']", "[data-testid='render-scope']"],
+      text_present: ["319", "1920", "Rendered", "renders"],
+      text_absent: ["null", "undefined", "NaN"],
+      unclipped: ["[data-testid='render-ledger-folder']", "[data-testid='render-done']"],
+    },
+    render: () => <CutscenePanel client={renderedCutsceneClient()} />,
+  },
+  {
+    id: "cutscene-shot-subject",
+    looking_for:
+      "WHAT THIS SHOT FRAMES — the control that was missing while the engine already had the " +
+      "capability. A `ShotRecipe` has carried its own `subject` since cutscenes shipped, and the " +
+      "runtime resolves it as the union of every rendered instance in that object's HIERARCHY " +
+      "SUBTREE — so 'film the whole assembly' was always solvable, the editor simply sent no " +
+      "subject and offered no way to change one, which made the most ordinary cinematic sequence " +
+      "there is (hold on the whole line, then cut in to one machine) impossible to author. Shot 1 " +
+      "here films the hall the gun stands in. Check that the LANE says so — clip 1 carries " +
+      "'Assembly Hall' beside its duration and the other four carry only a duration, because " +
+      "captioning all five with the same name is the heading repeated five times — and that the " +
+      "shot inspector's first framing control is 'Frames', reading back Assembly Hall with a help " +
+      "line naming the difference. Frames sits before Size, Angle and Move because all three of " +
+      "those are stated RELATIVE to the subject, so every one of them means something else once it " +
+      "changes. THE OPEN LIST IS NOT ASSERTED HERE: it is a `theme/Popover`, portalled to " +
+      "`document.body` by design, and this gate evaluates claims inside the scene's own frame. Its " +
+      "contents — the ranked groups, the parts counts, the nothing-drawn warning — are measured on " +
+      "the packaged .exe by `specs-subjectpicker`, against the real engine's own ranking",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    // Open shot 1 — the one that films something other than the object its cutscene hangs on.
+    click: ["[data-testid='cutscene-clip']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-shot-editor']", 1],
+        ["[data-testid='cutscene-subject']", 1],
+        ["[data-testid='cutscene-subject-name']", 1],
+        ["[data-testid='cutscene-clip']", 5],
+      ],
+      text_present: [
+        "Frames",
+        "Assembly Hall",
+        // The help line under the control, which is where the difference is explained.
+        "This shot films Assembly Hall, not Weld Gun 7",
+      ],
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      // A control whose value is ellipsised is a control that does not answer its own question.
+      unclipped: ["[data-testid='cutscene-subject']", "[data-testid='cutscene-subject-name']"],
+      // The sentence names the subject, and the control that changes it is under the sentence.
+      stacked: [["[data-testid='cutscene-shot-reads']", "[data-testid='cutscene-subject']"]],
+      // Frames and Size are one row of the framing grid: what a shot is OF and how it is framed
+      // belong to the same decision and are read together.
+      same_line: [["[data-testid='cutscene-subject']", "[data-testid='cutscene-size']"]],
+    },
+    render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-aim-badge",
+    looking_for:
+      "AIMING A SHOT BY POINTING AT THE THING. The stage while an aim is in flight. Three engine " +
+      "capabilities existed and had never met: `viewport_peek` names what is under the cursor " +
+      "WITHOUT changing the selection (and was called by nothing in the editor), " +
+      "`cinema_subject_chain` answers with the object and every assembly it belongs to, and " +
+      "`cinema_set_shot_subject` re-aims a shot as one undoable edit. What a user could reach was a " +
+      "search box, so in a 15,711-part import 'film THAT one' meant knowing its name. Check that " +
+      "the badge says which shot is being aimed (shot 2 of 5), that the cursor's object and the " +
+      "machine it belongs to are BOTH offered as buttons with their drawn-part counts — 1 part vs " +
+      "42 vs 378 is the whole reason a click on one bolt does not have to become a shot of one " +
+      "bolt — that the first rung is the emphasised one because it is what the stage click itself " +
+      "would take, and that the way out is named on the badge (Esc, and a Cancel beside it). It " +
+      "sits at the BOTTOM of the stage on purpose: the preview badge holds the top, and re-aiming a " +
+      "shot while previewing it is the loop this closes",
+    viewport: { width: 1400, height: 620 },
+    expect: {
+      present: [
+        ["[data-testid='subjectAimBadge']", 1],
+        ["[data-testid='subjectAimRungs']", 1],
+        ["[data-testid='subjectAimRung-bolt']", 1],
+        ["[data-testid='subjectAimRung-rig']", 1],
+        ["[data-testid='subjectAimRung-hall']", 1],
+        ["[data-testid='subjectAimCancel']", 1],
+      ],
+      text_present: [
+        "AIMING",
+        "shot 2 of 5",
+        "Bolt M8",
+        "1 part",
+        "Weld Gun 7",
+        "42 parts",
+        "Assembly Hall",
+        "378 parts",
+        "Esc",
+      ],
+      // The badge is the read-out for a gesture in progress; a hint left standing beside a named
+      // ladder would be two answers to the same question.
+      text_absent: ["click what this shot should film", "looking", "null", "undefined", "NaN"],
+      unclipped: [
+        "[data-testid='subjectAimRung-bolt']",
+        "[data-testid='subjectAimRung-rig']",
+        "[data-testid='subjectAimRung-hall']",
+        "[data-testid='subjectAimCancel']",
+      ],
+      // One pill. A ladder that wrapped its rungs onto a second line under the word AIMING is a
+      // badge that has run out of width, and the widen-to-the-assembly choice is the half that goes.
+      same_line: [
+        ["[data-testid='subjectAimShot']", "[data-testid='subjectAimRung-bolt']"],
+        ["[data-testid='subjectAimRung-bolt']", "[data-testid='subjectAimRung-hall']"],
+        ["[data-testid='subjectAimRung-hall']", "[data-testid='subjectAimCancel']"],
+      ],
+    },
+    render: () => (
+      // The stage, at the size the badge actually stands in: absolutely positioned against the
+      // viewport region, bottom-centre.
+      <div style={{ position: "relative", height: 560, background: "var(--mtk-bg-inset)" }}>
+        <SubjectAimBadge
+          shotIndex={1}
+          shots={5}
+          looking={false}
+          rungs={[
+            { id: "bolt", name: "Bolt M8", parts: 1, group: "This object" },
+            { id: "rig", name: "Weld Gun 7", parts: 42, group: "What it is part of" },
+            { id: "hall", name: "Assembly Hall", parts: 378, group: "What it is part of" },
+          ]}
+          onPick={() => {}}
+          onPreview={() => {}}
+          onCancel={() => {}}
+        />
+      </div>
+    ),
+  },
+  {
+    id: "cutscene-preview",
+    looking_for:
+      "THE PLAYHEAD ANSWERING WITH A PICTURE. `solve_shot` has been pure in (recipe, subject, t) " +
+      "since cutscenes shipped, so the engine could always produce the camera at any instant — and " +
+      "the only way to see one was to press Play and watch the cut from its start. Here the second " +
+      "clip has been clicked and Preview turned on. Check that the Preview control reads as PRESSED " +
+      "(filled, not outlined — an accent border alone would be a toggle whose state you have to " +
+      "know already), that it sits in its own toolbar group rather than crowding the pacing run, " +
+      "and that the playhead read-out beside it names the same shot the timeline is highlighting: " +
+      "3.1s, shot 2 of 5 — where shot 2 BECOMES ITSELF (its 2.5s start plus its 0.6s opening blend), not where it starts and not how long it runs. This is the toggle's whole job — the author says WHEN, and the viewport " +
+      "answers with the frame Play would film at that moment",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    // In order: open the second shot, then take the camera. Clicking the toggle first would preview
+    // 0.0s and photograph a caption that disagrees with its own picture.
+    click: ["[data-testid='cutscene-clip']:nth-of-type(2)", "[data-testid='cutscene-preview']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-clip']", 5],
+        ["[data-testid='cutscene-preview']", 1],
+        ["[data-testid='cutscene-shot-editor']", 1],
+        // The pose read-out is the expert half of this control and appears ONLY while a preview is
+        // standing somewhere - a scene that did not assert it would photograph the beginner half.
+        ["[data-testid='cutscene-preview-pose']", 1],
+      ],
+      text_present: [
+        "Preview",
+        "3.1s · shot 2 of 5",
+        "Weld Gun 7",
+        // Three world coordinates, not a promise of them.
+        "6.20, 3.10, 9.40",
+        "0.00, 1.40, 0.00",
+        "50° lens",
+      ],
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      unclipped: [
+        "[data-testid='cutscene-preview']",
+        "[data-testid='cutscene-preview-pose']",
+        "[data-testid='cutscene-panel'] > .mtk-toolbar .mtk-btn",
+      ],
+      // The read-out sits between the lane it describes and the inspector for the selected shot.
+      stacked: [
+        ["[data-testid='cutscene-timeline']", "[data-testid='cutscene-preview-pose']"],
+        ["[data-testid='cutscene-preview-pose']", "[data-testid='cutscene-shot-editor']"],
+      ],
+      // The control that takes the viewport is on the same row as the pacing it sits beside; a
+      // Preview button that wrapped onto its own line is the toolbar having run out of width.
+      same_line: [["[data-testid='cutscene-mood-calm']", "[data-testid='cutscene-preview']"]],
+    },
+    render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-delivery-frame",
+    looking_for:
+      "THE FRAME THE SHOTS ARE COMPOSED FOR. A shot solver fits a subject against an ASPECT RATIO — " +
+      "it is how far back the camera stands — and until this control the only ratio available was " +
+      "whatever shape the author's stage happened to be, so opening a dock silently re-composed the " +
+      "film. Check that the delivery picker sits in the toolbar beside pacing (both are properties " +
+      "of the whole cut, not of one shot), that it reads '2.39:1 scope' rather than a number, and " +
+      "that the pose read-out under the lane now ends with the frame those three coordinates were " +
+      "solved for. Match viewport is the ABSENCE of a delivery frame and prints nothing there: this " +
+      "capture is the one where it is on",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-clip']:nth-of-type(2)", "[data-testid='cutscene-preview']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-delivery']", 1],
+        ["[data-testid='cutscene-preview-pose']", 1],
+      ],
+      text_present: ["2.39:1 scope", "composed for"],
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      unclipped: [
+        "[data-testid='cutscene-delivery']",
+        "[data-testid='cutscene-preview-pose']",
+      ],
+      // The frame is chosen in the toolbar and reported under the lane - a control and its
+      // consequence, in that order down the panel.
+      stacked: [["[data-testid='cutscene-delivery']", "[data-testid='cutscene-preview-pose']"]],
+      // ...and it is on the pacing row, not on a line of its own.
+      same_line: [["[data-testid='cutscene-mood-calm']", "[data-testid='cutscene-delivery']"]],
+    },
+    render: () => <CutscenePanel client={deliveredCutsceneClient()} />,
+  },
+  {
+    id: "cutscene-empty",
+    looking_for:
+      "THE STATE EVERY NEW CUTSCENE STARTS IN, and the one a capture is most likely to skip. An " +
+      "object is selected and has no shots: the panel says so in the object's own name, says what " +
+      "the first click will do, and puts the whole card catalogue right there. No timeline is drawn " +
+      "— a ruler over an empty lane is a clock with nothing on it — and no shot inspector, because " +
+      "there is no shot. Nothing here is a dark control waiting to be understood",
+    viewport: { width: 1000, height: 700 },
+    setup: selectAnimatedEntity,
+    expect: {
+      present: [["[data-testid='shot-catalogue'] .mtk-btn", 6]],
+      absent: ["[data-testid='cutscene-clip']", "[data-testid='cutscene-shot-editor']"],
+      text_present: ["Weld Gun 7 has no cutscene yet", "Add a shot"],
+      text_absent: ["null", "undefined", "NaN", "0.0s"],
+      unclipped: ["[data-testid='shot-catalogue'] .mtk-btn"],
+    },
+    render: () => (
+      <CutscenePanel
+        client={
+          ({
+            cinemaCatalog: () => Promise.resolve(CUTSCENE_CARDS),
+            cinemaFramingCatalog: () => Promise.resolve(FRAMING),
+            cinemaList: () =>
+              Promise.resolve({ ...CUTSCENE, shots: 0, seconds: 0, reads: [], rows: [], problems: [] }),
+          }) as unknown as EditorClient
+        }
+      />
+    ),
+  },
+  {
     id: "animation-curve-editor",
     looking_for:
       "the curve view, which nothing in this repository had ever photographed. What it was: a blue " +
@@ -1034,11 +2075,139 @@ export const SCENES: Scene[] = [
   ...poseScenes(),
   ...graphScenes(),
   ...inspectorScenes(),
+  ...materialScenes(),
+  ...composerScenes(),
   ...assetScenes(),
   ...modelScenes(),
   ...gameplayScenes(),
+  ...terrainScenes(),
   ...shellScenes(),
+  ...exportScenes(),
+  ...importScenes(),
 ];
+
+// ── the Terrain sub-engine's way in ───────────────────────────────────────────────────────────────
+
+/** THE PANEL THAT EXPLAINED ITSELF IN PROSE WHERE THE REFERENCES SHOW A GRID.
+ *
+ *  `shell-terrain` has photographed this column inside the editor since ADR-124, and its caption names
+ *  the width problem — "the widest workspace in the dock, and the one that has already overflowed it
+ *  once" — but no claim has ever been attached to what is INSIDE it before a terrain exists, which is
+ *  the first thing every author sees. What the capture shows: a 43-word paragraph about what a recipe
+ *  is; a description box; a status line whose two long sentences ended in the same two examples printed
+ *  again directly below it; five of those examples as full-width rows of body copy; then a heading
+ *  indented 12px past the choices it labels, over six presets drawn as a name and a sentence each, with
+ *  no tile, no preview and no affordance. Six choices, and only three of them existed — the browser
+ *  mock published half the engine's catalogue, so the grid that wraps at six had never been seen.
+ *
+ *  Written as the claims the panel must satisfy, and added BEFORE the change so they went red first —
+ *  the same discipline `gameplayScenes` records. The claim that matters most is `max_height`: prose is
+ *  cheap to write and expensive to scroll, and the only honest way to say "this stopped being an essay"
+ *  is to measure it. */
+function terrainScenes(): Scene[] {
+  const terrain = () => <TerrainPanel client={createMockSession()} statsIntervalMs={0} />;
+  return [
+    {
+      id: "terrain-start",
+      looking_for:
+        "the two ways into the Terrain sub-engine, at the 300px the left dock really is between 980 " +
+        "and 1199. A description box with its examples as a WRAPPED ROW OF PILLS, and every one of " +
+        "the engine's six presets as a tile whose drawing says which shape of ground it makes before " +
+        "its name is read. What a reader is checking: no paragraph anywhere; the two group headings " +
+        "flush with the content they label, not indented past it; the status line and Build it " +
+        "sharing one line; and six tiles in a grid rather than six sentences in a column",
+      width: 300,
+      expect: {
+        // Every preset the engine publishes, each with a drawing in it. The `svg path` count is the
+        // part that cannot be satisfied by an empty well — a tile with no mark photographs as a tile.
+        present: [
+          ["[data-testid^='terrain-preset-']", 6],
+          ["[data-testid^='terrain-preset-'] svg path", 6],
+          // TWO, not five. The other three describe CHANGES to a world, and this is the surface whose
+          // whole condition is that there is no world — they belong to the compact box, which is what
+          // `terrain-authored` photographs.
+          ["[data-testid='terrain-example']", 2],
+        ],
+        // `Icon` draws an empty, still-sized box for a name the set lacks, so a blank control
+        // photographs like a working one.
+        absent: ["[data-icon-missing]"],
+        text_present: ["Describe it", "Or start from a preset", "Desert Dunes", "Canyon Mesa"],
+        // The paragraph this pass deleted, by its most distinctive phrase. A prose block is the one
+        // thing that grows back by accident, because writing one always feels like helping.
+        text_absent: ["null", "undefined", "NaN", "Nothing is baked in", "raise this mountain”, “widen the river"],
+        // THE MEASUREMENT, and the reason this scene exists rather than a `text_absent` alone. The
+        // whole way in has to fit the dock without scrolling: 6 tiles + 5 pills + a box + two
+        // headings. The old surface needed 1,180px of column for the same two choices.
+        max_height: [["[data-testid='terrain-panel']", 620]],
+        // A heading indented past its own content reads as belonging to something else. Both group
+        // headings start on the same x as the things they label.
+        stacked: [
+          ["[data-testid='terrain-describe']", "[data-testid='terrain-presets']"],
+        ],
+        // The status line and its button share a row — the defect the shortened status fixes is that
+        // it wrapped to three lines and shoved the "Try one" heading into itself.
+        same_line: [["[data-testid='terrain-describe-status']", "[data-testid='terrain-describe-build']"]],
+        // Nothing may be cut at the width the dock really is. The tiles are the new thing and the
+        // pills are the new thing; both are claimed.
+        unclipped: [
+          "[data-testid='terrain-presets']",
+          "[data-testid='terrain-example']",
+          "[data-testid='terrain-describe-build']",
+        ],
+      },
+      render: terrain,
+    },
+    {
+      id: "terrain-start-wide",
+      looking_for:
+        "the SAME surface in the 340px track the dock takes above 1200px. The grid's column count is " +
+        "the browser's decision from a minimum tile width, so what is being checked is that the extra " +
+        "40px goes into the tiles rather than into a ragged row: still six tiles, still nothing cut, " +
+        "and the pills still on a row rather than a column",
+      width: 340,
+      expect: {
+        present: [["[data-testid^='terrain-preset-']", 6], ["[data-testid='terrain-example']", 2]],
+        absent: ["[data-icon-missing]"],
+        text_absent: ["null", "undefined", "NaN", "Nothing is baked in"],
+        max_height: [["[data-testid='terrain-panel']", 620]],
+        same_line: [
+          ["[data-testid='terrain-describe-status']", "[data-testid='terrain-describe-build']"],
+          // Three columns at 340 as at 300 — the tiles absorb the width. A row that broke to two
+          // would mean the grid's minimum is doing the deciding, not the design.
+          ["[data-testid='terrain-preset-flat']", "[data-testid='terrain-preset-alpine']"],
+        ],
+        unclipped: ["[data-testid='terrain-presets']", "[data-testid='terrain-example']"],
+      },
+      render: terrain,
+    },
+    {
+      id: "terrain-authored",
+      looking_for:
+        "the surface a preset leads to, reached by pressing one — the folding sections, and the " +
+        "compact describe box at the top of them. What a reader is checking is the half of " +
+        "describe-to-build that used to be invisible: the three examples about CHANGING a world are " +
+        "offered here, on a wrapped row, where they are the only ones that can work — and were shown " +
+        "only on the empty surface, where none of them could",
+      width: 300,
+      // Pressing a tile is the way an author reaches this state, so the scene reaches it that way too
+      // rather than by handing the panel a fixture no gesture produces.
+      click: ["[data-testid='terrain-preset-rolling-hills']"],
+      expect: {
+        present: [
+          ["[data-testid='terrain-section-describe']", 1],
+          ["[data-testid='terrain-example']", 3],
+        ],
+        absent: ["[data-icon-missing]", "[data-testid='terrain-presets']"],
+        text_present: ["Raise a mountain", "Widen the river", "Rebuild"],
+        // The create-side examples are for the other box. Seeing one here means the filter is gone.
+        text_absent: ["null", "undefined", "NaN", "Alpine valley", "Tropical islands"],
+        same_line: [["[data-testid='terrain-describe-status']", "[data-testid='terrain-describe-build']"]],
+        unclipped: ["[data-testid='terrain-example']", "[data-testid='terrain-describe-build']"],
+      },
+      render: terrain,
+    },
+  ];
+}
 
 // ── the inspector ─────────────────────────────────────────────────────────────────────────────────
 
@@ -1051,13 +2220,17 @@ export const SCENES: Scene[] = [
  *  `DisclosureSection` for groups, and `@jsonforms/vanilla-renderers`' unstyled `.control` for
  *  everything else), and typed controls keyed on components the core has never registered.
  *
- *  THE ENTITY BELOW IS THE CORE'S OWN VOCABULARY, not the dev mock's. `Transform{px..sz}`,
+ *  THE ENTITY BELOW IS THE VOCABULARY THE ENGINE ACTUALLY STORES — and for two milestones it was not.
  *  `MeshRenderer{mesh,material,castShadows}`, `RigidBody{kind,mass}` and `Joint{kind,bodyA,bodyB}` are
- *  exactly what `core/src/stdlib.rs` registers, down to the `format` on the two body references —
- *  which is what makes this a capture of the real product rather than of the mock. A scene that seeded
- *  `Material`/`Targeting` would photograph a payload the core cannot produce, which is the C6 failure
- *  reached through a screenshot instead of a test. `check-registry-vocab.mjs` is the gate that keeps
- *  the two in step; this is the picture of them being in step. */
+ *  exactly what `core/src/stdlib.rs` registers, down to the `format` on the two body references. The
+ *  `Transform` was `{px..sz}`, seeded here **to prove this was a capture of the real product rather
+ *  than of the mock** — and it was the one component where that reasoning failed: no writer in this
+ *  repository has ever committed a `Transform.px`. Every creator writes `x`/`y`/`z` + a rotation
+ *  quaternion + a uniform `scale`, `capscene::local_transform` reads the same eight names, and the dev
+ *  mock — the thing this comment was guarding against — was the only one of the three that had it
+ *  right. So this scene photographed a payload the engine cannot produce, in the caption's own words,
+ *  for the whole of ADR-136 and ADR-155 (ADR-172). It is the stored vocabulary now, and
+ *  `stdlib_transform_matches_the_stored_transform` is the test that keeps it so. */
 function inspectorSetup(open: string[], extra: Record<string, Record<string, unknown>> = {}) {
   return () => {
     // The disclosure remembers its own state, and only `Transform` opens by default — so a capture of
@@ -1068,14 +2241,16 @@ function inspectorSetup(open: string[], extra: Record<string, Record<string, unk
       window.localStorage.setItem(`metrocalk:disclosure:inspector-component:${encodeURIComponent(label)}`, "open");
     }
     projectionStore.getState().bulkLoad([
-      { id: "e-mast", name: "Mast", parentId: null, components: { Transform: { px: 0, py: 0, pz: 0 } } },
-      { id: "e-counterweight", name: "Counterweight", parentId: null, components: { Transform: { px: -4, py: 0, pz: 0 } } },
+      { id: "e-mast", name: "Mast", parentId: null, components: { Transform: { x: 0, y: 0, z: 0 } } },
+      { id: "e-counterweight", name: "Counterweight", parentId: null, components: { Transform: { x: -4, y: 0, z: 0 } } },
       {
         id: "e-boom",
         name: "Boom Arm",
         parentId: null,
         components: {
-          Transform: { px: 2.5, py: 1.2, pz: -0.75, rx: 0, ry: 45, rz: 0, sx: 1, sy: 1, sz: 1 },
+          // 45 degrees about Y, as a quaternion — which is how the engine stores a rotation and why
+          // the panel converts it to degrees rather than printing four numbers nobody types.
+          Transform: { x: 2.5, y: 1.2, z: -0.75, qx: 0, qy: YAW_45[1], qz: 0, qw: YAW_45[3], scale: 1 },
           MeshRenderer: { mesh: "sha256:9f3c81aa4e07", material: "sha256:1ab77d5c90e2", castShadows: true },
           RigidBody: { kind: "dynamic", mass: 1250 },
           Joint: { kind: "revolute", bodyA: "e-mast", bodyB: "e-counterweight" },
@@ -1087,12 +2262,116 @@ function inspectorSetup(open: string[], extra: Record<string, Record<string, unk
   };
 }
 
-/** A client that records rather than sends. `setField` is the only method these scenes can reach. */
+/** A 45-degree yaw as the engine stores it: `[qx, qy, qz, qw]` for a rotation about +Y. Stated once
+ *  so the two scenes that need a rotated object cannot disagree about what "rotated" means. */
+const YAW_45: [number, number, number, number] = [
+  0,
+  Math.sin(Math.PI / 8),
+  0,
+  Math.cos(Math.PI / 8),
+];
+
+/** A client that records rather than sends. `setField`, `multiEdit` and `setRotation` are the methods
+ *  these scenes can reach — the single-object, whole-selection and rotation edit paths (ADR-169,
+ *  ADR-172). The rotation is recorded as ONE entry however many entities it carries, because that is
+ *  the claim: four stored fields on N objects, one transaction. */
 function recordingClient(record: (entry: string) => void) {
   return {
     setField: (id: string, component: string, field: string, value: unknown) =>
       record(`${id}.${component}.${field}=${JSON.stringify(value)}`),
+    multiEdit: (ids: string[], component: string, field: string, value: unknown) => {
+      record(`${ids.length}x.${component}.${field}=${JSON.stringify(value)}`);
+      return Promise.resolve({ ok: true, changed: ids.length, reason: null });
+    },
+    setRotation: (ids: string[], quat: number[]) => {
+      record(`${ids.length}x.Transform.rotation=[${quat.map((c) => c.toFixed(3)).join(",")}]`);
+      return Promise.resolve({ ok: true, changed: ids.length, reason: null });
+    },
   } as unknown as EditorClient;
+}
+
+/** A SELECTION of lights, loaded and selected the way a user builds one — click, then ctrl-click.
+ *
+ *  Two of the three agree about `intensity` and the third does not, which is the state the whole
+ *  feature is about: the panel may not print one object's 60 as though it were everyone's.
+ *  `Light{kind,intensity,r,g,b}` is the core's own vocabulary (`core/src/stdlib.rs`), so this is a
+ *  capture of the real product rather than of a shape only the mock can produce. */
+function multiSelectionSetup(extra: Record<string, Record<string, unknown>> = {}) {
+  return () => {
+    window.localStorage.setItem(
+      "metrocalk:disclosure:inspector-component:Light",
+      "open",
+    );
+    projectionStore.getState().bulkLoad([
+      {
+        id: "e-key",
+        name: "Key Light",
+        parentId: null,
+        components: {
+          Transform: { x: 0, y: 4, z: 0 },
+          Light: { kind: "point", intensity: 60, r: 1, g: 1, b: 1 },
+        },
+      },
+      {
+        id: "e-fill",
+        name: "Fill Light",
+        parentId: null,
+        components: {
+          Transform: { x: 3, y: 4, z: 0 },
+          Light: { kind: "point", intensity: 60, r: 1, g: 1, b: 1 },
+        },
+      },
+      {
+        id: "e-rim",
+        name: "Rim Light",
+        parentId: null,
+        components: {
+          Transform: { x: -3, y: 4, z: 2 },
+          Light: { kind: "point", intensity: 12, r: 1, g: 1, b: 1 },
+        },
+      },
+      {
+        id: "e-crate",
+        name: "Crate",
+        parentId: null,
+        components: { Transform: { x: 0, y: 0, z: 0 }, ...extra },
+      },
+    ] as never);
+    projectionStore.getState().select("e-key");
+    projectionStore.getState().toggleSelect("e-fill");
+    projectionStore.getState().toggleSelect("e-rim");
+  };
+}
+
+/** WHAT `capscene::create_entity` ACTUALLY COMMITS — three position fields and nothing else.
+ *
+ *  This is the entity a user makes with Add > Entity, and it is why ADR-172 exists: a data-driven
+ *  form over these components offers three rows, so until this scene the editor could not rotate or
+ *  scale a fresh object by typing at all, while the renderer was already drawing it with an identity
+ *  rotation and a scale of 1. */
+function sparseTransformSetup() {
+  return () => {
+    projectionStore.getState().bulkLoad([
+      { id: "e-crate", name: "Crate", parentId: null, components: { Transform: { x: 1.5, y: 0, z: -2 } } },
+    ] as never);
+    projectionStore.getState().select("e-crate");
+  };
+}
+
+/** An object whose ONLY non-default property is its rotation, so the single reset in the sheet is the
+ *  rotation's and a click on it is unambiguous. */
+function rotatedOnlySetup() {
+  return () => {
+    projectionStore.getState().bulkLoad([
+      {
+        id: "e-boom",
+        name: "Boom Arm",
+        parentId: null,
+        components: { Transform: { x: 0, y: 0, z: 0, qx: YAW_45[0], qy: YAW_45[1], qz: YAW_45[2], qw: YAW_45[3], scale: 1 } },
+      },
+    ] as never);
+    projectionStore.getState().select("e-boom");
+  };
 }
 
 /** The dock track the Inspector actually lives in, at a window wide enough that the ≤760px stacking
@@ -1104,6 +2383,41 @@ function dockTrack(children: ReactNode) {
       {children}
     </div>
   );
+}
+
+/** THE SAME TRACK, WITH THE PANEL'S REAL HEIGHT CHAIN UNDER IT.
+ *
+ *  `dockTrack` above photographs a panel at the dock's WIDTH; it has no height, so a component that
+ *  fills the column it is given — which is what an empty state does — photographs at its natural size
+ *  in it and the arrangement being claimed is not in the frame. The chain reproduced here is the one
+ *  `EditorDocks` builds: a bounded column -> `.mtk-dock-panel.mtk-scroll` (whose `> * { flex: none }`
+ *  is exactly what `InspectorEmpty` has to override) -> the panel. 300px, not 320: that is the width
+ *  the Inspector track actually ships at. */
+function inspectorColumn(children: ReactNode) {
+  return (
+    <div
+      data-testid="inspector-track"
+      style={{ width: 300, height: "100vh", display: "flex", flexDirection: "column", boxSizing: "border-box", borderLeft: "1px solid var(--mtk-border)", background: "var(--mtk-bg-panel)" }}
+    >
+      <div className="mtk-dock-panel mtk-scroll">{children}</div>
+    </div>
+  );
+}
+
+/** A scene with objects in it and NOTHING SELECTED — the state the Inspector is in most of the time
+ *  and the one it had never been photographed in. `HealthBar` is what makes an entity a requirer
+ *  (`deriveRel`), so this seeds the real signal rather than a hand-set flag. */
+function idleScene(withRequirer: boolean) {
+  return () => {
+    projectionStore.getState().bulkLoad([
+      { id: "e-player", name: "Player", parentId: null, components: { Transform: { px: 0, py: 0, pz: 0 } } },
+      { id: "e-ground", name: "Ground", parentId: null, components: { Transform: { px: 0, py: -1, pz: 0 } } },
+      ...(withRequirer
+        ? [{ id: "e-health", name: "Health Bar", parentId: null, components: { HealthBar: { width: 1 } } }]
+        : []),
+    ] as never);
+    // No `select()`. That is the whole point of the scene.
+  };
 }
 
 function inspectorScenes(): Scene[] {
@@ -1127,13 +2441,16 @@ function inspectorScenes(): Scene[] {
       setup: inspectorSetup(["MeshRenderer", "RigidBody", "Joint"]),
       expect: {
         present: [
-          // 9 Transform + 3 MeshRenderer + 2 RigidBody + 3 Joint.
-          ["[data-testid='prop-row']", 17],
-          // px/py/pz metres, rx/ry/rz degrees, sx/sy/sz multiples, and `RigidBody.mass` in kilograms —
+          // 7 Transform + 3 MeshRenderer + 2 RigidBody + 3 Joint. SEVEN, not nine: the Transform is
+          // drawn as three PROPERTIES - position, rotation, scale - over the eight scalars it is
+          // stored as, and the fourth quaternion component has no row because it is not an angle
+          // (ADR-172).
+          ["[data-testid='prop-row']", 15],
+          // x/y/z metres, three degree rows, one scale multiple, and `RigidBody.mass` in kilograms —
           // TEN, not nine. An adversarial review caught the miscount, and it matters more than an
           // off-by-one: `present` is at-least, so a scene that under-counts is a scene that would stay
           // green with a unit deleted. A unit the core states in prose and the editor never showed.
-          ["[data-testid='prop-unit']", 10],
+          ["[data-testid='prop-unit']", 8],
           // THE THREE CONTROLS THAT COULD NOT FIRE BEFORE. Two entity references and one asset
           // reference — the core declares eight such fields and the editor routed none of them.
           //
@@ -1149,7 +2466,7 @@ function inspectorScenes(): Scene[] {
           ["#mtk-prop-MeshRenderer-mesh.mtk-input--mono", 1],
           ["#mtk-prop-MeshRenderer-material.mtk-input--mono", 1],
           ["#mtk-prop-RigidBody-kind", 1],
-          // px 2.5, py 1.2, pz -0.75 and ry 45 differ from their declared defaults, so four rows offer a
+          // x 2.5, y 1.2, z -0.75 and a 45-degree yaw differ from their declared defaults, so four rows offer a
           // reset. The COUNT cannot say the other five must not, because `present` is at-least — an
           // unconditional reset on all seventeen rows satisfies it. The two `absent` entries below are
           // what actually state it, and they are stated per row, on values that ARE their default.
@@ -1174,7 +2491,10 @@ function inspectorScenes(): Scene[] {
         absent: [
           ".control", ".input", ".select", ".checkbox", ".mtk-field-row",
           "[aria-label='Reset Rotation X to 0']",
-          "[aria-label='Reset Scale X to 1']",
+          "[aria-label='Reset Scale to 1']",
+          // The fourth quaternion component had a box of its own until ADR-172 - one a user could
+          // type into and leave the document holding four numbers that are not a rotation.
+          "#mtk-prop-Transform-qw",
         ],
         // `Mast`, `Counterweight`, `dynamic` and `revolute` are `<option>` TEXT, so a claim about them
         // is a claim about what a reader can see. The asset reference is an `<input value=…>` and is
@@ -1184,13 +2504,13 @@ function inspectorScenes(): Scene[] {
         // limit of the panel. Closing gate: a `value_present` claim beside `text_present` in
         // `shoot.mjs`; owner is whoever next has that file free, since a concurrent lane holds it.
         text_present: [
-          "Position X", "Rotation Y", "Scale Z", "Cast shadows", "Mass",
+          "Position X", "Rotation Y", "Scale", "Cast shadows", "Mass",
           "Mast", "Counterweight", "dynamic", "revolute",
         ],
         // A ROW IS A ROW at this width: the label and the control it names share a line. Anchored on
         // one known control rather than "the first `.mtk-property-row__label`", because `same_line`
         // reads the first match of each selector and two unrelated first-matches can overlap by luck.
-        same_line: [["label[for='mtk-prop-Transform-px']", "#mtk-prop-Transform-px"]],
+        same_line: [["label[for='mtk-prop-Transform-x']", "#mtk-prop-Transform-x"]],
         // Every row whole inside a 320px track. The retired anatomy spent a fixed 92px on the label
         // and had no actions column at all, so this is the measurement that says the new one fits.
         unclipped: ["[data-testid='prop-row']"],
@@ -1222,15 +2542,15 @@ function inspectorScenes(): Scene[] {
         // five rows nobody can see and then reports them as clipped — correctly, because they are.
         // A claim about what a reader can reach has to say which rows those are.
         present: [
-          ["[data-state='open'] [data-testid='prop-row']", 12],
-          ["[data-state='open'] [data-testid='prop-unit']", 9],
+          ["[data-state='open'] [data-testid='prop-row']", 10],
+          ["[data-state='open'] [data-testid='prop-unit']", 7],
         ],
         absent: [".control", ".input", ".select", ".checkbox", ".mtk-field-row"],
         // THE DUAL OF THE SCENE ABOVE, and the reason both exist. The same two elements that must
         // share a line at 1200px must be on separate lines here, label first. A stylesheet that lost
         // the media query passes one of these scenes and fails the other, which is exactly the
         // discrimination a single capture cannot give.
-        stacked: [["label[for='mtk-prop-Transform-px']", "#mtk-prop-Transform-px"]],
+        stacked: [["label[for='mtk-prop-Transform-x']", "#mtk-prop-Transform-x"]],
         unclipped: ["[data-state='open'] [data-testid='prop-row']"],
         text_present: ["Position X", "Cast shadows"],
         text_absent: ["null", "undefined", "NaN", "No applicable renderer found"],
@@ -1257,14 +2577,14 @@ function inspectorScenes(): Scene[] {
         // when paired with "it did render", so the nine open Transform rows are claimed here too.
         present: [
           ["[data-testid='mount-edits']", 1],
-          ["[data-state='open'] [data-testid='prop-row']", 9],
+          ["[data-state='open'] [data-testid='prop-row']", 7],
         ],
         text_present: ["0 transactions since mount", "Position X"],
         // The failure states, spelled out: any non-zero count, and the specific fields whose declared
         // defaults are the ones a validator would inject.
         text_absent: [
           "1 transaction", "2 transactions", "3 transactions", "undefined", "NaN",
-          "No applicable renderer found", "No editable properties yet",
+          "No applicable renderer found", "No editable properties",
         ],
       },
       render: () => <EditProbe />,
@@ -1274,24 +2594,706 @@ function inspectorScenes(): Scene[] {
       looking_for:
         "THE RESET ACTUALLY RESETS. The same probe, with the first reset in the sheet clicked — " +
         "`Position X`, which is 2.5 against a declared default of 0. One transaction, and it is " +
-        "`Transform.px=0`: the value the schema declares, on the field whose row was clicked, through " +
+        "`Transform.x=0`: the value the schema declares, on the field whose row was clicked, through " +
         "the same `setField` path a typed edit takes. Without this scene the whole reset affordance " +
         "is proven by the presence of a button, and a button that emits nothing photographs the same",
       viewport: { width: 620, height: 1100 },
       setup: inspectorSetup([]),
       // The FIRST reset in the document is Position X's — Transform is the group that opens by
-      // default and `px` is its first field. Clicking by testid rather than by position in a list
+      // default and `x` is its first row. Clicking by testid rather than by position in a list
       // would be no more specific: they all carry the same one, which is why the assertion below
       // names the field the click must have reached.
       click: ["[data-testid='prop-reset']"],
       expect: {
         present: [["[data-testid='edit-log']", 1]],
-        text_present: ["1 transaction since mount", "e-boom.Transform.px=0"],
+        text_present: ["1 transaction since mount", "e-boom.Transform.x=0"],
         // Not two transactions, and not the wrong field: a reset that also nudged its neighbours, or
         // one wired to the row below it, would still print "a transaction" and look right.
-        text_absent: ["2 transactions", "Transform.py", "Transform.ry", "undefined", "NaN"],
+        text_absent: ["2 transactions", "Transform.y", "Transform.rotation", "undefined", "NaN"],
       },
       render: () => <EditProbe />,
+    },
+    {
+      id: "inspector-multi-selection",
+      looking_for:
+        "THE PANEL THIS REPOSITORY DID NOT HAVE. Three lights are selected and the Inspector is " +
+        "about the SELECTION, not about whichever one was clicked last: `3 lights selected` over " +
+        "the three names, and one form. `Intensity` reads MIXED and is empty, because 60, 60 and 12 " +
+        "are not one value and printing the primary's 60 would be a claim about all three; `Kind` " +
+        "shows `point`, because that one IS true of all three. Before this, the panel named one " +
+        "light, showed its numbers, and editing them moved one object out of three",
+      viewport: { width: 1200, height: 900 },
+      setup: multiSelectionSetup(),
+      expect: {
+        present: [
+          // The Transform section (7 rows - position mixed on x/z, agreed on y; rotation and scale
+          // agreed) plus the 5-row Light group opened by the setup.
+          ["[data-testid='prop-row']", 12],
+          // MIXED IS A STATE OF THE CONTROL, not a banner over the panel: the box that cannot show
+          // one value shows none, and says so where the value would be.
+          ["#mtk-prop-Light-intensity[data-mixed='1']", 1],
+          ["#mtk-prop-Transform-x[data-mixed='1']", 1],
+          // AND THE ROTATION THE THREE AGREE ABOUT IS NOT MIXED - they are all unrotated, which is a
+          // fact the panel could not state at all before it read an absent quaternion as identity.
+          ["#mtk-prop-Transform-qy:not([data-mixed])", 1],
+          // AND THE AGREED FIELD IS NOT MIXED. Without this the scene passes for a panel that gave
+          // up and marked everything mixed, which would be exactly as useless as the old one.
+          ["#mtk-prop-Light-kind:not([data-mixed])", 1],
+        ],
+        // The single-object header is gone: no mono entity id, because there is no single entity.
+        absent: [".control", ".input", ".select", ".checkbox", "[data-testid='inspectorEmpty']"],
+        // `Light.kind`'s curated title is "Type" (ADR-172 — a row is titled by the property it edits,
+        // never by the component it sits inside; it used to read `Light: Light`). The claim names what
+        // the panel actually prints, which is the whole reason a scene states its text.
+        text_present: ["3 lights selected", "Key Light", "Rim Light", "Intensity", "point"],
+        // `e-key` is the primary. A panel that printed it would be the OLD panel wearing a new count.
+        text_absent: ["e-key", "e-rim", "null", "undefined", "NaN", "No applicable renderer found"],
+        same_line: [["label[for='mtk-prop-Light-intensity']", "#mtk-prop-Light-intensity"]],
+        unclipped: ["[data-testid='prop-row']", "[data-testid='multiTitle']"],
+      },
+      render: () => dockTrack(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-multi-partial",
+      looking_for:
+        "WHAT THE PANEL WILL NOT OFFER, AND WHY, IN A SENTENCE. Two lights and a crate are " +
+        "selected. `Transform` is shared so its rows are there; `Light` is not, so its five fields " +
+        "are withheld — and the panel says how many and names the component, rather than quietly " +
+        "showing a shorter form. It is not politeness: `Op::SetField` CREATES a component it does " +
+        "not find, so offering `Light.intensity` here would give the crate a one-field Light in an " +
+        "undoable transaction that reported itself as a success",
+      viewport: { width: 1200, height: 900 },
+      setup: () => {
+        multiSelectionSetup()();
+        projectionStore.getState().toggleSelect("e-crate");
+      },
+      expect: {
+        present: [
+          ["[data-testid='multiPartial']", 1],
+          ["#mtk-prop-Transform-x", 1],
+        ],
+        // The withheld control is ABSENT, not disabled: a greyed row invites a click that can never
+        // work, and this panel already has a sentence for the same information.
+        absent: ["#mtk-prop-Light-intensity", "#mtk-prop-Light-kind", "[data-testid='multiEmpty']"],
+        text_present: ["4 objects selected", "3 lights", "5 properties are on only some of these", "Light", "select one object"],
+        text_absent: ["null", "undefined", "NaN", "No applicable renderer found"],
+        unclipped: ["[data-testid='multiPartial']"],
+      },
+      render: () => dockTrack(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-multi-edit-writes-to-all",
+      looking_for:
+        "ONE GESTURE, ONE TRANSACTION, THREE OBJECTS. The same probe that proves a single-object " +
+        "edit, with the first reset in the sheet clicked on a three-light selection - `Position X`, " +
+        "which is 0, 3 and -3 and therefore MIXED. Two claims in one click: a mixed row still offers " +
+        "its reset (setting them all back to the declared default is exactly what a reset is for, " +
+        "and an unbound single field offering none is a different case), and the write goes through " +
+        "the BATCHED path - the log reads `3x.Transform.x=0`, ONE entry, not three `setField`s " +
+        "that would have been three undo steps behind a toast promising one",
+      // 1120, not 1000: the Transform section is seven rows where the data-driven form drew three,
+      // so the same panel is ~120px taller. A window that cuts the log off the bottom is a fact about
+      // the window (the harness reports it correctly), not about the panel.
+      viewport: { width: 620, height: 1160 },
+      setup: multiSelectionSetup(),
+      click: ["[data-testid='prop-reset']"],
+      expect: {
+        present: [["[data-testid='edit-log']", 1]],
+        text_present: ["1 transaction since mount", "3x.Transform.x=0"],
+        // Not three transactions, and never the single-entity path - `e-key.Transform.px` is what
+        // the old panel would have written, and it would have looked like a success too.
+        text_absent: ["2 transactions", "3 transactions", "e-key.Transform", "undefined", "NaN"],
+      },
+      render: () => <EditProbe />,
+    },
+    {
+      id: "inspector-transform-is-a-property",
+      looking_for:
+        "THE OBJECT A USER ACTUALLY MAKES. `Add > Entity` commits `Transform{x, y, z}` and nothing " +
+        "else, so the data-driven form drew three rows labelled `x`, `y` and `z` - no titles, no " +
+        "units, no resets - and offered no way to rotate or scale it by typing at all. The renderer " +
+        "was drawing that same object with an identity rotation and a scale of 1 the whole time, " +
+        "because `capscene::local_transform` reads an absent field as the identity. Seven rows now: " +
+        "Position in metres, Rotation in DEGREES, Scale as a multiple - the property, not the storage",
+      viewport: { width: 1200, height: 900 },
+      setup: sparseTransformSetup(),
+      expect: {
+        present: [
+          ["[data-testid='prop-row']", 7],
+          ["[data-testid='prop-unit']", 7],
+          // The rows that did not exist for this entity before ADR-172, named individually: a scene
+          // that only counted seven would stay green if the seven were the wrong seven.
+          ["#mtk-prop-Transform-qx", 1],
+          ["#mtk-prop-Transform-qy", 1],
+          ["#mtk-prop-Transform-qz", 1],
+          ["#mtk-prop-Transform-scale", 1],
+          // Position X is 1.5 and Z is -2, so exactly two rows differ from their declared default.
+          // Rotation and scale are AT the identity, which is the point: they are shown, and they do
+          // not pretend to be edits.
+          ["[aria-label='Reset Position X to 0']", 1],
+        ],
+        absent: [
+          ".control", ".input", ".select", ".checkbox", ".mtk-field-row",
+          // Not a fourth quaternion box, and not the empty state either - an object carrying only a
+          // Transform used to be one row short of nothing.
+          "#mtk-prop-Transform-qw",
+          "[data-testid='inspectorEmpty']",
+          "[aria-label='Reset Rotation Y to 0']",
+          "[aria-label='Reset Scale to 1']",
+        ],
+        text_present: ["Position X", "Position Z", "Rotation X", "Rotation Y", "Rotation Z", "Scale", "Crate"],
+        // The raw wire names are what the panel printed for two milestones. A label reading exactly
+        // `qw` or `qx` is the old behaviour returning.
+        text_absent: ["null", "undefined", "NaN", "No applicable renderer found", "No editable properties yet"],
+        same_line: [["label[for='mtk-prop-Transform-qy']", "#mtk-prop-Transform-qy"]],
+        unclipped: ["[data-testid='prop-row']"],
+      },
+      render: () => dockTrack(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-rotation-is-one-transaction",
+      looking_for:
+        "A ROTATION IS ONE PROPERTY AND ONE TRANSACTION. The object below is rotated 45 degrees " +
+        "about Y and is otherwise at its defaults, so the single reset in the sheet is the " +
+        "rotation's. Clicking it writes ONE entry - a normalised quaternion carrying all four stored " +
+        "components - through `set_rotation`. The path it replaces wrote `qx`, `qy`, `qz` and `qw` as " +
+        "four independent boxes: four transactions, four undo steps, and a quaternion of length not " +
+        "equal to 1 in between, which is not a rotation at all",
+      viewport: { width: 620, height: 1000 },
+      setup: rotatedOnlySetup(),
+      click: ["[data-testid='prop-reset']"],
+      expect: {
+        present: [
+          ["[data-testid='edit-log']", 1],
+          // AND THE BOX SHOWS WHAT WAS COMMITTED, WHICH IS A SEPARATE CLAIM AND THE ONE THAT CAUGHT A
+          // REAL DEFECT. `set_rotation` is a command, not the optimistic `setField` echo, so the
+          // projection answers a round trip later and the panel holds the angle the user asked for in
+          // the meantime. The first capture of this scene showed `45` under a log that said the
+          // identity had been written: the pending angle was keyed on an object `readTransform`
+          // rebuilds every render, so the click's own re-render threw it away. `aria-valuenow` is the
+          // committed value the control is showing, so this is a claim about the number on screen.
+          //
+          // jsdom cannot see this one - measured, not assumed: `TransformSection.test.tsx` asserts the
+          // same behaviour and stays green with the defect reintroduced, because a store update in a
+          // separate `act` does not reproduce the click's own synchronous re-render. This scene is the
+          // gate for it.
+          ["#mtk-prop-Transform-qy[aria-valuenow='0']", 1],
+        ],
+        // The 45 degrees that were there before the click, and the reset that offered to remove them:
+        // both are gone because the value IS the default now.
+        absent: [
+          "#mtk-prop-Transform-qy[aria-valuenow='45']",
+          "[aria-label='Reset Rotation Y to 0']",
+        ],
+        // The identity quaternion, to three decimals, on one entity.
+        text_present: ["1 transaction since mount", "1x.Transform.rotation=[0.000,0.000,0.000,1.000]"],
+        // Never the per-field path: `Transform.qy` in this log is the defect this scene exists for.
+        text_absent: ["2 transactions", "4 transactions", "Transform.qy", "Transform.qw", "undefined", "NaN"],
+      },
+      render: () => <EditProbe />,
+    },
+
+    // -- the three absences (ADR-170) -------------------------------------------------------------
+    //
+    // The Inspector has three states in which it has nothing to show, and until this pass they were
+    // three different things: a grey sentence in the top-left corner, a second grey sentence, and —
+    // one tab over, in the same dock — a properly composed `EmptyPanelState`. None of the three had
+    // ever been photographed, which is how two of them stayed sentences through four UI milestones.
+    {
+      id: "inspector-nothing-selected",
+      looking_for:
+        "THE STATE THIS PANEL IS IN MOST OF THE TIME. Nothing is selected, and instead of `Select an " +
+        "entity to inspect.` pinned to the top-left of a 300x900 column, the panel says what will " +
+        "appear here and how to get there — centred in the column, in the same `EmptyPanelState` " +
+        "anatomy the Relations tab next door has always used. Under it, and ONLY when there is one, " +
+        "the one list that is useful with no selection and is not a second copy of something already " +
+        "on screen: the objects waiting for a binding. Clicking one makes the selection the panel is " +
+        "missing. The column is not filled — it is composed",
+      viewport: { width: 320, height: 900 },
+      setup: idleScene(true),
+      expect: {
+        present: [
+          ["[data-testid='inspectorNoSelection']", 1],
+          // The SHARED anatomy, asserted as the class and not as the testid — a bare `<div>` carrying
+          // the same hook would satisfy a testid-only claim, and a bare `<div>` is what was there.
+          ["[data-testid='inspectorEmpty'].mtk-empty-panel", 1],
+          ["[data-testid='requirer']", 1],
+          // The shared card surface. `Requirers` used to spell `.mtk-card` out by hand on a raw
+          // `<button>` because `Card` could not carry its `cand` hook.
+          ["button.mtk-card.cand", 1],
+        ],
+        absent: ["[data-testid='inspectorNoFields']", "[data-icon-missing]"],
+        text_present: ["Select an object to edit its properties", "Needs binding", "Health Bar"],
+        text_absent: ["Select an entity to inspect", "none found", "undefined", "NaN"],
+        unclipped: ["[data-testid='inspectorEmpty']", "[data-testid='requirer']"],
+        // THE CENTRING, MEASURED. `.mtk-dock-panel.mtk-scroll > *` sets `flex: none` on this element,
+        // so without the inline `flex: 1 0 auto` the composition is ~250px tall at the top of a 900px
+        // column with 650px of nothing under it — which is the defect, and it photographs as "a small
+        // tidy block" unless the height is claimed.
+        min_height: [["[data-testid='inspectorNoSelection']", 700]],
+      },
+      render: () => inspectorColumn(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-nothing-selected-quiet",
+      looking_for:
+        "THE SAME STATE WITH NOTHING WAITING — the common one, and the reason the list below the " +
+        "empty state is a guest rather than a fixture. No heading, no `none found`, no hairline: a " +
+        "section that renders `none found` into a column that is already empty is noise added to " +
+        "answer noise. One centred statement, and quiet",
+      viewport: { width: 320, height: 900 },
+      setup: idleScene(false),
+      expect: {
+        present: [["[data-testid='inspectorEmpty'].mtk-empty-panel", 1]],
+        absent: ["[data-testid='requirers']", "[data-testid='requirer']", "[data-icon-missing]"],
+        text_present: ["Select an object to edit its properties"],
+        text_absent: ["Needs binding", "none found", "Select an entity to inspect", "undefined", "NaN"],
+        unclipped: ["[data-testid='inspectorEmpty']"],
+      },
+      render: () => inspectorColumn(<Inspector client={recordingClient(() => {})} />),
+    },
+    {
+      id: "inspector-no-editable-fields",
+      looking_for:
+        "THE PANEL'S OTHER ABSENCE: an object IS selected — it is named in the header, with its id " +
+        "under it — and nothing on it exposes an editable field. Same anatomy as the state above, and " +
+        "the sentence no longer names a control that does not exist. `add a component to this object` " +
+        "instructed the reader to press something no surface in this editor offers and no `/core` op " +
+        "stands behind; the entity's own action list, which is a right-click away, is what can " +
+        "actually give it fields",
+      viewport: { width: 320, height: 900 },
+      setup: () => {
+        projectionStore.getState().bulkLoad([
+          { id: "e-marker", name: "Marker", parentId: null, components: {} },
+        ] as never);
+        projectionStore.getState().select("e-marker");
+      },
+      expect: {
+        present: [["[data-testid='inspectorNoFields'].mtk-empty-panel", 1]],
+        absent: ["[data-testid='inspectorNoSelection']", "[data-icon-missing]"],
+        text_present: ["Marker", "No editable properties", "Right-click it"],
+        text_absent: ["add a component", "undefined", "NaN"],
+        unclipped: ["[data-testid='inspectorNoFields']"],
+      },
+      render: () => inspectorColumn(<Inspector client={recordingClient(() => {})} />),
+    },
+  ];
+}
+
+// -- materials ------------------------------------------------------------------------------------
+
+/** Selects an object that CAN take a finish, with an optional stored one. `MeshRenderer.mesh` is what
+ *  makes it shadeable - the picker refuses on the COMPONENT, not on the field it is about to write. */
+function materialSetup(material?: string) {
+  return () => {
+    const MeshRenderer: Record<string, unknown> = { mesh: "sha256:9f3c81aa4e07", castShadows: true };
+    if (material !== undefined) MeshRenderer.material = material;
+    projectionStore.getState().bulkLoad([
+      { id: "e-boom", name: "Boom Arm", parentId: null, components: { Transform: { px: 0 }, MeshRenderer } },
+    ] as never);
+    projectionStore.getState().select("e-boom");
+  };
+}
+
+// ── the stage composer (north star #2) ────────────────────────────────────────────────────────────
+
+function composerScenes(): Scene[] {
+  /** THE WIDTH THE COMPOSER ACTUALLY SHIPS AT. `.mtk-stage-footer` is `min(680px, stage − 32)`, so 680
+   *  is the widest it is ever drawn and the width at which its row either fits or does not. A composer
+   *  photographed at 900 would prove nothing about the label that has to sit between a leading + and a round commit —
+   *  and the one thing this row can do wrong is run out of horizontal space. */
+  const COMPOSER_WIDTH = 680;
+
+  /** The client the composer really talks to, stated once. Every field here mirrors `protocol.ts`
+   *  (`CatalogSearch.items[]` is `CatalogItem`, `describe` returns `DescribeResponse`) rather than
+   *  being invented beside the scene — the terrain-preset lesson: a capture of a catalogue is only
+   *  evidence if the catalogue is shaped like the real one. */
+  function composerClient(over: Partial<Record<string, unknown>> = {}): EditorClient {
+    return {
+      catalogSearch: () => Promise.resolve({ items: [] }),
+      describe: () =>
+        Promise.resolve({ created: null, kind: null, source: null, price: null, seam: "generate", balance: 100 }),
+      // Never settles: the scenes that photograph a generation want its PROGRESS state held still.
+      generate: () => new Promise(() => {}),
+      gizmoSelect: () => Promise.resolve(),
+      ...over,
+    } as unknown as EditorClient;
+  }
+
+  const COMPOSER_DOORS = {
+    onImport: () => {},
+    onBrowseAssets: () => {},
+    onDrawShape: () => {},
+  } as const;
+
+  /** A composer on the ground it is drawn on, AT THE END OF THE STAGE IT LIVES AT. The card is
+   *  near-white and the stage behind it is a pale grey; photographed on a white frame the elevation
+   *  that separates them is invisible, and the whole argument for a floating surface is that it reads
+   *  as one.
+   *
+   *  The BOTTOM alignment is not decoration either, and the first version of these scenes got it wrong
+   *  in a way only the PNG showed: with the composer at the top of a short frame, the `+` menu — which
+   *  asks for `top-start` — had nowhere above it to go, so the edge-aware placement put it straight
+   *  over the composer, under a caption claiming it opened upward. `.mtk-stage-footer` anchors this
+   *  card to the bottom of the stage; a scene that photographs it anywhere else is photographing a
+   *  geometry no user is ever in. */
+  function OnStage({ children }: { children: ReactNode }) {
+    return (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "flex-end",
+          minHeight: 420,
+          padding: 24,
+          background: "var(--mtk-bg-inset)",
+          width: COMPOSER_WIDTH + 48,
+          boxSizing: "border-box",
+        }}
+      >
+        <div style={{ width: "100%", minWidth: 0 }}>{children}</div>
+      </div>
+    );
+  }
+
+  return [
+    {
+      id: "describe-composer",
+      looking_for:
+        "NORTH STAR #2 AS ONE CONTROL. A lifted card: a round + on the left, the field, and a ROUND " +
+        "commit on the right — the only circular control in the engine, which is what says 'this row " +
+        "commits a sentence' before a word has been read. The two round marks must be the SAME size " +
+        "and sit on the same centre line as the field's text, or the row reads as three unrelated " +
+        "things that happen to be adjacent. The commit is off, because the field is empty, and " +
+        "hovering it says why",
+      viewport: { width: COMPOSER_WIDTH + 80, height: 560 },
+      expect: {
+        present: [
+          ["[data-testid='describebar']", 1],
+          ["[data-testid='describe']", 1],
+          ["[data-testid='describeBtn']", 1],
+          ["[data-testid='describeAddBtn']", 1],
+        ],
+        // The empty state is EMPTY: no reading, no outcome, no leftover panel. A composer that shows
+        // a cost line before anything is typed is quoting a price for nothing.
+        absent: ["[data-testid='describePreview']", "[data-testid='describePanel']", "[data-icon-missing]"],
+        text_absent: ["null", "undefined", "NaN"],
+        same_line: [
+          ["[data-testid='describeAddBtn']", "[data-testid='describe']"],
+          ["[data-testid='describe']", "[data-testid='describeBtn']"],
+        ],
+        unclipped: ["[data-testid='describebar']", "[data-testid='describe']", "[data-testid='describeBtn']"],
+        // A commit small enough to miss is not a commit. 40px is `--mtk-control-comfortable` — the
+        // constitution's "large hit targets", and the size both reference sheets draw this control at
+        // — and the circle has to hold it on BOTH axes or it is a lozenge.
+        min_height: [["[data-testid='describeBtn']", 40]],
+        min_width: [["[data-testid='describeBtn']", 40]],
+        max_width: [["[data-testid='describeBtn']", 40]],
+      },
+      render: () => (
+        <OnStage>
+          <DescribeBar client={composerClient()} form="floating" {...COMPOSER_DOORS} />
+        </OnStage>
+      ),
+    },
+    {
+      id: "describe-composer-preview",
+      looking_for:
+        "WHAT IT WILL DO AND WHAT IT WILL COST, BEFORE THE COMMIT. One quiet line under the field: a " +
+        "tick, the real catalogue item the typed words resolve to, its source, and the price as a " +
+        "badge. This is the legible-cost contract at the gesture rather than in a receipt — a reader " +
+        "must be able to tell a free local hit from a paid marketplace one WITHOUT reading the " +
+        "number, which is why the badge is toned and not just worded",
+      viewport: { width: COMPOSER_WIDTH + 80, height: 560 },
+      type: [["[data-testid='describe']", "steel sword"]],
+      expect: {
+        present: [["[data-testid='describePreview']", 1], ["[data-testid='previewCost']", 1]],
+        absent: ["[data-testid='describePanel']", "[data-icon-missing]"],
+        text_present: ["Will place", "Steel Sword", "marketplace", "3 tokens"],
+        text_absent: ["null", "undefined", "NaN"],
+        // The reading sits UNDER the row it explains, never beside the commit it is qualifying.
+        stacked: [["[data-testid='describe']", "[data-testid='describePreview']"]],
+        same_line: [["[data-testid='describePreview']", "[data-testid='previewCost']"]],
+        unclipped: ["[data-testid='describePreview']", "[data-testid='previewCost']"],
+      },
+      render: () => (
+        <OnStage>
+          <DescribeBar
+            client={composerClient({
+              catalogSearch: () =>
+                Promise.resolve({
+                  items: [
+                    {
+                      id: "c2",
+                      label: "Steel Sword",
+                      bucket: "props",
+                      category: "weapon",
+                      source: "marketplace",
+                      provides: [],
+                      requires: [],
+                      price: 3,
+                    },
+                  ],
+                }),
+            })}
+            form="floating"
+            {...COMPOSER_DOORS}
+          />
+        </OnStage>
+      ),
+    },
+    {
+      id: "describe-composer-offer",
+      looking_for:
+        "NO MATCH IS AN OFFER, NOT A DEAD END. Nothing in the catalogue answers the sentence, so the " +
+        "composer states that and hands over three real ways forward — generate (priced, in the " +
+        "words of the price), browse, or build it yourself. What is being checked is that the three " +
+        "buttons sit on ONE line under the sentence at this width, and that the priced one is " +
+        "unmistakably the priced one",
+      viewport: { width: COMPOSER_WIDTH + 80, height: 560 },
+      // Typed with a trailing newline, which puppeteer sends as Enter — the driver types AFTER every
+      // click, so a type-then-click gesture is not expressible and Enter is the real one anyway: it
+      // is how this field is committed by anyone who did not reach for the mouse.
+      type: [["[data-testid='describe']", "a flying dragon\n"]],
+      expect: {
+        present: [
+          ["[data-testid='describePanel']", 1],
+          ["#genBtn", 1],
+          ["#browseMarket", 1],
+          ["#buildManual", 1],
+        ],
+        // The reading is withdrawn while the OUTCOME is up: two statements about one sentence, one of
+        // which is now stale, is the C11 defect this panel was built against.
+        absent: ["[data-testid='describePreview']", "[data-icon-missing]"],
+        text_present: ["No match", "Generate with AI", "tokens"],
+        text_absent: ["null", "undefined", "NaN"],
+        same_line: [["#genBtn", "#browseMarket"], ["#browseMarket", "#buildManual"]],
+        stacked: [["[data-testid='describe']", "[data-testid='describePanel']"]],
+        unclipped: ["#genBtn", "#browseMarket", "#buildManual"],
+      },
+      render: () => (
+        <OnStage>
+          <DescribeBar client={composerClient()} form="floating" {...COMPOSER_DOORS} />
+        </OnStage>
+      ),
+    },
+    {
+      id: "describe-composer-add-menu",
+      looking_for:
+        "THE OTHER HALF OF THE SAME QUESTION. 'Describe it', 'import it' and 'browse for it' are three " +
+        "answers to *get something into my scene*, and only one of them used to be on the stage. The " +
+        "+ opens the other two beside a third — each row a mark, a verb and one line saying what it " +
+        "is for. The menu opens UPWARD, because the composer sits at the bottom of the stage and a " +
+        "menu that drops off the edge is a menu nobody can read",
+      viewport: { width: COMPOSER_WIDTH + 80, height: 560 },
+      click: ["[data-testid='describeAddBtn']"],
+      expect: {
+        present: [
+          ["[data-testid='describeAddImport']", 1],
+          ["[data-testid='describeAddBrowse']", 1],
+          ["[data-testid='describeAddDraw']", 1],
+        ],
+        absent: ["[data-icon-missing]"],
+        text_present: ["Import a file", "Browse the asset library", "Draw it in the viewport"],
+        text_absent: ["null", "undefined", "NaN"],
+        stacked: [
+          ["[data-testid='describeAddImport']", "[data-testid='describeAddBrowse']"],
+          ["[data-testid='describeAddBrowse']", "[data-testid='describeAddDraw']"],
+        ],
+        unclipped: ["[data-testid='describeAddImport']", "[data-testid='describeAddBrowse']", "[data-testid='describeAddDraw']"],
+      },
+      render: () => (
+        <OnStage>
+          <DescribeBar client={composerClient()} form="floating" {...COMPOSER_DOORS} />
+        </OnStage>
+      ),
+    },
+  ];
+}
+
+function materialScenes(): Scene[] {
+  /** THE WIDTH THESE ARE READ AT, AND WHY IT IS NOT A COMFORTABLE ONE. The Inspector track is 300px
+   *  and a section inside it has ~234px of content box, measured in the packaged `.exe`. A swatch
+   *  grid photographed at 560 would fit six columns and prove nothing about the column count a user
+   *  gets.
+   *
+   *  INSIDE the function, not beside it, and that is not a style choice: `SCENES` calls this during
+   *  module evaluation, so a module-level `const` here is still in its temporal dead zone when the
+   *  call happens. The bundle then throws on load and the driver reports ZERO scenes — the exact
+   *  hoisting trap `shell()`'s own header records, reproduced within an hour of reading it. */
+  const MATERIAL_TRACK = 234;
+  return [
+    {
+      id: "material-specimen",
+      looking_for:
+        "EVERY FINISH THE RENDERER KNOWS, ON ONE SHEET, AT A SIZE A HUMAN CAN JUDGE — the material " +
+        "twin of `icon-set-specimen`, and it exists because the 56px swatch in the picker is too " +
+        "small to see a shading regression in. What a reader is checking is DISCRIMINATION: no two " +
+        "spheres alike, and each one recognisable as the surface its numbers describe. Chrome " +
+        "(roughness 0.06) must be visibly higher-contrast than Metal (0.35) — a small blown cap, a " +
+        "dark body, a bright floor bounce — and Plastic, a dielectric, must be the FLATTEST of the " +
+        "seven rather than the shiniest, which is precisely what the first version of this shading " +
+        "got backwards. Gold and Copper must read warm, Rust dark and dry. Every sphere must look " +
+        "ROUND: a gradient with no rim term photographs as a disc",
+      viewport: { width: 900, height: 560 },
+      expect: {
+        present: [
+          ["[data-testid='material-specimen']", 6],
+          ["[data-testid='material-specimen'] .mtk-swatch__sphere circle", 6],
+          // Three gradients per sphere: body, hotspot, contact shadow. Sharing ids across instances is
+          // the "all my materials are grey" bug, and the count is what makes it visible here.
+          ["[data-testid='material-specimen'] radialGradient", 18],
+        ],
+        // The numbers are on the sheet, because a specimen that does not say what it is showing
+        // cannot be checked against the renderer's table by the person reading it.
+        text_present: ["Chrome", "roughness 0.06", "metalness 1", "Plastic", "roughness 0.55"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='material-specimen']"],
+      },
+      render: () => (
+        <div style={{ padding: 20, background: "var(--mtk-bg-base)", font: "var(--mtk-font-ui)" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
+            {MATERIAL_PRESETS.map((preset) => (
+              <div
+                key={preset.id}
+                data-testid="material-specimen"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 14,
+                  padding: 12,
+                  borderRadius: 12,
+                  background: "var(--mtk-bg-panel)",
+                  border: "1px solid var(--mtk-border-subtle)",
+                  minWidth: 0,
+                }}
+              >
+                <span
+                  style={{
+                    flex: "none",
+                    display: "flex",
+                    width: 104,
+                    height: 104,
+                    borderRadius: 10,
+                    background: "var(--mtk-bg-inset)",
+                  }}
+                >
+                  <MaterialSphere preset={preset} size={104} />
+                </span>
+                <span style={{ minWidth: 0 }}>
+                  <span style={{ display: "block", fontSize: 14, fontWeight: 600, color: "var(--mtk-text)" }}>
+                    {preset.label}
+                  </span>
+                  <span style={{ display: "block", fontSize: 11, color: "var(--mtk-text-muted)" }}>
+                    metalness {preset.metallic}
+                  </span>
+                  <span style={{ display: "block", fontSize: 11, color: "var(--mtk-text-muted)" }}>
+                    roughness {preset.roughness}
+                  </span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ),
+    },
+    {
+      id: "material-picker",
+      looking_for:
+        "THE FINISH AS A PICTURE, at the width the Inspector actually gives it. Seven swatches - " +
+        "Default plus the six the renderer knows - each a SHADED SPHERE rather than a word: gold " +
+        "warm with a dark side, chrome high-contrast with a tight hotspot, plastic a pale matte " +
+        "ball, rust dark and barely reflective. They must be visibly DIFFERENT from one another, " +
+        "because the whole argument for drawing them is that a reader can tell metal from plastic " +
+        "without reading. Chrome is the one that is set, and it says so twice - a ring AND a tick - " +
+        "so the answer survives greyscale. The one priced control is BELOW the free grid",
+      width: MATERIAL_TRACK,
+      setup: materialSetup("chrome"),
+      expect: {
+        present: [
+          ["[data-testid='materialPicker']", 1],
+          // Seven tiles, and six DRAWINGS. A tile whose sphere failed to render is still a tile, and
+          // it photographs as a well-formed control with an empty well - the `[data-icon-missing]`
+          // failure one level down. Default's mark is an Icon, not a gradient, so six spheres carry
+          // three gradients each.
+          ["[data-testid^='material-'][aria-pressed]", 7],
+          [".mtk-swatch__sphere", 6],
+          [".mtk-swatch__sphere radialGradient", 18],
+          // The selection, stated as a SHAPE and not only as a colour.
+          [".mtk-swatch.is-selected .mtk-swatch__tick", 1],
+          ["#rustier", 1],
+        ],
+        absent: ["[data-icon-missing]"],
+        // Every finish names itself. A grid of unlabelled spheres is prettier and unusable.
+        text_present: ["Default", "Metal", "Chrome", "Gold", "Copper", "Rust", "Plastic", "tokens"],
+        // The refusal and the imported-handle note belong to the OTHER two scenes; either one here
+        // would mean the panel mis-read a perfectly ordinary shadeable object.
+        text_absent: ["null", "undefined", "NaN", "no mesh to shade", "Imported finish"],
+        // NOTHING ELLIPSISES AND NOTHING IS CUT. 234px is where a three-column grid either fits or
+        // starts eating its own labels, which is the failure this width exists to catch.
+        unclipped: [".mtk-swatch", ".mtk-swatch__label", "#rustier"],
+        // A swatch small enough to be decorative is not a preview. 48px is the floor at which the
+        // difference between satin and mirror is still visible in the well.
+        min_height: [[".mtk-swatch__preview", 48]],
+        // The free grid comes FIRST. If the priced row ever floats above it, the panel is telling a
+        // beginner that changing a material costs money, which is the defect this panel repaired.
+        stacked: [[".mtk-swatch-grid", "#rustier"]],
+      },
+      render: () => <MaterialPanel client={createMockSession()} />,
+    },
+    {
+      id: "material-no-mesh",
+      looking_for:
+        "THE REFUSAL, BEFORE THE CLICK. An object with no MeshRenderer cannot take a finish - the " +
+        "field write has no component to land on - so every swatch is disabled and the panel says " +
+        "why in one plain sentence. What this replaces is a grid of live buttons that each produce " +
+        "an error after you press them",
+      width: MATERIAL_TRACK,
+      setup: () => {
+        projectionStore.getState().bulkLoad([
+          { id: "e-trigger", name: "Trigger Volume", parentId: null, components: { Transform: { px: 0 } } },
+        ] as never);
+        projectionStore.getState().select("e-trigger");
+      },
+      expect: {
+        present: [
+          ["[data-testid='material-unavailable']", 1],
+          // Disabled, all seven - `present` is at-least, so this is the claim that none of them is
+          // live rather than that one of them is dead.
+          ["[data-testid^='material-'][aria-pressed][disabled]", 7],
+          // AND THE PRICED ONE TOO. `ai_edit` patches the same component through the same validator,
+          // so it cannot land here either - and it was the one control on this panel still offering
+          // to spend two tokens on an edit that must fail. Found by reading this capture.
+          ["#rustier[disabled]", 1],
+        ],
+        text_present: ["no mesh to shade"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='material-unavailable']"],
+        // NOTHING IS SET, and nothing claims to be. A lit `Default` tile under a sentence saying no
+        // finish is possible is two statements disagreeing inside one column.
+        absent: [".mtk-swatch.is-selected"],
+      },
+      render: () => <MaterialPanel client={createMockSession()} />,
+    },
+    {
+      id: "material-imported",
+      looking_for:
+        "AN IMPORTED FINISH, NAMED. The stored value is a content handle the renderer has no preset " +
+        "for, so no swatch can carry the selection - and the honest reading of that is NOT 'nothing " +
+        "is set', which is what an unmarked grid would say. The note names the handle and says what " +
+        "Default would do; Default itself is NOT drawn as the current state",
+      width: MATERIAL_TRACK,
+      setup: materialSetup("mtkasset:9f3c81aa4e07"),
+      expect: {
+        present: [["[data-testid='material-foreign']", 1]],
+        // NOT ONE selected swatch. This is the assertion the scene exists for: the failure mode is a
+        // panel that silently lights up Default and tells the user their imported material is gone.
+        absent: [".mtk-swatch.is-selected"],
+        text_present: ["Imported finish", "mtkasset:9f3c81aa4e07", "Default"],
+        text_absent: ["null", "undefined", "NaN"],
+        // A handle is long and the column is 234px - it wraps, it does not run out of the panel.
+        unclipped: ["[data-testid='material-foreign']"],
+      },
+      render: () => <MaterialPanel client={createMockSession()} />,
     },
   ];
 }
@@ -1533,6 +3535,9 @@ function shell(
   looking_for: string,
   expect: Expect,
   click?: string[],
+  /** The projection the shell is photographed over. Without it every shell scene is the sample scene,
+   *  so the whole EMPTY regime — the state a first-run user is actually in — had never been in frame. */
+  setup?: () => void,
 ): Scene {
   const [width, height] = typeof size === "number" ? [size, 900] : size;
   return {
@@ -1540,6 +3545,7 @@ function shell(
     looking_for,
     viewport: { width, height },
     click,
+    setup,
     expect: {
       ...expect,
       present: [["[data-testid='viewport']", 1], ...(expect.present ?? [])],
@@ -1590,16 +3596,92 @@ function shellScenes(): Scene[] {
     1440,
     "the whole editor at a desktop width: Engines rail · left dock · stage · Inspector, all four " +
       "tracks open at once. This is the first capture in the repository that contains two panels, " +
-      "so it is the first one where a panel can be caught colliding with its neighbour",
+      "so it is the first one where a panel can be caught colliding with its neighbour. AND EACH " +
+      "DOCK FILLS THE CARD IT IS IN — the Inspector's empty state is centred in the column rather " +
+      "than sitting at the top of it, which is only possible because the panel owns the column",
     {
       present: [
         ["[data-testid='engine-rail']", 1],
         ["[data-testid='hierarchy']", 1],
         ["[data-testid='editor-header']", 1],
+        // The Inspector's no-selection state, in the shell, at the width it ships at (ADR-170).
+        ["[data-testid='inspectorNoSelection']", 1],
+        // NORTH STAR #2, ON THE STAGE, IN THE SHELL. It used to be three clicks and a scroll inside a
+        // collapsed disclosure in the Build workspace, which means no shell capture had ever contained
+        // it: a surface you must navigate to cannot be photographed beside its neighbours, and beside
+        // its neighbours is the only place a collision exists.
+        ["[data-testid='describebar']", 1],
+        ["[data-testid='stage-footer']", 1],
       ],
       // Wide open: the docks are panels, not rails. If this ever flips, the layout collapsed at a
       // width where it had room — the opposite defect to the stage being squeezed.
       absent: ["[data-testid='rail-left']"],
+      // A PANEL FILLS THE CARD IT IS DOCKED IN, MEASURED (ADR-170). Both shell docks were
+      // shrink-wrapped to their content inside a full-height card — 369px and 409px inside 804px,
+      // ~400px of blank card under each — and nothing here could see it, because every claim in this
+      // suite is about a panel's own box and both panels were perfectly well-formed. `fills` is the
+      // one claim that compares a child to the container it was given: the panel accounts for the
+      // whole card or it does not.
+      //
+      // It is the gate on the ROOT-CAUSE fix (`.mtk-workspace-panel { flex: 1 1 auto; height: 100% }`),
+      // and it is what everything downstream needs — the Hierarchy's virtualised tree gets its height
+      // from `.mtk-dock-panel__fill`, `.mtk-dock-panel.mtk-scroll` can only scroll a panel that is
+      // bounded, and an empty state can only be centred in a column that exists.
+      fills: [
+        [".mtk-shell-track--left > .mtk-shell-card", ["[data-testid='left-dock']"]],
+        [".mtk-shell-track--right > .mtk-shell-card", ["[data-testid='inspector-dock']"]],
+      ],
+      // THE STACK, PHOTOGRAPHED. The first-run card and the composer both want the bottom-centre of
+      // the stage, and both used to write their own `position: absolute; left: 50%`. They are one
+      // column now, in this order, and this is the claim that says so — R3 would catch them ON TOP of
+      // each other, but only `stacked` catches them in the wrong order.
+      stacked: [["[data-testid='onboarding']", "[data-testid='describebar']"]],
+      unclipped: ["[data-testid='describebar']", "[data-testid='describeBtn']"],
+    },
+  ),
+  // THE STATE A FIRST-RUN USER IS ACTUALLY IN, WHICH NO SHELL CAPTURE HAD EVER BEEN. Every scene above
+  // is the sample project; the empty one is the regime where the stage's two invitations — the centred
+  // card and the composer under it — are on screen together, and the only regime where they can
+  // collide. R3 decides that, not a reading of the layout.
+  shell(
+    "shell-empty-stage",
+    1440,
+    "THE EMPTY STAGE, WITH BOTH INVITATIONS ON IT. A centred card naming the ways in, and — under it, " +
+      "at the bottom of the stage — the composer that is the way in. They must not touch, and the " +
+      "card's primary action must be the one that leads to the composer: the header of `EmptyState` " +
+      "has promised a CTA that focuses the describe field since the day it was written, and until the " +
+      "composer reached the stage there was no field for it to focus",
+    {
+      present: [
+        ["[data-testid='emptyState']", 1],
+        ["[data-testid='emptyDescribe']", 1],
+        ["[data-testid='describebar']", 1],
+      ],
+      // The first-run card is the NON-empty scene's invitation; both at once would be two cards
+      // saying "start here" on one stage.
+      absent: ["[data-testid='onboarding']"],
+      text_present: ["Start with something tangible", "Describe it"],
+      // THE CARD, NOT THE WRAPPER. `emptyState` is `position: absolute; inset: 0` — a full-stage box
+      // that centres a card inside itself — so a claim on it says the STAGE is above the composer,
+      // which is both true and meaningless, and it reported a shared line (56–834 vs 774–822) on a
+      // layout with a 200px gap in it. The visible card is the thing a reader sees, so it is the
+      // thing the claim is about.
+      stacked: [["[data-testid='emptyStateCard']", "[data-testid='describebar']"]],
+      unclipped: ["[data-testid='describebar']", "[data-testid='emptyDescribe']"],
+    },
+    undefined,
+    // A PLAIN `reset()` HERE IS UNDONE A TICK LATER. `createMockSession` emits the sample scene
+    // asynchronously, after `setup` has run, so the obvious version of this photographs the sample
+    // under a caption about an empty stage — the exact class of lie this harness exists to stop
+    // (it failed that way first: `emptyState` found 0, `onboarding` found 1). Reset on the FIRST
+    // projection instead: one shot, and nothing re-emits after it, so the empty stage is the state
+    // the settle converges on. This is the state a user is in after File → New.
+    () => {
+      const stop = projectionStore.subscribe((state) => {
+        if (state.order.length === 0) return;
+        stop();
+        projectionStore.getState().reset();
+      });
     },
   ),
   shell(
@@ -1812,6 +3894,53 @@ function shellScenes(): Scene[] {
     },
   ),
 
+  // THE DRAWING SURFACE IS THE STAGE, so the only honest capture of it is the whole shell with the
+  // tool armed and an outline actually drawn — a panel photographed on its own would show the numbers
+  // and hide the thing they measure. Two scenes, because the empty state is the one a first-time user
+  // is in and it is the one where every control refuses (R9 reads exactly this frame).
+  shell(
+    // 1720 WIDE, AND THE NUMBER IS A MEASUREMENT. The drawing panel floats over the LEFT of the stage
+    // and the harness clicks an element's CENTRE, so at 1440 the stage's midpoint lands six pixels
+    // inside the panel and every corner-placing click is correctly ignored by `onStageSurface` — a
+    // scene that photographs an empty outline under a caption about a rectangle. It is also the honest
+    // window for this tool: a surface you draw on and a panel that measures the drawing both need room.
+    "shell-ground-sketch",
+    [1720, 900],
+    "the ground sketch with a 12 x 8 m rectangle drawn on the stage. What a reader is checking: the " +
+      "MEASUREMENT is the largest thing in the panel and reads in metres, not in clicks; the corner " +
+      "count, the area and the perimeter agree with each other; the live line names what the snap " +
+      "decided; and the panel sits beside the tool rail without covering the stage it is drawing on",
+    {
+      present: [["[data-testid='ground-sketch']", 1]],
+      // The dimensions are the claim. A panel that mounts and shows 0.00 x 0.00 is the empty-box
+      // defect wearing a drawing tool's name.
+      text_present: ["12.00 × 8.00 m", "96.00 m²", "4 corners"],
+      unclipped: ["[data-testid='ground-sketch']"],
+      text_absent: ["undefined", "NaN"],
+    },
+    [
+      "#vpDraw",
+      "[data-testid='viewport']",
+      "[data-testid='viewport']",
+      "[data-testid='viewport']",
+      "[data-testid='viewport']",
+    ],
+  ),
+  shell(
+    "shell-ground-sketch-empty",
+    [1440, 900],
+    "the ground sketch the instant it is armed, with nothing drawn — the state a first-time user is " +
+      "in. Every control here is refusing, so every one of them has to SAY WHY in words before it is " +
+      "pressed, and the panel has to give one instruction rather than an essay",
+    {
+      present: [["[data-testid='ground-sketch']", 1], ["[data-testid='ground-sketch-raise']", 1]],
+      text_present: ["Draw on the ground", "click on the ground to place the first corner"],
+      unclipped: ["[data-testid='ground-sketch']"],
+      text_absent: ["undefined", "NaN"],
+    },
+    ["#vpDraw"],
+  ),
+
   // THE FOUR OTHER THINGS THE LEFT DOCK CAN BE. The dock is a 300 px track between 980 and 1199 —
   // the narrowest it ever gets while still open — and which workspace is inside it is a click. The
   // scenes above photograph the default one, so on their own they would gate a fifth of the surface
@@ -1820,18 +3949,24 @@ function shellScenes(): Scene[] {
   // the Inspector, and the repair was to widen the track by hand after a human noticed.
   ...(
     [
-      ["build", "Build — place and create: the toolbar, the asset browser and the describe bar stacked in one 300 px column", "[data-testid='authbar']"],
+      // TWO MARKERS, and the second one is the asset library rather than a second reading of the
+      // toolbar. `authbar` mounts the instant the workspace does; the library's tiles arrive from a
+      // `catalog()` promise afterwards and take the frame from 35 controls to 104. A claim satisfied
+      // by the first of those photographs the second one arriving — which is exactly what the
+      // post-capture drift check kept reporting. The caption already named three things in this
+      // column; now it can only pass with two of them on screen.
+      ["build", "Build — place and create: the toolbar, the asset browser and the describe bar stacked in one 300 px column", "[data-testid='authbar']", "[data-testid='asset-item']"],
       ["terrain", "Terrain — the widest workspace in the dock, and the one that has already overflowed it once", "[data-testid='terrain-presets']"],
       ["physics", "Physics — numeric read-outs and a contact list, the shape most likely to demand width", "[data-testid='dropBall']"],
       ["gameplay", "Gameplay — roles, cinema and VFX stacked in a column narrower than any of them", "[data-testid='match-panel']"],
     ] as const
-  ).map(([engine, blurb, marker]) =>
+  ).map(([engine, blurb, ...markers]) =>
     shell(
       `shell-${engine}`,
       1000,
       `${blurb}. Photographed at 1000 px, where the dock is at its narrowest that is still open`,
       {
-        present: [[marker, 1]],
+        present: markers.map((m) => [m, 1] as [string, number]),
         // The stage floor is the point: a dock that will not yield takes the difference out of the
         // viewport, and this is the width where it has the least room to hide.
         min_width: [["[data-testid='left-dock']", 1]],
@@ -2218,23 +4353,48 @@ const NO_MATCH: MatchValidation = {
   lane_length_m: 0,
 };
 
+/** The authored scene the panel's own primary button produces — four actors on a 90 m lane, three
+ *  waves, and a cook that says yes. Copied from what `match_validate` answers after
+ *  `match_author_starter` in the packaged editor: numbers, not a shape, because the fourth section is
+ *  a grid of read-outs and a capture of it is a capture of proportion. */
+const AUTHORED_MATCH: MatchValidation = {
+  ok: true,
+  is_match_scene: true,
+  diagnostics: [],
+  cook_digest: "sha256:4c19e0",
+  actor_count: 4,
+  wave_count: 3,
+  lane_length_m: 90,
+};
+
 /** The three sections read four endpoints between them and mutate through six more. Only the reads
  *  matter to a capture, so the writes are absent and would throw — which is the point: a scene that
- *  silently mutated would be photographing a state no user gesture produced. */
-const gameplayClient = (roster: RoleRow[] = []) =>
-  ({
-    matchValidate: () => Promise.resolve(NO_MATCH),
+ *  silently mutated would be photographing a state no user gesture produced.
+ *
+ *  ONE EXCEPTION, AND IT IS THE POINT OF `gameplay-authored`: `matchAuthorStarter` is the panel's own
+ *  primary button, so a scene that photographs the authored state has to reach it the way a user
+ *  does. The flag is per-client and set by that call alone — a scene that never clicks the button
+ *  still sees `NO_MATCH`, which is what keeps the other three honest. */
+const gameplayClient = (roster: RoleRow[] = []) => {
+  let authored = false;
+  return ({
+    matchAuthorStarter: () => {
+      authored = true;
+      return Promise.resolve({ ok: true });
+    },
+    matchValidate: () => Promise.resolve(authored ? AUTHORED_MATCH : NO_MATCH),
     roleCatalog: () => Promise.resolve(GAMEPLAY_ROLES),
     roleStatus: () =>
       Promise.resolve({ roster, score: 0, scoreEntity: null, remaining: 0, companions: [], won: false, health: null, blocked: null }),
     cinemaCatalog: () => Promise.resolve(GAMEPLAY_SHOTS),
     cinemaList: () =>
-      Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: null }),
+      Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: null }),
     cameraProbe: () => Promise.resolve({ eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 45, cinematic: false, distance: 0 }),
     vfxCatalog: () => Promise.resolve(GAMEPLAY_EFFECTS),
     vfxList: () => Promise.resolve({ entity: null, layers: 0, particles: 0, reads: [], problems: [], message: "", reason: null }),
     vfxProbe: () => Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 }),
   }) as unknown as EditorClient;
+};
 
 /** `function`, not `const` — and the whole bundle refuses to load otherwise. `gameplayScenes()` is
  *  hoisted above `SCENES`, but a `setup: selectCrystal` reference is read while the array is being
@@ -2283,7 +4443,18 @@ function gameplayScenes(): Scene[] {
         ],
         // Two of the three closed by default, so the column is calm at rest. `[data-state]` is the
         // disclosure's own stable token — asserting on a class list would test the styling.
-        absent: ["[data-icon-missing]", "[data-testid='cinema-section'][data-state='open']", "[data-testid='vfx-section'][data-state='open']"],
+        absent: [
+          "[data-icon-missing]",
+          "[data-testid='cinema-section'][data-state='open']",
+          "[data-testid='vfx-section'][data-state='open']",
+          // NO GROUP DRAWS ITS OWN HEADING. `DisclosureSection` renders its `h3` inside
+          // `.mtk-disclosure__heading-wrap`; an `h3` or `h4` anywhere else in this panel is a group
+          // that built its own header, which is what made four groups look like four products. The
+          // other lane reached this workspace from the opposite direction and wrote this same claim;
+          // it is kept because it is the one selector that states the rule rather than its symptom.
+          "[data-testid='match-panel'] h3:not(.mtk-disclosure__heading-wrap)",
+          "[data-testid='match-panel'] h4",
+        ],
         text_present: ["Roles", "Cinematics", "Effects", "Select an object", "Create a starter match"],
         text_absent: ["undefined", "null", "NaN"],
         // A CLOSED SECTION STILL REPORTS ITS STATE, AND THIS IS A MEASUREMENT BECAUSE `text_present`
@@ -2349,6 +4520,33 @@ function gameplayScenes(): Scene[] {
       },
       viewport: { width: 760, height: 980 },
       setup: selectCrystal,
+      render: () => <MatchPanel client={gameplayClient()} />,
+    },
+    {
+      id: "gameplay-authored",
+      looking_for:
+        "THE STATE THE PANEL IS FOR, reached the way a user reaches it — by pressing the panel's own " +
+        "primary button. `Your match` is a fourth group and it must be the same section as the other " +
+        "three, with its read-outs inside it rather than a bare heading over a tile grid. No capture " +
+        "in this repository had ever contained this state",
+      expect: {
+        present: [
+          ["[data-testid='match-panel']", 1],
+          // Four now: Roles · Cinematics · Effects · Your match.
+          ["[data-testid='match-panel'] .mtk-disclosure", 4],
+          ["[data-testid='match-summary']", 1],
+        ],
+        absent: [
+          "[data-icon-missing]",
+          "[data-testid='match-panel'] h3:not(.mtk-disclosure__heading-wrap)",
+          "[data-testid='match-panel'] h4",
+        ],
+        text_present: ["Actors", "Waves", "Lane"],
+        text_absent: ["null", "undefined", "NaN"],
+      },
+      width: 300,
+      setup: selectNothing,
+      click: ["[data-testid='match-create']"],
       render: () => <MatchPanel client={gameplayClient()} />,
     },
   ];

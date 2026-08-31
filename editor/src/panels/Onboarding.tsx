@@ -4,7 +4,7 @@
 import { useState } from "react";
 import { Button } from "../theme/primitives";
 import { DisclosureSection } from "../theme/workspace";
-import { color, elevation, space, z } from "../theme/tokens";
+import { color, elevation, space } from "../theme/tokens";
 
 const FLAG = "mtk.onboarded.v1";
 
@@ -65,24 +65,22 @@ export function Onboarding({ show = true, onStart, onSkip }: OnboardingProps = {
           </Button>
         </>
       )}
-      // Overlaid on the STAGE, inside it — the same anchoring `PlayBadge` uses, and for the same
-      // reason: what the card talks about (place · bind · Play · Save) happens on the stage. It was
-      // `fixed` and centred on the WINDOW, which is a position that knows nothing about the docks:
-      // at 1000 px a 520 px card centred on the window overlapped the left dock by 192 px and took
-      // the clicks of whatever was under it. Percentages here are of the stage, so the card yields
-      // with the stage instead of ignoring it, and the grid stays the only thing that decides where
-      // the stage is.
-      onPointerDown={(e) => e.stopPropagation()}
-      onClick={(e) => e.stopPropagation()}
+      // A CHILD OF THE STAGE FOOTER, NOT ITS OWN ANCHOR. This card used to write
+      // `position: absolute; left: 50%; bottom: …` for itself — and so did the aim badge, and so did
+      // the composer that now sits under it, which is how the badge ended up painted across this
+      // card's headline. `.mtk-stage-footer` (App.tsx) declares that position once and stacks its
+      // children in reading order, so the card is an ordinary block here and cannot collide with a
+      // neighbour that shares its corner. It stays on the STAGE rather than the window for the reason
+      // that has always been true of it: at 1000px a 520px card centred on the WINDOW overlapped the
+      // left dock by 192px and took the clicks of whatever was under it.
+      // No `stopPropagation`: `stageInput.ts`'s `onStageSurface` is the one place that decides
+      // whether a pointer belongs to the stage or to chrome floating over it, and a per-overlay
+      // guard is the idiom that module superseded. See `PlayBadge` for the measurement.
+      // NO WIDTH AND NO MAX-HEIGHT HERE. Both belong to `.mtk-stage-footer`, which states them once for
+      // every surface anchored there — and an inline style beats every stylesheet rule, so a copy kept
+      // here would silently win against the column it is supposed to be part of.
       style={{
-        position: "absolute",
-        left: "50%",
-        bottom: space.lg,
-        transform: "translateX(-50%)",
-        zIndex: z.menu,
         boxSizing: "border-box",
-        width: `min(520px, calc(100% - ${space.xxl}px))`,
-        maxHeight: `calc(100% - ${space.xxxl}px)`,
         overflowX: "hidden",
         overflowY: "auto",
         margin: 0,

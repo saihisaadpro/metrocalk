@@ -90,6 +90,24 @@ export function RolesSection({ client }: { client: EditorClient }) {
   const currentRole = selected ? status.roster.find((r) => r.entity === selected)?.role ?? null : null;
   const assigned = status.roster.length;
 
+  // THE HEADER STATES THE GROUP'S CONDITION, which is what makes folding it the calm default rather
+  // than hiding it. Two lanes converged on the same anatomy here; this is the union of their two
+  // summaries — the live score while Play is running (so a folded scoreboard is still a scoreboard),
+  // the subject and its current role while authoring, and the size of the catalogue before there is
+  // anything to apply it to.
+  const subject = summary?.name ?? selected;
+  const condition = playing
+    ? `score ${status.score}`
+    : selected
+      ? currentRole
+        ? `${subject} · ${currentRole}`
+        : String(subject)
+      : assigned > 0
+        ? `${assigned} assigned`
+        : specs.length > 0
+          ? `${specs.length} to choose from`
+          : "needs a selection";
+
   return (
     // ONE SECTION, NOT AN `<h3>` AND A COLUMN OF DIVS. The three Gameplay sections each drew their own
     // heading, their own accent box, their own warning box and their own refusal box — four private
@@ -103,7 +121,7 @@ export function RolesSection({ client }: { client: EditorClient }) {
       data-testid="roles-section"
       title="Roles"
       icon={<Icon name="gameplay" size="md" />}
-      summary={assigned > 0 ? `${assigned} assigned` : specs.length > 0 ? `${specs.length} to choose from` : undefined}
+      summary={condition}
       storageKey="gameplay.roles"
       tone="card"
       density="compact"
@@ -195,7 +213,15 @@ export function RolesSection({ client }: { client: EditorClient }) {
         )}
       </div>
 
-      {specs.length > 0 && (
+      {/* AN EMPTY CATALOGUE MUST NOT RENDER AS NOTHING. `role_catalog` answers with nothing wherever
+          the gameplay sub-engine is absent — the browser dev build is exactly that case — and a
+          section that silently drops its only content leaves a header with a summary about cards that
+          are not there. Say why instead, the same sentence Cinematics and Effects say. */}
+      {specs.length === 0 ? (
+        <div data-testid="roles-unavailable" style={metaText}>
+          No roles are available here — the gameplay sub-engine runs in the desktop editor.
+        </div>
+      ) : (
       <ChoiceGrid label="Assign a role">
         {specs.map((spec) => (
           <ChoiceCard

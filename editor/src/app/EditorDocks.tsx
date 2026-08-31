@@ -27,11 +27,10 @@ import { LazyWorkspace } from "./LazyWorkspace";
 // shared workspace boundary as the other engines protects the stage's initial bundle while preserving
 // a named, polite loading state when an author actually opens either workspace.
 const AssetBrowser = lazy(() => import("../panels/AssetBrowser").then((module) => ({ default: module.AssetBrowser })));
-const DescribeBar = lazy(() => import("../panels/DescribeBar").then((module) => ({ default: module.DescribeBar })));
 const ShapeStudio = lazy(() => import("../panels/ShapeStudio").then((module) => ({ default: module.ShapeStudio })));
 const TerrainPanel = lazy(() => import("../panels/TerrainPanel").then((module) => ({ default: module.TerrainPanel })));
 const Diagnostics = lazy(() => import("../panels/Diagnostics").then((module) => ({ default: module.Diagnostics })));
-const AiEditPanel = lazy(() => import("../panels/AiEditPanel").then((module) => ({ default: module.AiEditPanel })));
+const MaterialPanel = lazy(() => import("../panels/MaterialPanel").then((module) => ({ default: module.MaterialPanel })));
 const JointPanel = lazy(() => import("../panels/JointPanel").then((module) => ({ default: module.JointPanel })));
 const PhysicsPanel = lazy(() => import("../panels/PhysicsPanel").then((module) => ({ default: module.PhysicsPanel })));
 const MatchPanel = lazy(() => import("../panels/MatchPanel").then((module) => ({ default: module.MatchPanel })));
@@ -52,9 +51,13 @@ export interface LeftDockProps {
   active: LeftWorkspace;
   onContextMenu: (id: string, x: number, y: number) => void;
   onStartPipe: () => void;
+  /** Arm the ground sketch: draw an outline in the viewport at world scale, then raise it. */
+  onStartDraw: () => void;
   onImport: () => void;
   onCollapse?: () => void;
   onPin?: () => void;
+  /** Open the Cutscene timeline in the Animate dock (the Gameplay workspace's Cinematics block). */
+  onOpenCutscene?: () => void;
 }
 
 function DockChromeAction({ onCollapse, onPin, label }: { onCollapse?: () => void; onPin?: () => void; label: string }) {
@@ -133,7 +136,7 @@ function sideEngineChrome(active: LeftWorkspace, entities: number, selected: str
   }
 }
 
-export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport, onCollapse, onPin }: LeftDockProps) {
+export function LeftDock({ client, active, onContextMenu, onStartPipe, onStartDraw, onImport, onCollapse, onPin, onOpenCutscene }: LeftDockProps) {
   const entities = useEntityOrder();
   const selected = useSelectedId();
   const chrome = sideEngineChrome(active, entities.length, selected);
@@ -175,6 +178,9 @@ export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport,
             <ShapeStudio client={client} />
             <div className="mtk-dock-section-heading">Other tools</div>
             <div className="mtk-quick-create" role="group" aria-label="Quick creation tools">
+              <Button data-testid="create-draw" variant="secondary" onClick={onStartDraw} title="Trace an outline on the ground in the viewport, at real size, then raise it into a solid">
+                <Icon name="draw" size="md" /> Draw on the ground
+              </Button>
               <Button data-testid="create-pipe" variant="secondary" onClick={onStartPipe} title="Draw a production pipe asset directly in the viewport">
                 <Icon name="pipe" size="md" /> Draw pipe
               </Button>
@@ -182,9 +188,11 @@ export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport,
                 <Icon name="import" size="md" /> Import
               </Button>
             </div>
-            <DisclosureSection title="Describe" summary="Optional assisted creation" defaultOpen={false} storageKey="create-describe">
-              <DescribeBar client={client} />
-            </DisclosureSection>
+            {/* WHERE `Describe` WENT. It was a collapsed `DisclosureSection` here, summarised "Optional
+                assisted creation", below Shape Studio and Other tools — three clicks and a scroll from
+                the stage for north star #2, under a label telling you not to bother. It is the stage
+                composer now (`.mtk-stage-footer`), always present, and this column keeps the two things
+                a Build workspace is actually for: making a shape, and finding one. */}
             <div className="mtk-dock-section-heading">Asset library</div>
             <AssetBrowser client={client} />
           </LazyWorkspace>
@@ -215,7 +223,7 @@ export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport,
         hidden={active !== "gameplay"}
         className="mtk-dock-panel mtk-scroll"
       >
-        {active === "gameplay" && <LazyWorkspace label="Gameplay workspace"><MatchPanel client={client} /></LazyWorkspace>}
+        {active === "gameplay" && <LazyWorkspace label="Gameplay workspace"><MatchPanel client={client} onOpenTimeline={onOpenCutscene} /></LazyWorkspace>}
       </div>
     </WorkspacePanel>
   );
@@ -263,8 +271,13 @@ export function InspectorDock({ client, active, onChange, onCollapse, onPin, onJ
                 <DisclosureSection title="Diagnostics" summary="Selection health and quick fixes" defaultOpen storageKey="inspect-diagnostics">
                   <Diagnostics client={client} />
                 </DisclosureSection>
-                <DisclosureSection title="Material" summary="Local presets and surface appearance" defaultOpen={false} storageKey="inspect-material">
-                  <AiEditPanel client={client} />
+                {/* OPEN BY DEFAULT (ADR-164). "What is this made of" is answered by looking, and the
+                    answer is a grid of shaded spheres that takes one glance — the reference sheet's
+                    Materials block is the first thing in its right column for the same reason. It was
+                    collapsed while it held six text buttons that spent tokens, which was the correct
+                    default for what it was and the wrong one for what it is. */}
+                <DisclosureSection title="Material" summary="Surface finish" defaultOpen storageKey="inspect-material">
+                  <MaterialPanel client={client} />
                 </DisclosureSection>
                 <DisclosureSection title="Object actions" summary="Reuse, hierarchy and placement" defaultOpen={false} storageKey="inspect-object-actions">
                   <TransformPanel client={client} />

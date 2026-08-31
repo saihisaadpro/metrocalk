@@ -63,6 +63,20 @@ pub enum Record {
     Edit(EditTx),
     /// A binding-by-intent (HealthBar → provider).
     Bind { from: String, to: String },
+    /// **A whole-selection field edit** (ADR-169's `multi_edit`), replayed as the same batched
+    /// transaction. ADR-172 added it: `Record::Edit` covers the ONE-object path and the batched path
+    /// had no record at all, so a selection edit survived a `.mtk` save (it is in the document) and
+    /// was silently lost by a session replay, which is the recovery path a crash uses.
+    MultiEdit {
+        ids: Vec<String>,
+        component: String,
+        field: String,
+        value: metrocalk_core::FieldValue,
+    },
+    /// **A whole-selection rotation** (ADR-172's `set_rotation`) — the quaternion as authored; replay
+    /// re-normalises it through the same verb, so a replayed document can no more hold a non-rotation
+    /// than a live one can.
+    SetRotation { ids: Vec<String>, quat: [f64; 4] },
     /// A describe-to-create (M3.2): a free-text query resolved + instantiated at a position. Replayed
     /// deterministically (same resolve + same id allocation) so the described entity is recreated.
     /// With the asset tier (M4) the resolved kind may also carry a mesh handle — re-derived from the
@@ -103,6 +117,8 @@ pub enum Record {
     CinemaRemove { id: String, index: usize },
     /// Cinematics - the authored pacing mood changed.
     CinemaMood { id: String, mood: String },
+    /// Cinematics - the frame the cutscene is composed and delivered in changed.
+    CinemaDelivery { id: String, delivery: String },
     /// VFX - one effect layer added to an object.
     VfxAdd {
         id: String,
@@ -112,7 +128,44 @@ pub enum Record {
     /// VFX - one effect layer removed by index.
     VfxRemove { id: String, index: usize },
     /// Cinematics - one shot appended to an object's cutscene.
-    CinemaShot { id: String, shot: String },
+    ///
+    /// `subject` names the object the shot FRAMES when that is not the cutscene's own owner. It is
+    /// `#[serde(default)]` so every log written before shots could film anything else still reads —
+    /// and it had to be added because replay called `add_shot_ops(engine, e, &shot, e)`, which pins
+    /// the subject to the owner: an establishing wide of the whole assembly reopened as a wide of
+    /// the one part, silently, with the shot count unchanged.
+    CinemaShot {
+        id: String,
+        shot: String,
+        #[serde(default)]
+        subject: Option<String>,
+    },
+    /// Cinematics - one shot's authored length changed.
+    CinemaShotSeconds {
+        id: String,
+        index: usize,
+        seconds: f32,
+    },
+    /// Cinematics - one shot moved to another position in the list.
+    CinemaMoveShot { id: String, from: usize, to: usize },
+    /// Cinematics - one shot re-framed in place.
+    CinemaShotFraming {
+        id: String,
+        index: usize,
+        edit: crate::cinema_intent::FramingEdit,
+    },
+    /// Cinematics - one shot pointed at a different object.
+    ///
+    /// Replayed rather than folded into [`Self::CinemaShot`] because the two are different moments:
+    /// the shot was added framing one thing and later re-aimed at another, and a log that only knew
+    /// the final answer could not describe an undo between them. An unresolvable subject leaves the
+    /// shot where it was, for the same reason a re-aimed shot is never silently redirected at the
+    /// owner - a wide that quietly became a close-up is not visible until the film is watched.
+    CinemaShotSubject {
+        id: String,
+        index: usize,
+        subject: String,
+    },
     /// Conditionals — one "only if" clause added to an object.
     ConditionAdd {
         id: String,
@@ -485,6 +538,14 @@ impl Log {
                         crate::cinema_intent::set_mood_ops(engine, e, &mood)
                             .is_ok_and(|(ops, _)| engine.commit("cinema-mood", ops).is_ok())
                     }),
+                Record::CinemaDelivery { id, delivery } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            crate::cinema_intent::set_delivery_ops(engine, e, &delivery)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-delivery", ops).is_ok())
+                        })
+                }
                 Record::VfxAdd {
                     id,
                     effect,
@@ -502,12 +563,58 @@ impl Log {
                         crate::vfx_intent::remove_effect_ops(engine, e, index)
                             .is_ok_and(|(ops, _)| engine.commit("vfx-remove", ops).is_ok())
                     }),
-                Record::CinemaShot { id, shot } => metrocalk_core::EntityId::from_loro_key(&id)
-                    .filter(|e| engine.entity_exists(*e))
-                    .is_some_and(|e| {
-                        crate::cinema_intent::add_shot_ops(engine, e, &shot, e)
-                            .is_ok_and(|(ops, _)| engine.commit("cinema-shot", ops).is_ok())
-                    }),
+                Record::CinemaShot { id, shot, subject } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            // An unresolvable subject replays onto the owner rather than dropping the
+                            // shot: a reopened project with one mis-aimed shot is recoverable, a
+                            // reopened project one shot short is not obviously wrong at all.
+                            let framed = subject
+                                .as_deref()
+                                .and_then(metrocalk_core::EntityId::from_loro_key)
+                                .filter(|s| engine.entity_exists(*s))
+                                .unwrap_or(e);
+                            crate::cinema_intent::add_shot_ops(engine, e, &shot, framed)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-shot", ops).is_ok())
+                        })
+                }
+                Record::CinemaShotSeconds { id, index, seconds } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            crate::cinema_intent::set_shot_seconds_ops(engine, e, index, seconds)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-seconds", ops).is_ok())
+                        })
+                }
+                Record::CinemaMoveShot { id, from, to } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            crate::cinema_intent::move_shot_ops(engine, e, from, to)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-move", ops).is_ok())
+                        })
+                }
+                Record::CinemaShotFraming { id, index, edit } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .is_some_and(|e| {
+                            crate::cinema_intent::set_shot_framing_ops(engine, e, index, &edit)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-framing", ops).is_ok())
+                        })
+                }
+                Record::CinemaShotSubject { id, index, subject } => {
+                    metrocalk_core::EntityId::from_loro_key(&id)
+                        .filter(|e| engine.entity_exists(*e))
+                        .zip(
+                            metrocalk_core::EntityId::from_loro_key(&subject)
+                                .filter(|s| engine.entity_exists(*s)),
+                        )
+                        .is_some_and(|(e, s)| {
+                            crate::cinema_intent::set_shot_subject_ops(engine, e, index, s)
+                                .is_ok_and(|(ops, _)| engine.commit("cinema-subject", ops).is_ok())
+                        })
+                }
                 Record::ConditionAdd { id, request } => {
                     metrocalk_core::EntityId::from_loro_key(&id)
                         .filter(|e| engine.entity_exists(*e))
@@ -729,6 +836,30 @@ impl Log {
                     .is_some_and(|e| capscene::set_part_active(engine, e, active).is_ok()),
                 Record::DeleteDeactivate { id } => EntityId::from_loro_key(&id)
                     .is_some_and(|e| capscene::delete_deactivate(engine, scene, e).is_ok()),
+                Record::MultiEdit {
+                    ids,
+                    component,
+                    field,
+                    value,
+                } => {
+                    let targets: Vec<EntityId> = ids
+                        .iter()
+                        .filter_map(|s| EntityId::from_loro_key(s))
+                        .collect();
+                    targets.len() == ids.len()
+                        && !targets.is_empty()
+                        && capscene::multi_edit(engine, &targets, &component, &field, &value)
+                            .is_ok()
+                }
+                Record::SetRotation { ids, quat } => {
+                    let targets: Vec<EntityId> = ids
+                        .iter()
+                        .filter_map(|s| EntityId::from_loro_key(s))
+                        .collect();
+                    targets.len() == ids.len()
+                        && !targets.is_empty()
+                        && capscene::set_rotation(engine, &targets, quat).is_ok()
+                }
                 Record::Deform { id, handles } => EntityId::from_loro_key(&id)
                     .is_some_and(|e| capscene::set_part_deform(engine, e, &handles).is_ok()),
                 Record::ApplyMarketplace {

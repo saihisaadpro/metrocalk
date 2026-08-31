@@ -55,6 +55,18 @@ export type ProjectionOp =
   | { op: "addEdge"; from: string; rel: string; to: string }
   | { op: "removeEdge"; from: string; rel: string; to: string };
 
+/** What a batched multi-entity edit did — or, when it refused, the one sentence that says why
+ *  (ADR-169). A property control that edits a whole selection must be able to answer "nothing
+ *  happened" with a reason; `boolean` could not, and this path is the one the Inspector now uses for
+ *  every field on a multi-selection. */
+export interface MultiEditResult {
+  ok: boolean;
+  /** How many entities the transaction wrote. `0` on a refusal — the pipeline is all-or-nothing. */
+  changed: number;
+  /** Plain-language refusal, `null` on success. */
+  reason: string | null;
+}
+
 /** A merge-validation rejection — the north-star "every 'no' explained". */
 export interface RejectInfo {
   clientOpId: string;
@@ -755,6 +767,22 @@ export interface CadReportPart {
   sourceFormat: string | null;
 }
 
+/** ADR-178 — which of the three things happened when File→Import ran. Mirrors `ImportOutcome`.
+ *
+ *  It exists because the shell used to reply `string | null` and `null` meant BOTH "you dismissed the
+ *  file dialog" and "this build could not read that file". The engine distinguished them internally
+ *  and discarded the distinction at the last statement before the wire, which left the only honest
+ *  sentence a caller could write as two answers joined by "or". */
+export type ImportOutcomeKind = "imported" | "cancelled" | "failed";
+
+/** The reply File→Import sends: the placed entity when there is one, and always which outcome it was
+ *  with the sentence to show for it. Mirrors `ImportDialogResponse`. */
+export interface ImportDialogResponse {
+  entityId: string | null;
+  outcome: ImportOutcomeKind;
+  message: string;
+}
+
 /** The per-part CAD import report aggregated from the ECS — the fidelity breakdown (the header) + a capped
  *  part list (the queryable body). "Explain every no" applied to import; nothing silent. Mirrors
  *  `CadReportResp`. */
@@ -1431,6 +1459,17 @@ export interface AssetLabResponse {
   bakeEvidence: AssetLabBakeEvidence | null;
 }
 
+/**
+ * Every `format` argument `scene_export` acts on — the mirror of `formats::EXPORT_ARGS`.
+ *
+ * It is the full set, not the three spellings the File menu used to hardcode, because the export
+ * dialog addresses a format by its CANONICAL EXTENSION (`extensions[0]` of its `FormatSpec`) rather
+ * than by a second hand-written mapping — and two of those canonical extensions (`stp`, `usda`) are
+ * spellings the old union did not name. `every_writable_format_is_addressable_by_its_canonical_extension`
+ * in `editor-shell/src/formats.rs` is the test that keeps the two sides of that derivation paired.
+ */
+export type SceneExportFormat = "glb" | "usda" | "usd" | "step" | "stp";
+
 /** One machine-readable fidelity decision from complete-scene export. */
 export interface SceneExportFidelity {
   status: "preserved" | "converted" | "omitted";
@@ -1785,6 +1824,40 @@ export interface ShapeReply {
   reason: string | null;
 }
 
+/** The ground sketch's whole live read-model (mirrors the Rust `sketch::State`).
+ *
+ *  One reply carries everything the drawing panel shows, so a click closes its own loop rather than
+ *  asking a second time what it just did. Every length is metres; every point is world space. */
+export interface GroundSketchState {
+  /** The tool is armed and the stage is taking clicks. */
+  active: boolean;
+  /** Corners placed so far, world space. */
+  points: [number, number, number][];
+  /** Where the next corner would land, or `null` when the cursor is not over the ground. */
+  cursor: [number, number, number] | null;
+  /** What decided `cursor`, in plain words ("grid", "locked angle", "closes the shape"). */
+  snap: string;
+  /** Taking the cursor's point right now would close the outline. */
+  closes: boolean;
+  /** The author already closed it: finished, waiting to be raised. */
+  closed: boolean;
+  /** Length of the segment being drawn (last corner → cursor). */
+  segmentM: number;
+  perimeterM: number;
+  areaM2: number;
+  widthM: number;
+  depthM: number;
+  /** The construction plane's height. */
+  planeY: number;
+  /** Snap pitch; `0` is freehand. */
+  gridM: number;
+  angleSnap: boolean;
+  /** The outline could become a solid right now. */
+  canBuild: boolean;
+  /** One sentence: what to do next, or why it cannot be built yet. Never empty. */
+  message: string;
+}
+
 /** The editable recipe a shape entity's `ShapeRecipe.source` field stores (canonical JSON). */
 export interface ShapeRecipeSource {
   v: number;
@@ -1938,6 +2011,12 @@ export interface CameraProbe {
   /** True only while a cutscene owns the view. */
   cinematic: boolean;
   distance: number;
+  /** The rectangle the picture is COMPOSED for, in surface fractions `[x, y, width, height]` from
+   *  the top-left: the visible viewport, inset to the delivery frame while a cutscene composes for
+   *  one. */
+  frame: [number, number, number, number];
+  /** The rectangle the viewer can SEE. Its difference from `frame` is the letterbox. */
+  visibleRect: [number, number, number, number];
 }
 
 /** One effect card in the VFX catalogue. */
@@ -1974,6 +2053,126 @@ export interface ShotSpec {
   adds: string;
 }
 
+/** How much of the frame the subject fills. */
+export type ShotSize = "extreme_wide" | "wide" | "full" | "medium" | "close" | "extreme_close";
+/** Where the camera stands, relative to the subject's own facing. */
+export type ShotAngle = "front" | "three_quarter" | "profile" | "behind" | "low" | "high";
+/** What the camera does over the shot's length. */
+export type ShotMove = "hold" | "push_in" | "pull_out" | "orbit" | "crane_up" | "crane_down";
+
+/** One choice on one framing axis, published by the side that validates it. */
+export interface FramingOption {
+  value: string;
+  label: string;
+  blurb: string;
+}
+
+/** The frame a cutscene is composed and DELIVERED in.
+ *
+ *  Not a ratio on the wire: the author picked a frame, and a float would lose which one. The ratios
+ *  live in Rust, beside the solver that fits against them; the words the picker shows come from
+ *  `FramingCatalog.deliveries`, which is published by the same side that validates them. */
+export type DeliveryFrame = "viewport" | "widescreen" | "scope" | "academy" | "square" | "vertical";
+
+/** The whole framing vocabulary plus the bounds a shot must respect. */
+export interface FramingCatalog {
+  sizes: FramingOption[];
+  angles: FramingOption[];
+  motions: FramingOption[];
+  /** The shortest a shot may be authored, seconds. */
+  minSeconds: number;
+  /** The longest, seconds. */
+  maxSeconds: number;
+  /** The most shots one cutscene may hold. */
+  maxShots: number;
+  /** Moves for which strength does nothing — the dial is disabled, with a reason, on these. */
+  stillMotions: string[];
+  /** The frames a cutscene may be delivered in — the shape its shots are composed for. */
+  deliveries: FramingOption[];
+}
+
+/** One shot with its numbers — what the timeline draws and the shot inspector edits. */
+export interface ShotRow {
+  /** Stable across a reorder. */
+  id: string;
+  /** Position in the list, 0-based. */
+  index: number;
+  /** The sentence. */
+  reads: string;
+  /** The AUTHORED length in seconds — what the duration control edits. */
+  seconds: number;
+  /** What it runs for once the mood has scaled it. Calm is 2.5x, so these usually differ. */
+  effectiveSeconds: number;
+  /** Where the shot starts on the cutscene clock, seconds. */
+  startSeconds: number;
+  /** The first instant this shot is on screen ALONE, seconds on the cutscene clock — what the
+   *  timeline seeks to when the user opens this shot. Absolute, so no caller does arithmetic on a
+   *  boundary the solver owns: `startSeconds + blendSeconds` lands a hair BELOW the strict `local <
+   *  blend` test in f32 and reports a 99.99999% transition rather than the shot. */
+  openSeconds: number;
+  /** How long this shot takes to become itself, seconds — its opening blend, `0` on the first.
+   *
+   *  `startSeconds` is the one instant of a shot at which that shot is NOT what you see: the
+   *  transition weight there is zero, so the frame is the END of the shot before. "Open shot 3"
+   *  means `startSeconds + blendSeconds`, and the number that defines the window comes from the
+   *  side that draws it. */
+  blendSeconds: number;
+  size: ShotSize;
+  angle: ShotAngle;
+  motion: ShotMove;
+  /** How strong the move is, 0..1. Inert for `hold`. */
+  amount: number;
+  /** The object this shot FRAMES — not necessarily the cutscene's owner. */
+  subject: string;
+  /** That object's display name. */
+  subjectName: string;
+}
+
+/** One object a shot could be pointed at, with the two facts that decide whether it is the right one. */
+export interface SubjectCandidate {
+  /** The entity key `cinemaSetShotSubject` takes. */
+  id: string;
+  /** What the outliner calls it. */
+  name: string;
+  /** The heading it is listed under, in the author's language — `"This object"`, `"What it is part
+   *  of"`, `"What it is made of"`, `"Beside it"`, or `"Matches"` for a search. Sent by the engine
+   *  rather than derived here, so the ranking and its headings cannot drift apart. */
+  group: string;
+  /** How many DRAWN parts are under it — what the camera will actually be fitted to. The number that
+   *  tells a 378-part assembly apart from the one bracket that shares most of its name. */
+  parts: number;
+  /** `false` when nothing under it is drawn: the shot would be composed on its ORIGIN inside a
+   *  metre-ish fallback box — a plausible camera pointed at nothing. */
+  framable: boolean;
+  /** This is the object the shot frames right now. */
+  current: boolean;
+}
+
+/** The subject picker's list — ranked by the scene's own hierarchy, or the answer to a search. */
+export interface SubjectCatalog {
+  /** The cutscene's own object, and the default a shot frames. */
+  owner: string;
+  ownerName: string;
+  /** What the shot being edited frames right now. */
+  current: string | null;
+  /** The rows, already in the order they should be drawn. */
+  candidates: SubjectCandidate[];
+  /** The query these rows answer, trimmed by the engine. Empty for the ranked default list. */
+  query: string;
+  /** How many objects matched in total — `candidates.length` is how many fitted. */
+  matches: number;
+  /** `true` when the list was cut short, so the UI says so instead of implying completeness. */
+  truncated: boolean;
+}
+
+/** A change to one shot's framing. An absent axis means "leave it alone", never "reset it". */
+export interface FramingEdit {
+  size?: string;
+  angle?: string;
+  motion?: string;
+  amount?: number;
+}
+
 /** What a completed cinematics command answers with. */
 export interface CinemaReply {
   entity: string | null;
@@ -1981,13 +2180,92 @@ export interface CinemaReply {
   seconds: number;
   /** The authored pacing dial that drives effective shot duration and transition length. */
   mood: "calm" | "normal" | "tense";
-  /** The cutscene read back as sentences, one line per shot. */
+  /** The frame this cutscene is composed and delivered in. */
+  delivery: DeliveryFrame;
+  /** The cutscene read back as sentences, one line per shot. Flattened from `rows`. */
   reads: string[];
+  /** The same shots with their numbers. */
+  rows: ShotRow[];
   /** Continuity warnings in plain language (a jump cut, opening tight, a rushed shot). */
   problems: string[];
   message: string;
   reason: string | null;
 }
+
+/** What the cutscene timeline's viewport preview answers with — the frame now on the stage.
+ *
+ *  `eye` / `lookAt` / `fovDeg` are on the wire deliberately. They are the only externally checkable
+ *  evidence that the preview posed the camera at a PARTICULAR place rather than at any place, which
+ *  is what turns "the preview is the frame Play films" into an assertion instead of a hope. */
+export interface CinemaPreviewReply {
+  /** Whether the cutscene camera is holding the viewport right now. `false` after a successful exit
+   *  AND after any refusal, so one field answers "who has the camera" in every case. */
+  active: boolean;
+  entity: string | null;
+  /** Where on the cutscene clock this frame is, seconds — clamped into the cut, so what comes back
+   *  is the moment actually filmed rather than the moment asked for. */
+  seconds: number;
+  /** Which shot is on screen, 0-based. `null` when nothing is being previewed. */
+  shotIndex: number | null;
+  /** How many shots the cutscene holds, so a surface that never read the shot list can still say
+   *  "shot 2 of 5" — the stage badge is a long way from the panel that did. */
+  shots: number;
+  /** That shot's sentence. */
+  reads: string;
+  /** The display name of the object the shot FRAMES — not necessarily the cutscene's owner. */
+  subjectName: string;
+  /** How far through the shot this moment is, 0..1. */
+  progress: number;
+  /** True while the frame is a transition between two shots. */
+  blending: boolean;
+  /** Where the camera stands, world units. */
+  eye: [number, number, number];
+  /** The point it is aimed at. */
+  lookAt: [number, number, number];
+  /** Vertical field of view, degrees. */
+  fovDeg: number;
+  message: string;
+  /** Set iff the camera did not move, and says why. */
+  reason: string | null;
+}
+
+/** ADR-175 — a render, in progress or finished.
+ *
+ *  ONE shape for start, poll and cancel: a progress bar and a ledger are the same six numbers read at
+ *  different moments, and a surface that had to switch between two shapes is a surface that can show
+ *  the stale one. */
+export interface RenderReply {
+  /** Whether a job is running right now. */
+  running: boolean;
+  /** Whether the job this describes has finished — successfully or not. */
+  done: boolean;
+  entity: string | null;
+  /** How many frames the plan holds. */
+  frames: number;
+  /** How many files exist on disk so far. */
+  written: number;
+  /** The pixel size the frames are written at, from the first one actually captured. `0` until then —
+   *  a size guessed from the window would be a claim the files may not honour. */
+  width: number;
+  height: number;
+  fps: number;
+  /** The span of the cutscene clock being filmed. */
+  seconds: number;
+  /** Where the files are going — or, for a single still, the file itself. */
+  folder: string;
+  /** The name the frames share, before the number. */
+  stem: string;
+  bytes: number;
+  elapsedMs: number;
+  /** Frames that could not be written, each with its own sentence. */
+  failures: string[];
+  message: string;
+  /** Set iff the request was refused, and says why. */
+  reason: string | null;
+}
+
+/** What a render is asked to film: the whole cut, or one shot of it. `null` is the whole cut. */
+export type RenderScopeIndex = number | null;
 
 export interface ConditionSpec {
   kind: string;

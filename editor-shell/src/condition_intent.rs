@@ -57,14 +57,20 @@ pub struct ClauseRequest {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConditionSpec {
-    /// Stable kind key.
+    /// Stable kind key — AND the card's icon name (ADR-137).
+    ///
+    /// The catalog used to carry a separate `icon: &'static str` holding one character per entry, and
+    /// in all fifty-nine entries across the five catalogs that character was a per-`kind` constant:
+    /// the field was one contract stated twice, in two languages, which is exactly the drift ADR-134
+    /// is about. It was also thirty-five colour EMOJI, which the editor is a monochrome light
+    /// workbench and cannot draw. `editor/src/theme/icons.tsx` keys its drawings on these kinds, so
+    /// there is nothing left to keep in sync — `check-icon-vocab.mjs` fails if a kind here has no
+    /// mark there.
     pub kind: &'static str,
     /// Card label.
     pub label: &'static str,
     /// One line of what it means.
     pub blurb: &'static str,
-    /// Card glyph.
-    pub icon: &'static str,
     /// What the user must supply: `none` | `number` | `object`.
     pub needs: &'static str,
     /// The sentence fragment, with `{n}` / `{name}` blanks — the thing the user actually reads.
@@ -80,7 +86,6 @@ pub fn condition_specs() -> Vec<ConditionSpec> {
             kind: "score_at_least",
             label: "The Score is at least…",
             blurb: "gate this behind points the player has already earned",
-            icon: "★",
             needs: "number",
             reads: "the Score is at least {n}",
         },
@@ -88,7 +93,6 @@ pub fn condition_specs() -> Vec<ConditionSpec> {
             kind: "score_under",
             label: "The Score is under…",
             blurb: "only while the player is still below a score",
-            icon: "☆",
             needs: "number",
             reads: "the Score is under {n}",
         },
@@ -96,7 +100,6 @@ pub fn condition_specs() -> Vec<ConditionSpec> {
             kind: "still_active",
             label: "It hasn't been used yet",
             blurb: "this object has not been collected or beaten",
-            icon: "◆",
             needs: "none",
             reads: "it hasn't been used yet",
         },
@@ -104,7 +107,6 @@ pub fn condition_specs() -> Vec<ConditionSpec> {
             kind: "touched_by_player",
             label: "The PLAYER touched it",
             blurb: "only when you walk into it — a companion or a stray crate will not do",
-            icon: "🎮",
             needs: "none",
             reads: "the player touched it",
         },
@@ -112,7 +114,6 @@ pub fn condition_specs() -> Vec<ConditionSpec> {
             kind: "touched_by_companion",
             label: "A COMPANION touched it",
             blurb: "only when one of your companions walks into it, not you",
-            icon: "♥",
             needs: "none",
             reads: "a companion touched it",
         },
@@ -120,7 +121,6 @@ pub fn condition_specs() -> Vec<ConditionSpec> {
             kind: "other_gone",
             label: "Another object is gone",
             blurb: "that collectible has been collected, or that enemy beaten",
-            icon: "✧",
             needs: "object",
             reads: "{name} is gone",
         },
@@ -128,7 +128,6 @@ pub fn condition_specs() -> Vec<ConditionSpec> {
             kind: "other_still_there",
             label: "Another object is still there",
             blurb: "that object has NOT been collected or beaten yet",
-            icon: "◇",
             needs: "object",
             reads: "{name} is still there",
         },

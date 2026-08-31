@@ -176,3 +176,78 @@ export function analyzeNativeImportLifecycle(records) {
     pending,
   };
 }
+
+/**
+ * Did the drag helper refuse the gesture because a window that is NOT the editor covered the drop point?
+ *
+ * The distinction is the whole point. A foreign window taking the foreground mid-drag (a console another
+ * tool spawned, a notification toast, a driver overlay) is an accident of a shared desktop and is worth
+ * retrying. The editor covering its OWN drop target is a product defect — a modal that swallows drops —
+ * and retrying that would turn a real bug into a flaky test that eventually passes.
+ *
+ * WHY THIS LIVES HERE AND HAS A TEST
+ * ----------------------------------
+ * The previous version of this predicate was a private function in the cinematic spec that matched
+ *
+ *   /DROP_TARGET: pid=\d+ hwnd=(\d+)/
+ *
+ * against helper output whose only DROP_TARGET line is, and always has been,
+ *
+ *   DROP_TARGET: hwnd=2295898 title='metrocalk editor'
+ *
+ * There is no `pid=` in it. The match therefore returned null on every log ever produced, the predicate
+ * returned false unconditionally, and `startOleDropSurvivingOcclusion` — a loop written to take up to
+ * three attempts — could never take its second. The one production run that a foreign window stole
+ * ended, after a single attempt, in an error explaining that a retry was not warranted.
+ *
+ * Two of the six previous production runs died in this step. The retry meant to survive that was, in
+ * effect, not installed. So the predicate is now exported, and the tests beside it are fed the VERBATIM
+ * output of a real helper run: a format drift breaks the test rather than silently disarming the retry.
+ *
+ * @param {string} log combined stdout+stderr of one `scripts/ole-drop-file.ps1` attempt
+ * @returns {boolean} true when the gesture was refused because something else owned the drop point
+ */
+export function occludedByForeignWindow(log) {
+  const gesture = /DROP_GESTURE: target-hit-test-failed: under=\d+ root=(\d+)/.exec(log ?? "");
+  // No hit-test failure at all: the attempt died of something else, and this predicate has no opinion.
+  if (!gesture) return false;
+  const target = /DROP_TARGET: hwnd=(\d+)/.exec(log ?? "");
+  if (!target) {
+    // "I could not read the log" must never be delivered as "the editor blocked itself". That
+    // substitution is the whole reason this function needed rewriting.
+    throw new Error(
+      "The drag helper reported a hit-test failure but printed no parsable DROP_TARGET line, so whether "
+        + `a foreign window owned the drop point cannot be answered from this log:\n${log}`,
+    );
+  }
+  return gesture[1] !== target[1];
+}
+
+/**
+ * Did the synthetic gesture strand before the application was ever involved?
+ *
+ * `ole-drop-file.ps1` prints its first four lines while setting up — the resolved target, the geometry,
+ * the file, and what is under the cursor at the source point — and everything after that only once the
+ * drag has produced an outcome. A log that stops after `DROP_UNDER_CURSOR`, with no `DROP_GESTURE` and
+ * no `DROP_RESULT`, is a drag that never finished: the helper is still inside ole32's modal loop.
+ *
+ * That is worth retrying and a hit-test refusal naming the editor's own root is not, for the same
+ * reason in both directions: this one never asked the application for anything, so it cannot be evidence
+ * of a defect in the application.
+ *
+ * HONEST LIMIT, because this predicate decides whether a failure is allowed a second chance: a hang
+ * inside the application's OWN `DragEnter` would leave exactly this log, since the helper prints nothing
+ * between starting the drag and its outcome. The helper's output cannot separate the two. What can is
+ * the run's own lifecycle evidence — the app emits a `hovered` phase when it accepts the drag, and
+ * `native-import-lifecycle.json` preserves it for every run. A stranded gesture that DID reach the
+ * application will have that record; one that never reached it will not. If this retry ever starts
+ * firing repeatedly, that file is the thing to read before widening it further.
+ *
+ * @param {string} log combined stdout+stderr of one `scripts/ole-drop-file.ps1` attempt
+ * @returns {boolean} true when the gesture produced no outcome at all
+ */
+export function gestureStrandedBeforeTheApplication(log) {
+  const text = String(log ?? "");
+  if (!/DROP_UNDER_CURSOR:/.test(text)) return false;
+  return !/DROP_GESTURE:/.test(text) && !/DROP_RESULT:/.test(text);
+}

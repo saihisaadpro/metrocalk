@@ -1,13 +1,37 @@
-//! DescribeBar — describe-to-create (north-star #2), the front door (M10.10 / C1). The bar owns its FULL
-//! outcome in one place: a local/marketplace **match → place + select** the result; **no match → an explicit
-//! inline panel under the field** with actionable controls — ［ ✦ Generate with AI · ~N tokens ］ ·
-//! ［ Browse marketplace ］ · ［ Build manually ］ — never a passive, button-less footer line ("Generate?",
-//! "last resort"). Generate → a progress state → place + select the generated result (the M6 placeholder-
-//! first stream-in, ADR-017). Create is **disabled while the field is empty** (C5 — no enabled-inert CTA),
-//! and every outcome surfaces a toast AT THE GESTURE (C11), not only the status gutter.
+//! DescribeBar — describe-to-create (north-star #2), the front door. The bar owns its FULL outcome in one
+//! place: a local/marketplace **match → place + select** the result; **no match → an explicit inline panel
+//! under the field** with actionable controls — ［ ✦ Generate with AI · ~N tokens ］ · ［ Browse the asset
+//! library ］ · ［ Build manually ］ — never a passive, button-less footer line. Generate → a progress state
+//! → place + select the generated result (the M6 placeholder-first stream-in, ADR-017). The commit is
+//! **disabled while the field is empty** (C5 — no enabled-inert CTA), and every outcome surfaces a toast AT
+//! THE GESTURE (C11), not only the status gutter.
 //!
-//! Keeps the scaffold's stable `#describe`/`#describeBtn` ids AND restores the `#genBtn` the prompt-40
-//! acceptance gate drives (the React port had dropped it — the literal C1 bug).
+//! Implement this feature in accordance with the Engine UI/UX Architecture Constitution.
+//!
+//! WHERE IT WAS, AND WHY THAT WAS A DEFECT RATHER THAN A PLACEMENT. This is the engine's second north star,
+//! and reaching it took: open the Engines rail → Build → wait for a lazy chunk → scroll past Shape Studio
+//! and Other tools → **open a collapsed disclosure** headed `Describe`, summarised *"Optional assisted
+//! creation"*. Three clicks, a scroll, and a label telling you not to bother, for the gesture the product is
+//! named after. Nothing measured that: `check-ui-constitution` scored this file **1**, because a control
+//! that is beautifully built and unreachable is indistinguishable, to a counter of raw controls, from one
+//! that is not there at all.
+//!
+//! Both full-shell reference sheets put the same act in the same place — a lifted composer at the
+//! bottom-centre **of the stage**, always present, over the picture. It lives there now, as a child of the
+//! one stage-footer anchor (see `.mtk-stage-footer`), and it draws itself out of the shared `Composer`
+//! anatomy rather than nine inline style objects and three hand-built boxes.
+//!
+//! THE LEADING `+` IS THE OTHER HALF OF THE SAME QUESTION. "Describe it", "import it" and "browse for it"
+//! are three answers to *get something into my scene*, and only one of them was on the stage. The reference
+//! composer opens a small menu from a leading `+` for exactly this; the three rows here are the product's
+//! real doors, not invented ones.
+//!
+//! WHAT IS DELIBERATELY NOT COPIED FROM THE REFERENCE. Its composer carries a model picker and a microphone.
+//! This engine has neither — AI is a guest, and there is no model to choose — so the trailing slot carries
+//! the thing that IS true and that a user needs before committing: which tier will answer, and what it will
+//! cost. Substrate truth in the reference's shape.
+//!
+//! Keeps the stable `#describe`/`#describeBtn`/`#genBtn` hooks the acceptance gates drive.
 
 import { useEffect, useState } from "react";
 import { projectionStore } from "../store/projection";
@@ -16,8 +40,17 @@ import { setBalance } from "../store/wallet";
 import { pushToast } from "../store/toasts";
 import { GENERATE_COST } from "../transport/protocol";
 import { Icon } from "../theme/icons";
-import { Button } from "../theme/primitives";
-import { color, elevation, fontSize, radius, space } from "../theme/tokens";
+import { Badge, Button } from "../theme/primitives";
+import { Callout } from "../theme/callout";
+import { MenuPopup, PopupMenuItem } from "../theme/workspace";
+import {
+  Composer,
+  ComposerField,
+  ComposerHint,
+  ComposerOutcome,
+  ComposerRow,
+  ComposerSubmit,
+} from "../theme/composer";
 import type { EditorClient } from "../transport/session";
 
 /** The accepted-tier "registry-aware" preview (M14.1) — what the typed query WILL create, read live from the
@@ -36,11 +69,23 @@ type Panel =
   | { kind: "generating"; query: string }
   | { kind: "refusal"; message: string };
 
-export function DescribeBar({ client }: { client: EditorClient }) {
+export interface DescribeBarProps {
+  client: EditorClient;
+  /** The stage form (a lifted card over the picture) or the panel form (framed, no elevation). */
+  form?: "floating" | "inline";
+  /** The `+` menu's three doors. Each is optional; a door with no handler is not offered rather than
+   *  offered-and-inert, which is the one thing `<ux_quality>` 6 rules out. */
+  onImport?: () => void;
+  onBrowseAssets?: () => void;
+  onDrawShape?: () => void;
+}
+
+export function DescribeBar({ client, form = "inline", onImport, onBrowseAssets, onDrawShape }: DescribeBarProps) {
   const [query, setQuery] = useState("");
   const [panel, setPanel] = useState<Panel>(null);
   const [preview, setPreview] = useState<Preview>(null);
   const empty = query.trim().length === 0;
+  const busy = panel?.kind === "generating";
 
   // Registry-aware preview (accepted-tier): debounced, non-mutating `catalog_search` over the typed query →
   // show WHAT will be created + its real cost BEFORE commit. Local state only (never `setStatus` — the
@@ -72,7 +117,7 @@ export function DescribeBar({ client }: { client: EditorClient }) {
 
   async function submit() {
     const q = query.trim();
-    if (!q) return; // empty guard (Create is also disabled) — never a silent inert CTA (C5)
+    if (!q) return; // empty guard (the commit is also disabled) — never a silent inert CTA (C5)
     setPanel(null);
     setPreview(null);
     try {
@@ -154,25 +199,93 @@ export function DescribeBar({ client }: { client: EditorClient }) {
     setStatus(msg);
   }
 
-  /** Browse the asset library (the *browse* door to creation) — focus the asset search with the query. */
-  function browseMarketplace(q: string) {
+  /** Browse the asset library (the *browse* door to creation). The library lives in a workspace that may
+   *  not be open — the composer is on the stage now — so this OPENS it first and then aims the caret at
+   *  its search. Focusing an id that is not mounted was a no-op that looked like a dead control. */
+  function browseLibrary(q: string) {
     setPanel(null);
-    const el = document.getElementById("assetSearch") as HTMLInputElement | null;
-    el?.focus();
-    pushToast(`Browse the asset library (left panel) for "${q}"`, "info");
+    // OPEN IT, then aim at its search. The old version only aimed: it called `focus()` on `#assetSearch`
+    // from a composer that could be anywhere, and `focus()` on an id that is not mounted is a no-op that
+    // looks exactly like a working control. The library lives in a LAZILY-loaded workspace, so the focus
+    // lands only when it happens to be open already — which is why the toast, not the caret, is the
+    // durable pointer here.
+    onBrowseAssets?.();
+    (document.getElementById("assetSearch") as HTMLInputElement | null)?.focus();
+    pushToast(`Browse the asset library for "${q}"`, "info");
     setStatus(`browsing the asset library for "${q}"`);
   }
 
+  const submitReason = empty ? "Describe something first" : busy ? "A generation is already running" : undefined;
+
   return (
-    <div data-testid="describebar" style={{ padding: `${space.sm}px ${space.lg}px` }}>
-      <div style={{ display: "flex", gap: space.sm, alignItems: "center" }}>
-        <Icon name="sparkle" size="lg" style={{ color: color.accent.base }} />
-        <input
+    <Composer
+      id="describeComposer"
+      data-testid="describebar"
+      form={form}
+      aria-label="Describe something to create"
+    >
+      <ComposerRow>
+        {/* No doors wired → no trigger. A `+` that opens an empty menu is the inert surface
+            `<ux_quality>` 6 rules out, and it is what a panel embedding this composer without the
+            shell's handlers would otherwise get. */}
+        {(onImport || onBrowseAssets || onDrawShape) && (
+        <MenuPopup
+          id="describeAdd"
+          label="Add something to the scene"
+          placement="top-start"
+          trigger={<Icon name="plus" size="md" />}
+          triggerProps={{
+            id: "describeAddBtn",
+            "data-testid": "describeAddBtn",
+            variant: "ghost",
+            icon: true,
+            className: "mtk-composer__lead",
+            "aria-label": "Add something to the scene",
+          }}
+        >
+          {(close) => (
+            <>
+              {onImport && (
+                <PopupMenuItem
+                  data-testid="describeAddImport"
+                  leading={<Icon name="import" size="md" />}
+                  label="Import a file…"
+                  description="A model, drawing or assembly from disk"
+                  onSelect={onImport}
+                  onRequestClose={close}
+                />
+              )}
+              {onBrowseAssets && (
+                <PopupMenuItem
+                  data-testid="describeAddBrowse"
+                  leading={<Icon name="assets" size="md" />}
+                  label="Browse the asset library"
+                  description="Everything already available to this project"
+                  onSelect={onBrowseAssets}
+                  onRequestClose={close}
+                />
+              )}
+              {onDrawShape && (
+                <PopupMenuItem
+                  data-testid="describeAddDraw"
+                  leading={<Icon name="draw" size="md" />}
+                  label="Draw it in the viewport"
+                  description="Trace an outline on the ground, at real size, and raise it into a solid"
+                  onSelect={onDrawShape}
+                  onRequestClose={close}
+                />
+              )}
+            </>
+          )}
+        </MenuPopup>
+        )}
+        <ComposerField
           id="describe"
           data-testid="describe"
-          className="mtk-input"
           value={query}
-          placeholder="Describe something to create — e.g. “a glowing health bar”"
+          placeholder="Describe something to create…"
+          aria-label="Describe something to create"
+          disabled={busy}
           onChange={(e) => {
             setQuery(e.target.value);
             // typing invalidates a stale offer/refusal so feedback never goes stale (C11)
@@ -181,102 +294,100 @@ export function DescribeBar({ client }: { client: EditorClient }) {
           onKeyDown={(e) => {
             if (e.key === "Enter") void submit();
           }}
-          style={{ flex: 1 }}
         />
-        <Button
+        <ComposerSubmit
           id="describeBtn"
           data-testid="describeBtn"
-          variant="primary"
-          disabled={empty}
-          title={empty ? "Describe something first" : undefined}
+          label="Create it"
+          disabled={empty || busy}
+          disabledReason={submitReason}
           onClick={() => void submit()}
-        >
-          Create
-        </Button>
-      </div>
+        />
+      </ComposerRow>
 
       {/* Accepted-tier registry-aware preview: WHAT will be created + its real cost, before commit. Suppressed
           while an offer/generating/refusal panel is showing (that panel is the more specific surface). */}
       {!empty && !panel && preview && (
-        <div
-          data-testid="describePreview"
-          style={{ marginTop: space.xs, fontSize: fontSize.meta, color: color.text.muted, display: "flex", alignItems: "center", gap: space.sm }}
-        >
+        <ComposerHint data-testid="describePreview">
           {preview.kind === "match" ? (
             <>
-              <span style={{ color: color.success.text }}><Icon name="check" size="sm" /> will place</span>
-              <span style={{ color: color.text.secondary }}>{preview.label}</span>
-              <span style={{ color: color.text.muted }}>· {preview.source}</span>
-              <span data-testid="previewCost" style={{ color: preview.price ? color.token : color.success.text }}>
-                · {preview.price ? `−${preview.price} tokens` : "free"}
+              <Icon name="check" size="sm" title="Found in the catalogue" />
+              <span>
+                Will place <strong>{preview.label}</strong> · {preview.source}
               </span>
+              <Badge
+                data-testid="previewCost"
+                tone={preview.price ? "warn" : "success"}
+                title={preview.price ? "Buying this from the marketplace spends tokens" : "Already available to this project"}
+              >
+                {preview.price ? `−${preview.price} tokens` : "free"}
+              </Badge>
             </>
           ) : (
             <>
-              <span style={{ color: color.accent.base }}><Icon name="sparkle" size="sm" /> no match — will generate</span>
-              <span data-testid="previewCost" style={{ color: color.token }}>· ~{GENERATE_COST} tokens</span>
+              <Icon name="sparkle" size="sm" title="Nothing matches — this will be generated" />
+              <span>No match — will generate</span>
+              <Badge data-testid="previewCost" tone="warn" title="Generating spends tokens">
+                ~{GENERATE_COST} tokens
+              </Badge>
             </>
           )}
-        </div>
+        </ComposerHint>
       )}
 
-      {panel?.kind === "offer" && (
-        <div
-          data-testid="describePanel"
-          style={{ marginTop: space.sm, padding: `${space.md}px ${space.lg}px`, background: color.bg.raised, border: `1px solid ${color.border.default}`, borderRadius: radius.lg, fontSize: fontSize.body, boxShadow: elevation.e1 }}
-        >
-          <div style={{ marginBottom: space.sm, color: color.text.secondary }}>
-            No match for “{panel.query}”. Generate it with AI, browse the asset library, or build it yourself.
-          </div>
-          <div style={{ display: "flex", gap: space.md, flexWrap: "wrap" }}>
-            <Button
-              id="genBtn"
-              data-testid="genBtn"
-              variant="primary"
-              title={`Generate a new asset with AI — costs about ${GENERATE_COST} tokens`}
-              onClick={() => void runGenerate(panel.query)}
-            >
-              <Icon name="sparkle" size="sm" /> Generate with AI · ~{GENERATE_COST} tokens
-            </Button>
-            <Button id="browseMarket" data-testid="browseMarket" variant="secondary" onClick={() => browseMarketplace(panel.query)}>
-              Browse asset library
-            </Button>
-            <Button
-              id="buildManual"
-              data-testid="buildManual"
-              variant="secondary"
-              onClick={() => {
-                setPanel(null);
-                setStatus("build it manually — add an asset or components in the inspector");
-              }}
-            >
-              Build manually
-            </Button>
-          </div>
-        </div>
-      )}
+      {panel != null && (
+        <ComposerOutcome>
+          {panel.kind === "offer" && (
+            <Callout tone="info" data-testid="describePanel">
+              No match for “{panel.query}”. Generate it with AI, browse the asset library, or build it yourself.
+              <div className="mtk-composer__actions">
+                <Button
+                  id="genBtn"
+                  data-testid="genBtn"
+                  variant="primary"
+                  compact
+                  title={`Generate a new asset with AI — costs about ${GENERATE_COST} tokens`}
+                  onClick={() => void runGenerate(panel.query)}
+                >
+                  <Icon name="sparkle" size="sm" /> Generate with AI · ~{GENERATE_COST} tokens
+                </Button>
+                <Button id="browseMarket" data-testid="browseMarket" variant="secondary" compact onClick={() => browseLibrary(panel.query)}>
+                  Browse asset library
+                </Button>
+                <Button
+                  id="buildManual"
+                  data-testid="buildManual"
+                  variant="secondary"
+                  compact
+                  onClick={() => {
+                    setPanel(null);
+                    setStatus("build it manually — add an asset or components in the inspector");
+                  }}
+                >
+                  Build manually
+                </Button>
+              </div>
+            </Callout>
+          )}
 
-      {panel?.kind === "generating" && (
-        <div
-          data-testid="describePanel"
-          style={{ marginTop: space.sm, padding: `${space.md}px ${space.lg}px`, background: color.accent.subtle, border: `1px solid ${color.accent.border}`, borderRadius: radius.lg, fontSize: fontSize.body, color: color.text.primary, display: "flex", alignItems: "center", gap: space.md }}
-        >
-          <span className="mtk-spinner" aria-hidden />
-          <span data-testid="genProgress">Generating “{panel.query}” … a placeholder drops in, the mesh streams in.</span>
-        </div>
-      )}
+          {panel.kind === "generating" && (
+            <Callout tone="info" data-testid="describePanel" icon={<span className="mtk-spinner" aria-hidden />}>
+              <span data-testid="genProgress">Generating “{panel.query}” … a placeholder drops in, the mesh streams in.</span>
+            </Callout>
+          )}
 
-      {panel?.kind === "refusal" && (
-        <div
-          data-testid="describePanel"
-          style={{ marginTop: space.sm, padding: `${space.md}px ${space.lg}px`, background: color.danger.bg, border: `1px solid ${color.danger.border}`, borderRadius: radius.lg, fontSize: fontSize.body, color: color.danger.text, display: "flex", alignItems: "center", justifyContent: "space-between", gap: space.md }}
-        >
-          <span>{panel.message}</span>
-          <Button data-testid="describePanelDismiss" variant="secondary" compact onClick={() => setPanel(null)}>
-            Dismiss
-          </Button>
-        </div>
+          {panel.kind === "refusal" && (
+            <Callout tone="danger" data-testid="describePanel">
+              {panel.message}
+              <div className="mtk-composer__actions">
+                <Button data-testid="describePanelDismiss" variant="secondary" compact onClick={() => setPanel(null)}>
+                  Dismiss
+                </Button>
+              </div>
+            </Callout>
+          )}
+        </ComposerOutcome>
       )}
-    </div>
+    </Composer>
   );
 }

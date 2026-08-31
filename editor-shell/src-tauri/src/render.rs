@@ -12,6 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::diag_log;
 use glam::{Mat4, Quat, Vec3, Vec4};
 use metrocalk_assets::colour::TextureRole as Role;
 use metrocalk_assets::{MeshGpu, MeshVertex, Texture};
@@ -43,7 +44,20 @@ pub struct Instance {
     pub center: [f32; 3],
     pub scale: f32,
     pub color: [f32; 3],
-    pub selected: f32,
+    /// What the viewport is saying about this instance right now — a small integer CODE, not a
+    /// boolean: bit 0 ([`HIGHLIGHT_SELECTED`]) is the committed selection, bit 1
+    /// ([`HIGHLIGHT_HOVERED`]) is what the cursor is over. They are independent facts and an object
+    /// is routinely both, which is exactly why one flag could not carry them: a hover that wrote
+    /// `1.0` would report a selection the selection model does not have, and clearing it would
+    /// silently deselect.
+    ///
+    /// A code rather than a second field because this is an `array<Instance>` STRIDE — a 15 711-part
+    /// import re-uploads 1 MB of it whenever the highlight changes, and growing the struct to carry
+    /// one more bit would make that 1.25 MB on every hover.
+    ///
+    /// The particle pass reuses this lane as OPACITY, the same way it reuses `color` as HDR radiance
+    /// and `scale` as a radius — `Instance` is a carrier there, not an entity.
+    pub highlight: f32,
     pub rotation: [f32; 4],
     /// M11.2 per-entity PBR material override `[metallic, roughness, has_override, _pad]`. When
     /// `has_override > 0.5` the mesh shader uses these (with `color` as the override base color) instead of
@@ -66,6 +80,42 @@ pub struct LightGpu {
     pub color_intensity: [f32; 4],
     /// `xyz` = direction (directional/spot); `w` = range (point/spot falloff, 0 = infinite).
     pub dir_range: [f32; 4],
+}
+
+/// [`Instance::highlight`] bit 0 — this instance is in the committed selection.
+pub const HIGHLIGHT_SELECTED: u32 = 1;
+/// [`Instance::highlight`] bit 1 — the cursor is over this instance, or over an assembly it belongs
+/// to. Transient: a render projection of a hover, never document state, and it survives a rebuild no
+/// longer than the hover does.
+pub const HIGHLIGHT_HOVERED: u32 = 2;
+
+/// Read one bit out of an [`Instance::highlight`] code.
+#[must_use]
+pub fn highlight_has(code: f32, bit: u32) -> bool {
+    (highlight_code(code) & bit) != 0
+}
+
+/// The code as an integer. Written from these constants and read back through `+ 0.5` rounding, so
+/// the float never has to be compared for equality.
+#[must_use]
+pub fn highlight_code(code: f32) -> u32 {
+    if code <= 0.0 {
+        return 0;
+    }
+    (code + 0.5) as u32
+}
+
+/// The code with `bit` set or cleared, leaving every other bit alone. This is the whole reason the
+/// field is a code: the selection writes bit 0 and a hover writes bit 1, and neither may erase the
+/// other's answer.
+#[must_use]
+pub fn highlight_with(code: f32, bit: u32, on: bool) -> f32 {
+    let next = if on {
+        highlight_code(code) | bit
+    } else {
+        highlight_code(code) & !bit
+    };
+    next as f32
 }
 
 /// The identity quaternion (no rotation) — the default for `Instance::rotation`.
@@ -201,7 +251,54 @@ impl SceneState {
     ///
     /// Nothing else in the engine triggers this: the structure exists for one caller, and a scene that
     /// is never filmed never builds it.
+    /// Size the presentation room to whatever is currently in the scene.
+    ///
+    /// Memoised against the revisions that can change the answer, and called from both the draw pass
+    /// and the camera planner so those two can never be looking at different rooms. Cheap enough to
+    /// call every frame; the memo exists because the bounds walk behind it is not.
+    pub fn sync_stage(&mut self) {
+        let key = (self.ids_revision, self.meshes_revision);
+        if self.hall_revision == Some(key) {
+            return;
+        }
+        self.hall_revision = Some(key);
+        self.hall = match self.presentation_set {
+            PresentationSet::Studio => None,
+            PresentationSet::FactoryHall => {
+                scene_world_bounds(&self.instances, &self.mesh_slots, &self.meshes).and_then(
+                    |(lo, hi)| {
+                        crate::hall::Hall::around(lo.to_array(), hi.to_array(), GROUND_PLANE_Y)
+                    },
+                )
+            }
+        };
+    }
+
+    /// Forget the sized room, so the next [`Self::sync_stage`] rebuilds it.
+    ///
+    /// Needed because the memo is keyed on what is IN the scene, and switching the set changes the
+    /// answer without changing the scene — the one case the key cannot see.
+    pub fn invalidate_stage(&mut self) {
+        self.hall_revision = None;
+    }
+
+    /// Where a camera may stand, for the shot solver.
+    ///
+    /// The margin is applied here, once, rather than by the solver: the room knows how thick its own
+    /// walls are and how much clearance a lens needs off them, and a solver with a second opinion about
+    /// that would be a second place the number is decided.
+    #[must_use]
+    pub fn camera_stage(&self) -> metrocalk_animation::shot::Stage {
+        metrocalk_animation::shot::Stage {
+            room: self.hall.map(crate::hall::Hall::camera_room),
+        }
+    }
+
     pub fn sync_occlusion(&mut self) {
+        // The planner asks about the room in the same breath as it asks about obstruction, and a
+        // vantage judged against a room that has not been sized yet reports the void the scene used to
+        // be. Sized here, so no caller has to remember to.
+        self.sync_stage();
         if self.occlusion_revision == Some(self.ids_revision) {
             return;
         }
@@ -388,6 +485,18 @@ impl SceneState {
                     backed += 1;
                     continue;
                 }
+                // The presentation ROOM, for the same reason as the ground below it: the hall's slab,
+                // walls, columns and roof are drawn directly rather than published as instances, so
+                // they are absent from the BVH. Without this the planner keeps reporting the void the
+                // scene used to be — and the delivered films measured `backing` at 1/9 on every wide
+                // shot of the assembly for exactly that reason, while the frame the viewer would have
+                // seen was a wall.
+                if let Some(hall) = self.hall {
+                    if hall.shell_within(beyond, behind.direction, backdrop) {
+                        backed += 1;
+                        continue;
+                    }
+                }
                 // Falling toward the floor within the same reach counts as content.
                 let dy = behind.direction[1];
                 if dy < -1.0e-6 {
@@ -442,6 +551,14 @@ pub struct CinematicPlacement {
     pub yaw_offset_deg: f32,
     /// How many placements were rejected before this one. Zero means the direction was filmed as written.
     pub rejected: u8,
+    /// WHAT THE ORACLE SAW at the placement it settled on, mid-shot.
+    ///
+    /// Recorded because the first film measured with a sound legibility metric disagreed with it flatly:
+    /// fifteen frames were a picture of nothing, and every shot that produced them reported
+    /// `rejected: 0` -- the negotiation had looked at those placements and called them acceptable. A
+    /// record that says only "filmed as directed" cannot distinguish an oracle that was never consulted
+    /// from one that was consulted and was wrong, and those need opposite fixes.
+    pub vantage: metrocalk_animation::shot::Vantage,
 }
 
 /// A right/up pair for the plane facing `target` from `eye`, used to spread sample rays across a frame.
@@ -570,6 +687,7 @@ enum ViewportLayer {
     MarkerGlyphs,
     PhysicsDebugOverlay,
     TerrainToolOverlay,
+    GroundSketchOverlay,
     GizmoAndSnapChrome,
 }
 
@@ -590,6 +708,7 @@ impl ViewportVisibility {
             | ViewportLayer::MarkerGlyphs
             | ViewportLayer::PhysicsDebugOverlay
             | ViewportLayer::TerrainToolOverlay
+            | ViewportLayer::GroundSketchOverlay
             | ViewportLayer::GizmoAndSnapChrome => matches!(self, Self::Editor),
         }
     }
@@ -603,6 +722,195 @@ pub const DEFAULT_EXPOSURE: f32 = 0.45;
 /// The aspect assumed when framing happens before a real surface size is known. 16:9 rather than 1:1 so
 /// the pre-surface guess errs toward the shape of a real editor viewport.
 pub const DEFAULT_ASPECT: f32 = 16.0 / 9.0;
+
+/// The whole surface: the composition frame of a viewport with nothing drawn over it. What a
+/// thumbnail, a bench or an offscreen render composes for, because those really do own every pixel.
+pub const FULL_FRAME: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// A composition rectangle that can be trusted, in surface fractions `[x, y, width, height]` measured
+/// from the top-left.
+///
+/// A missing, degenerate or out-of-range rectangle collapses to the whole surface, which is exactly the
+/// behaviour before any rectangle was reported. A bad rectangle must never be able to shear the
+/// projection or fling the camera somewhere the subject is not.
+#[must_use]
+pub fn sane_frame(frame: [f32; 4]) -> [f32; 4] {
+    let [x, y, w, h] = frame;
+    let ok = frame.iter().all(|v| v.is_finite())
+        && w > 0.02
+        && h > 0.02
+        && w <= 1.001
+        && h <= 1.001
+        && x >= -0.001
+        && y >= -0.001
+        && x + w <= 1.001
+        && y + h <= 1.001;
+    if ok {
+        [x.max(0.0), y.max(0.0), w.min(1.0), h.min(1.0)]
+    } else {
+        FULL_FRAME
+    }
+}
+
+/// The aspect ratio of the composed rectangle ITSELF - the shape of the picture, not of the window it
+/// is cut out of.
+#[must_use]
+pub fn frame_aspect(surface_aspect: f32, frame: [f32; 4]) -> f32 {
+    let [_, _, w, h] = sane_frame(frame);
+    let surface = if surface_aspect.is_finite() && surface_aspect > 0.01 {
+        surface_aspect
+    } else {
+        DEFAULT_ASPECT
+    };
+    (surface * w / h).clamp(0.05, 20.0)
+}
+
+/// Inset `rect` until its own aspect ratio is `want`, centred - the bars of a delivery frame.
+///
+/// Pillarbox when the rectangle is wider than the frame it delivers, letterbox when it is taller. This
+/// is the ONE place the bars are decided: the engine composes for the result and hands the same
+/// rectangle to the UI to draw the mask from, so the picture and the bars around it cannot disagree.
+#[must_use]
+pub fn inset_to_aspect(rect: [f32; 4], surface_aspect: f32, want: f32) -> [f32; 4] {
+    let [x, y, w, h] = sane_frame(rect);
+    if !want.is_finite() {
+        return [x, y, w, h];
+    }
+    let want = want.clamp(0.05, 20.0);
+    let have = frame_aspect(surface_aspect, [x, y, w, h]);
+    if (have - want).abs() <= 1.0e-4 {
+        [x, y, w, h]
+    } else if have > want {
+        let inner = w * want / have;
+        [(w - inner).mul_add(0.5, x), y, inner, h]
+    } else {
+        let inner = h * have / want;
+        [x, (h - inner).mul_add(0.5, y), w, inner]
+    }
+}
+
+/// The shape and placement of the rectangle a picture is composed for.
+///
+/// Two numbers that only mean anything together: a sub-rectangle without the surface it sits on has no
+/// aspect ratio, and a surface aspect without the sub-rectangle is the shape of a window rather than of
+/// a picture. They travel as one value so no caller can pass half of the answer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewFrame {
+    surface_aspect: f32,
+    rect: [f32; 4],
+}
+
+impl ViewFrame {
+    /// A frame composed for `rect` of a surface of `surface_aspect`. The rectangle is sanitised here,
+    /// once, so an unusable `ViewFrame` cannot exist.
+    #[must_use]
+    pub fn new(surface_aspect: f32, rect: [f32; 4]) -> Self {
+        Self {
+            surface_aspect,
+            rect: sane_frame(rect),
+        }
+    }
+
+    /// A frame that owns its whole surface.
+    #[must_use]
+    pub fn whole(surface_aspect: f32) -> Self {
+        Self::new(surface_aspect, FULL_FRAME)
+    }
+
+    /// The composed rectangle, in surface fractions.
+    #[must_use]
+    pub fn rect(self) -> [f32; 4] {
+        self.rect
+    }
+
+    /// The composed rectangle's own aspect ratio.
+    #[must_use]
+    pub fn aspect(self) -> f32 {
+        frame_aspect(self.surface_aspect, self.rect)
+    }
+}
+
+/// A composed frame as a pixel rectangle `[x, y, width, height]` on a `w` x `h` surface, clamped so it
+/// always names at least one pixel inside the surface. What a scissor needs.
+#[must_use]
+pub fn frame_pixels(frame: [f32; 4], w: u32, h: u32) -> [u32; 4] {
+    let [fx, fy, fw, fh] = sane_frame(frame);
+    let (sw, sh) = (w.max(1), h.max(1));
+    let px = |v: f32, span: u32| (v * span as f32).round().clamp(0.0, span as f32) as u32;
+    let x = px(fx, sw).min(sw - 1);
+    let y = px(fy, sh).min(sh - 1);
+    [
+        x,
+        y,
+        px(fw, sw).clamp(1, sw - x),
+        px(fh, sh).clamp(1, sh - y),
+    ]
+}
+
+/// Expand a frame's own symmetric half-extents into the SURFACE extents that place them inside it.
+/// Returns `(left, right, bottom, top)` in the plane the half-extents were measured at.
+fn surface_extents(frame: [f32; 4], half_w: f32, half_h: f32) -> (f32, f32, f32, f32) {
+    let [x, y, w, h] = sane_frame(frame);
+    let span_x = 2.0 * half_w / w;
+    let span_y = 2.0 * half_h / h;
+    // NDC y points up, so it is the frame's distance from the BOTTOM that offsets the vertical extents.
+    let left = (-x).mul_add(span_x, -half_w);
+    let bottom = -(1.0 - y - h).mul_add(span_y, half_h);
+    (left, left + span_x, bottom, bottom + span_y)
+}
+
+/// A right-handed off-centre perspective projection with wgpu's `[0, 1]` depth - the same matrix
+/// `Mat4::perspective_rh` builds when `l = -r` and `b = -t`, with the symmetry dropped.
+fn perspective_off_centre_rh(l: f32, r: f32, b: f32, t: f32, near: f32, far: f32) -> Mat4 {
+    let rl = (r - l).max(1.0e-6);
+    let tb = (t - b).max(1.0e-6);
+    let depth = far / (near - far);
+    Mat4::from_cols(
+        Vec4::new(2.0 * near / rl, 0.0, 0.0, 0.0),
+        Vec4::new(0.0, 2.0 * near / tb, 0.0, 0.0),
+        Vec4::new((r + l) / rl, (t + b) / tb, depth, -1.0),
+        Vec4::new(0.0, 0.0, near * depth, 0.0),
+    )
+}
+
+/// The projection that draws, INSIDE `frame`, exactly the picture a camera owning a surface of that
+/// frame's shape would draw.
+///
+/// WHY THE PROJECTION AND NOT THE CAMERA TARGET. The wgpu surface is the whole window; the editor is
+/// composited over it and the 3D shows through a transparent hole. The first answer to that was to
+/// slide the ORBIT TARGET sideways at framing time by the hole's offset, which put the subject in the
+/// hole for exactly one instant. That offset is proportional to `distance` and expressed in the
+/// camera's own right/up basis, so zooming, orbiting, opening a dock and resizing the window each left
+/// a target that had been correct for a frame which no longer existed - and nothing re-derived it,
+/// because framing is a user action and none of those are. Shearing the frustum instead is not a
+/// correction applied once: it IS the frame, every tick, for nothing.
+#[must_use]
+pub fn framed_projection(
+    projection: Projection,
+    fov_deg: f32,
+    frame: ViewFrame,
+    distance: f32,
+    near: f32,
+    far: f32,
+) -> Mat4 {
+    let half_v = (fov_deg.to_radians() * 0.5).clamp(0.01, 1.5).tan();
+    let aspect = frame.aspect();
+    match projection {
+        Projection::Perspective => {
+            let half_h = near * half_v;
+            let (l, r, b, t) = surface_extents(frame.rect(), half_h * aspect, half_h);
+            perspective_off_centre_rh(l, r, b, t, near, far)
+        }
+        Projection::Orthographic => {
+            let half_h = distance * half_v;
+            let (l, r, b, t) = surface_extents(frame.rect(), half_h * aspect, half_h);
+            // The near plane goes BEHIND the eye. A parallel projection has no apex to clip against, and
+            // starting at the eye would slice away everything between the camera and its orbit target -
+            // which in a top view is most of the scene.
+            Mat4::orthographic_rh(l, r, b, t, -far, far)
+        }
+    }
+}
 
 /// The fraction of the tighter viewport half-extent the subject should span. 0.72 sits inside the
 /// 55-75% band a professional viewport targets, leaving a margin that reads as deliberate framing
@@ -645,29 +953,14 @@ fn camera_right_up(orbit: f32, elevation: f32) -> (Vec3, Vec3) {
     (right, right.cross(forward).normalize_or_zero())
 }
 
-/// `visible` is `[width_fraction, height_fraction]` of the surface the viewer can actually see. The
-/// projection still spans the whole window -- the editor UI is composited on top of a window-sized
-/// surface -- so framing for the window alone puts part of the subject behind a panel. Each axis needs
-/// its own tangent scaled by that axis's visible fraction; `[1.0, 1.0]` fits the whole surface, which is
-/// what this did before the visible rectangle existed.
+/// `aspect` is the shape of the FRAME the picture is composed for, not of the window it is cut out of.
+///
+/// This used to take a second pair of `visible` fractions and divide its tangents by them, because the
+/// projection spanned the whole window and the frame only saw a share of it. That knob is gone:
+/// [`framed_projection`] gives the frame its own frustum, so it really does span what it is fitted
+/// against, and a second compensation here would apply the same correction twice.
 #[must_use]
-pub fn fit_distance_in_viewport(
-    half_extent: Vec3,
-    aspect: f32,
-    orbit: f32,
-    elevation: f32,
-    visible: [f32; 2],
-) -> f32 {
-    let visible_w = if visible[0].is_finite() {
-        visible[0].clamp(0.05, 1.0)
-    } else {
-        1.0
-    };
-    let visible_h = if visible[1].is_finite() {
-        visible[1].clamp(0.05, 1.0)
-    } else {
-        1.0
-    };
+pub fn fit_distance_in_viewport(half_extent: Vec3, aspect: f32, orbit: f32, elevation: f32) -> f32 {
     let aspect = if aspect.is_finite() && aspect > 0.01 {
         aspect
     } else {
@@ -689,8 +982,8 @@ pub fn fit_distance_in_viewport(
 
     // Each axis needs its own distance; the frame must satisfy the more demanding one. `ext_f` is
     // added because the box has depth: fitting its centre would push its near face through the lens.
-    let need_v = ext_u / (half_v.tan() * visible_h);
-    let need_h = ext_r / (half_h.tan() * visible_w);
+    let need_v = ext_u / half_v.tan();
+    let need_h = ext_r / half_h.tan();
     (need_v.max(need_h) / FRAME_OCCUPANCY + ext_f).clamp(0.3, 4000.0)
 }
 
@@ -901,6 +1194,112 @@ pub enum ThumbTake {
     StateMoved,
 }
 
+/// A request to keep the picture this viewport is about to present, as a file rather than a frame.
+///
+/// There is exactly one render path in this shell, and a still has to come out of THAT one — a second
+/// offscreen renderer would be a second grade, the divergence [`render_thumbnail`]'s own comment names
+/// and avoids. So a capture is a read of the swapchain texture between the submit and the present: the
+/// same instances, the same lights, the same post route, the same final resolve, the same bars.
+///
+/// **`min_epoch` is the whole correctness argument.** A capture is nearly always asked for by something
+/// that has just moved the camera — a render job stepping a cutscene a frame at a time — and the frame
+/// already in flight when the request lands was drawn with the pose BEFORE it. Servicing that frame
+/// would write shot 1's picture into shot 2's file, silently, and every file after it would be off by
+/// one. [`SceneState::pose_epoch`] counts camera publications; a request records the epoch current when
+/// it was made, and only a frame drawn at that epoch or later may answer it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameRequest {
+    /// Unique and monotonic, from the same counter the thumbnails use. The answer quotes it back.
+    pub req: u64,
+    /// The lowest [`SceneState::pose_epoch`] a frame may have been drawn at and still answer this.
+    pub min_epoch: u64,
+}
+
+/// A serviced frame capture: the PNG, or the sentence saying why there is none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameResult {
+    /// The request this answers.
+    pub req: u64,
+    /// The image, in the delivery frame's own pixels.
+    pub png: Option<Vec<u8>>,
+    /// The written size. Reported even on failure as `0 x 0`, so a caller never has to infer it.
+    pub width: u32,
+    pub height: u32,
+    /// Why there is no image. `None` when there is one — never both.
+    pub reason: Option<String>,
+}
+
+/// The three honest outcomes of asking for a frame, for the same reason [`ThumbTake`] has four: "not
+/// yet" and "never, because …" are different answers and an `Option` collapses them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameTake {
+    /// No frame has been drawn at the requested pose yet. Keep polling.
+    Pending,
+    /// The picture, and the pixel size it was written at.
+    Ready {
+        png: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    /// It cannot be produced, and this is why. A sentence, not a silence.
+    Failed(String),
+}
+
+/// Which room a scene is presented in.
+///
+/// A presentation choice with the same standing as the view transform: it changes what a camera can
+/// see and nothing about what the project *is*. The default is deliberately the old behaviour, so no
+/// existing scene, baseline capture or viewport test changes because this type exists — the room is
+/// something a presentation asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PresentationSet {
+    /// A ground plane under the model and open air around it. Right for inspecting a part; it is what
+    /// every earlier film of the factory was shot in, and why those films measured mostly-empty frames.
+    #[default]
+    Studio,
+    /// An industrial hall around the model — slab, walkways, clad walls, a column grid and a roof.
+    FactoryHall,
+}
+
+impl PresentationSet {
+    /// The wire name, for the command and the sidecar. Round-trips through [`Self::parse`].
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Studio => "studio",
+            Self::FactoryHall => "factoryHall",
+        }
+    }
+
+    /// Read a wire name, accepting the spellings a caller is likely to type.
+    ///
+    /// `None` for anything else rather than a silent fall back to `Studio`: a command that quietly
+    /// ignores the word it was given would report success for a set it did not apply, and the operator
+    /// would be looking at the wrong room believing it was the right one.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_', ' '], "")
+            .as_str()
+        {
+            "studio" | "none" | "open" => Some(Self::Studio),
+            "factoryhall" | "hall" | "factory" | "industrial" => Some(Self::FactoryHall),
+            _ => None,
+        }
+    }
+
+    /// The author-facing name.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Studio => "Studio (open ground)",
+            Self::FactoryHall => "Factory hall",
+        }
+    }
+}
+
 /// Scene state shared between the app (writer, from core deltas + input) and the render loop (reader).
 #[derive(Default)]
 pub struct SceneState {
@@ -926,6 +1325,14 @@ pub struct SceneState {
     /// A degenerate value (including the `[0,0,0,0]` this derives by default) means "the whole surface",
     /// so the behaviour is unchanged until the shell reports a real rectangle.
     pub visible_rect: [f32; 4],
+    /// The aspect ratio the ACTIVE cutscene is delivered in, or `None` when nothing is composing for a
+    /// frame of its own.
+    ///
+    /// A cutscene is authored for a delivery frame - 16:9, scope, vertical - and the author's stage is
+    /// whatever shape the docks have left it. Held here rather than on the cutscene document because
+    /// this is render state: it lives and dies with `cam_override`, is never undoable, and is written
+    /// by the same tick that poses the camera.
+    pub delivery_aspect: Option<f32>,
     /// Per-slot local mesh bounds, memoised against `meshes_revision` -- see
     /// [`Self::local_bounds_for_slot`] for why walking them per instance was ruinous.
     /// DERIVED: write it only through [`Self::sync_mesh_bounds`], which keeps it and the revision
@@ -967,6 +1374,19 @@ pub struct SceneState {
     /// identical from outside, and the difference is the whole point of the negotiation. Cleared when a
     /// cutscene takes the camera, so it always describes the run being watched.
     pub cinematic_placements: Vec<CinematicPlacement>,
+    /// Which room the scene is presented in. A viewing choice, exactly like the tone curve: it changes
+    /// no entity, no component and no count, and it is not written into the document.
+    pub presentation_set: PresentationSet,
+    /// The room [`Self::presentation_set`] currently resolves to, sized to the live scene.
+    ///
+    /// Derived, memoised, and read by three separate consumers that must not disagree: the draw pass
+    /// (what is on screen), the camera planner's backdrop test (what a shot can be backed by) and the
+    /// shot solver's confinement (where a camera may stand). Three copies of "how big is the hall"
+    /// would be three chances for the picture, the verdict and the placement to describe different
+    /// rooms — which is the shape of every defect the last four passes of this work found.
+    pub hall: Option<crate::hall::Hall>,
+    /// The `(ids_revision, meshes_revision)` [`Self::hall`] was sized for.
+    pub hall_revision: Option<(u64, u64)>,
     /// Entity key -> instance index, memoised against [`Self::ids_revision`].
     ///
     /// Publishing an animation pose used to scan all of `ids` looking for the handful of keys it had
@@ -1090,6 +1510,15 @@ pub struct SceneState {
     pub moba_structure_slot: i32,
     /// Currently-selected instance index (drives the highlight).
     pub selected: Option<usize>,
+    /// What the cursor is over, as the loro keys of the SUBJECTS being pointed at — a leaf part, or
+    /// an assembly whose whole subtree lights up. Kept as keys rather than instance indices for the
+    /// same reason the cinema preview keeps its suppressed outline by key: indices are stable only
+    /// between rebuilds, and a rebuild mid-hover would otherwise light an unrelated object.
+    ///
+    /// The RESOLVED half lives in `Instance::highlight`'s [`HIGHLIGHT_HOVERED`] bit. Empty is the
+    /// normal state — a hover is a transient render projection, never document state, and nothing
+    /// persists it.
+    pub hovered: Vec<String>,
     /// Bump when `instances` changes so the loop re-uploads the buffer.
     pub revision: u64,
     /// Orbit/zoom driven by drag input (stays in Rust — invariant 4).
@@ -1196,8 +1625,24 @@ pub struct SceneState {
     pub thumb_results: Vec<ThumbResult>,
     /// The next request id to hand out. Monotonic for the life of the process; the counter lives here
     /// rather than in a global atomic because every producer and consumer already holds this lock, so
-    /// there is exactly one place the ordering can be reasoned about.
+    /// there is exactly one place the ordering can be reasoned about. Shared with the frame captures
+    /// below — one id space, so a result can never be mistaken for the other kind's.
     pub next_thumb_req: u64,
+    /// ADR-175 — pending frame captures: "write down the picture you are about to present". Drained by
+    /// the render thread AFTER its submit and BEFORE its present, so what lands in the file is the frame
+    /// the viewer would have seen, produced by the one render path rather than a second one.
+    pub frame_requests: Vec<FrameRequest>,
+    /// Serviced captures. Polled by the engine thread, which owns the file writing — the render thread
+    /// never touches the disk, so a slow or failing write cannot stall a frame.
+    pub frame_results: Vec<FrameResult>,
+    /// How many times the camera has been PUBLISHED — bumped by every writer of [`Self::cam_override`]
+    /// that wants a capture to wait for its pose. See [`FrameRequest::min_epoch`]: without it a render
+    /// job writes each shot's picture into the next shot's file.
+    pub pose_epoch: u64,
+    /// Whether this adapter's surface can be read back at all (`COPY_SRC` in its capabilities), decided
+    /// once at start-up and published here so a refusal can name the real reason instead of the request
+    /// timing out. `false` until the render thread has configured a surface.
+    pub frame_capture_supported: bool,
     /// M19 (ADR-104) — terrain chunks the runtime wants uploaded, drained by the render thread a few per
     /// frame. Geometry and textures are separate `Option`s: a LOD switch re-sends only the vertices, because
     /// the chunk's half-megabyte splat texture has not changed.
@@ -1243,6 +1688,33 @@ pub struct SceneState {
     /// — the identical trick `gizmo_test_cursor` plays for the transform gizmo. `None` ⇒ the live cursor
     /// drives, which is the production path.
     pub terrain_test_cursor: Option<(f32, f32)>,
+
+    // ── Ground sketch (the Build sub-engine's in-viewport outline) ────────────────────────────────
+    /// The ground-sketch tool is armed: the render loop aims it every frame, and a left click on the
+    /// stage places a corner instead of picking. Render-only state, like `terrain_tool`.
+    pub sketch_active: bool,
+    /// Snap pitch in metres; `0` is freehand. Set when the author changes it, never per frame.
+    pub sketch_grid_m: f32,
+    /// Lock a new segment's direction to a multiple of 15° when the cursor is close to one.
+    pub sketch_angle_snap: bool,
+    /// The height of the horizontal construction plane the outline is drawn on. The FIRST corner sets
+    /// it (from the terrain, or from this value when there is no terrain); every later corner inherits
+    /// it, which is what keeps a sketch planar and therefore extrudable.
+    pub sketch_plane_y: f32,
+    /// Corners placed so far, in world metres, awaiting a commit.
+    pub sketch_points: Vec<[f32; 3]>,
+    /// Where the next corner would land — the snapped cursor, republished every frame for the overlay
+    /// and read by `sketch_point` so a click is ONE command rather than a screen-to-world round trip.
+    pub sketch_cursor: Option<[f32; 3]>,
+    /// What decided [`Self::sketch_cursor`] ([`metrocalk_editor_shell::sketch::SnapKind`]), and whether
+    /// taking it would close the loop. Published for the readout so a snap is a claim, not a surprise.
+    pub sketch_snap: Option<(metrocalk_editor_shell::sketch::SnapKind, bool)>,
+    /// A test-injected normalized cursor for the ground sketch — the same trick `terrain_test_cursor`
+    /// plays, so an end-to-end test drives the SAME native aiming path a hand does.
+    pub sketch_test_cursor: Option<(f32, f32)>,
+    /// The outline has been closed by clicking its first corner: finished, waiting to be raised.
+    /// Distinct from "has three corners" — an author who has not said they are done is still drawing.
+    pub sketch_closed: bool,
 }
 
 /// Which terrain tool the pointer drives.
@@ -1411,62 +1883,105 @@ impl SceneState {
         }
     }
 
-    /// The visible sub-rectangle as `([width_fraction, height_fraction], [ndc_x, ndc_y])`, sanitised.
+    /// Publish a new camera pose to the render loop, so that captures asked for from here on wait for a
+    /// frame that was drawn with it.
     ///
-    /// A missing, degenerate or out-of-range report collapses to the whole surface centred on itself,
-    /// which is exactly the pre-existing behaviour -- a bad rectangle must never be able to fling the
-    /// camera somewhere the subject is not.
-    fn visible_frame(&self) -> ([f32; 2], [f32; 2]) {
-        let [x, y, w, h] = self.visible_rect;
-        let sane = [x, y, w, h].iter().all(|v| v.is_finite())
-            && w > 0.02
-            && h > 0.02
-            && w <= 1.001
-            && h <= 1.001
-            && x >= -0.001
-            && y >= -0.001
-            && x + w <= 1.001
-            && y + h <= 1.001;
-        if !sane {
-            return ([1.0, 1.0], [0.0, 0.0]);
+    /// Every writer of [`Self::cam_override`] that a capture could follow goes through this rather than
+    /// assigning the field: an epoch that is bumped *most* of the time is worse than none, because the
+    /// one path that forgot is the one that silently writes the previous pose's picture.
+    pub fn publish_camera(&mut self, view: Option<CamView>) {
+        self.cam_override = view;
+        self.pose_epoch = self.pose_epoch.wrapping_add(1);
+    }
+
+    /// Ask for the next frame drawn at the current pose, as a PNG. Returns the request id to poll with.
+    pub fn request_frame(&mut self) -> u64 {
+        let req = self.next_request();
+        let min_epoch = self.pose_epoch;
+        self.frame_requests.push(FrameRequest { req, min_epoch });
+        req
+    }
+
+    /// Take the answer to capture `req`, if it has arrived. A result belongs to exactly one request.
+    pub fn take_frame(&mut self, req: u64) -> FrameTake {
+        let Some(pos) = self.frame_results.iter().position(|r| r.req == req) else {
+            return FrameTake::Pending;
+        };
+        let got = self.frame_results.remove(pos);
+        match (got.png, got.reason) {
+            (Some(png), _) => FrameTake::Ready {
+                png,
+                width: got.width,
+                height: got.height,
+            },
+            (None, Some(why)) => FrameTake::Failed(why),
+            // Unreachable by construction (the render thread writes one or the other), and a sentence
+            // rather than an `expect` because the two producers are 2,000 lines apart.
+            (None, None) => FrameTake::Failed("the frame came back empty".into()),
         }
-        // The rectangle is measured from the top-left in DOM fractions; NDC y points up.
-        (
-            [w.min(1.0), h.min(1.0)],
-            [(x + w * 0.5).mul_add(2.0, -1.0), 1.0 - (y + h * 0.5) * 2.0],
-        )
+    }
+
+    /// Abandon a capture: drop its pending request and any result already waiting for it. Called when a
+    /// render job is cancelled, so a finished job cannot be answered by the one before it.
+    pub fn forget_frame(&mut self, req: u64) {
+        self.frame_requests.retain(|r| r.req != req);
+        self.frame_results.retain(|r| r.req != req);
     }
 
     /// The visible rectangle actually in force, after sanitisation -- what a caller reporting one gets
     /// back, so "it was rejected" is observable rather than a silent revert to the whole window.
     #[must_use]
     pub fn adopted_visible_rect(&self) -> [f32; 4] {
-        let ([w, h], [ndc_x, ndc_y]) = self.visible_frame();
-        [
-            ndc_x.mul_add(0.5, 0.5) - w * 0.5,
-            (1.0 - ndc_y) * 0.5 - h * 0.5,
-            w,
-            h,
-        ]
+        sane_frame(self.visible_rect)
     }
 
-    /// Where to put the orbit target so that `subject` lands in the middle of the visible rectangle.
+    /// The rectangle the picture is COMPOSED for: the visible viewport, inset to the delivery frame when
+    /// a cutscene is composing for one.
     ///
-    /// The target is what projects to the centre of the *surface*, and the visible hole is generally not
-    /// centred there. Offsetting the target along the camera's own right/up by the hole's NDC centre --
-    /// scaled by the frustum half-extents at that distance -- slides the subject into the hole without
-    /// touching the projection, which must keep spanning the window because picking rays and the
-    /// composited image both do.
-    fn target_centred_in_viewport(&self, subject: Vec3, distance: f32, aspect: f32) -> [f32; 3] {
-        let (_, [ndc_x, ndc_y]) = self.visible_frame();
-        if ndc_x.abs() < 1.0e-4 && ndc_y.abs() < 1.0e-4 {
-            return subject.to_array();
+    /// The single answer to "what shape is the frame". The projection is sheared to it, the fit that
+    /// `frame_all` and `focus_on` solve is measured against it, picking rays are cast through it, and
+    /// the bars the stage draws are the difference between it and [`Self::adopted_visible_rect`]. One
+    /// answer, so a shot cannot be composed for one frame and shown inside another.
+    #[must_use]
+    pub fn composition_rect(&self) -> [f32; 4] {
+        let rect = self.adopted_visible_rect();
+        // A delivery frame only insets while something is ACTUALLY holding the camera. Gated on
+        // `cam_override` rather than on every teardown path remembering to clear the aspect: there are
+        // five of those, and a missed one would letterbox the author's own viewport with no cutscene
+        // on screen and no control anywhere to turn it off.
+        if self.cam_override.is_none() {
+            return rect;
         }
-        let half_v = (CAMERA_FOV_DEG.to_radians() * 0.5).clamp(0.01, 1.5).tan();
-        let (right, up) = camera_right_up(self.orbit, self.elevation);
-        let offset =
-            right * (ndc_x * distance * half_v * aspect) + up * (ndc_y * distance * half_v);
-        (subject - offset).to_array()
+        match self.delivery_aspect {
+            Some(want) if want.is_finite() && want > 0.05 => {
+                inset_to_aspect(rect, self.surface_aspect, want)
+            }
+            _ => rect,
+        }
+    }
+
+    /// The composed rectangle together with the surface it sits on -- what every projection, ray and fit
+    /// in this file is built from.
+    #[must_use]
+    pub fn view_frame(&self, surface_aspect: f32) -> ViewFrame {
+        ViewFrame::new(surface_aspect, self.composition_rect())
+    }
+
+    /// The aspect ratio of the rectangle the picture is composed for -- the number a shot solver needs
+    /// to decide how far back the camera stands.
+    #[must_use]
+    pub fn composition_aspect(&self) -> f32 {
+        self.view_frame(self.known_surface_aspect()).aspect()
+    }
+
+    /// The live surface aspect if one has been published, and the pre-surface guess otherwise.
+    #[must_use]
+    pub fn known_surface_aspect(&self) -> f32 {
+        if self.surface_aspect > 0.01 {
+            self.surface_aspect
+        } else {
+            DEFAULT_ASPECT
+        }
     }
 
     /// M10.7 — **frame the whole scene**: center the orbit target on the scene's bounds and set a distance
@@ -1475,12 +1990,7 @@ impl SceneState {
     pub fn frame_all(&mut self) {
         // The aspect the user is actually looking through, not a constant. Falls back only before the
         // first frame has published one.
-        let aspect = if self.surface_aspect > 0.01 {
-            self.surface_aspect
-        } else {
-            DEFAULT_ASPECT
-        };
-        self.frame_all_with_aspect(aspect);
+        self.frame_all_with_aspect(self.known_surface_aspect());
     }
 
     /// Frame the whole scene through a lens of the given aspect ratio.
@@ -1508,15 +2018,17 @@ impl SceneState {
         else {
             return;
         };
-        let (visible, _) = self.visible_frame();
+        let frame = ViewFrame::new(aspect, self.composition_rect());
         let distance =
-            fit_distance_in_viewport((hi - lo) * 0.5, aspect, self.orbit, self.elevation, visible);
+            fit_distance_in_viewport((hi - lo) * 0.5, frame.aspect(), self.orbit, self.elevation);
         // `clear_focus` restores the pre-focus distance, so it has to run BEFORE the new framing is
         // written -- otherwise framing everything hands the camera back the distance it had while
         // focused on one part.
         self.clear_focus();
         self.distance = distance;
-        self.cam_target = self.target_centred_in_viewport((lo + hi) * 0.5, distance, aspect);
+        // The subject IS the orbit target. Sliding it sideways to land in the visible hole was the old
+        // answer, and it was correct for exactly one frame: see `framed_projection`.
+        self.cam_target = ((lo + hi) * 0.5).to_array();
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -1570,11 +2082,13 @@ impl SceneState {
         // focus dims the rest) — clear any prior highlight first.
         if let Some(p) = self.selected {
             if p < self.instances.len() {
-                self.instances[p].selected = 0.0;
+                self.instances[p].highlight =
+                    highlight_with(self.instances[p].highlight, HIGHLIGHT_SELECTED, false);
             }
         }
         self.selected = Some(i);
-        self.instances[i].selected = 1.0;
+        self.instances[i].highlight =
+            highlight_with(self.instances[i].highlight, HIGHLIGHT_SELECTED, true);
         // Center and size come from the real authored geometry. This is essential for offset meshes and for
         // CAD whose vertices are in millimetres while its instance scale is 0.001.
         let local_bounds = self
@@ -1598,19 +2112,14 @@ impl SceneState {
         // camera NEAR it (the old 6 m floor parked a 2 cm part sub-pixel — the same M15.9 defect family
         // as frame-all's metre floors).
         let half_extent = ((world_hi - world_lo) * 0.5).max_element().max(0.02);
-        // Pull back by the visible fraction as well: a part framed to fill the WINDOW is cropped by
-        // whatever share of the window the docks cover, and then centred somewhere the viewer cannot
-        // even see. Both halves of that are fixed here and in `target_centred_in_viewport` below.
-        let (visible, _) = self.visible_frame();
-        let shrink = visible[0].min(visible[1]).clamp(0.05, 1.0);
-        self.distance = (half_extent * 4.0 / shrink).clamp(0.15, 400.0);
-        let aspect = if self.surface_aspect > 0.01 {
-            self.surface_aspect
-        } else {
-            DEFAULT_ASPECT
-        };
-        self.cam_target =
-            self.target_centred_in_viewport((world_lo + world_hi) * 0.5, self.distance, aspect);
+        // Pull back when the composed frame is TALLER than it is wide: four half-extents of stand-off
+        // clears the vertical field of view with room to spare, and only the horizontal one can be
+        // tighter. A wide frame needs nothing, which is why this used to be the visible fraction and is
+        // now the frame's own shape - the docks no longer crop the picture, they change what it is.
+        let frame = self.view_frame(self.known_surface_aspect());
+        let narrow = frame.aspect().clamp(0.05, 1.0);
+        self.distance = (half_extent * 4.0 / narrow).clamp(0.15, 400.0);
+        self.cam_target = ((world_lo + world_hi) * 0.5).to_array();
         self.focused = Some(i);
         self.revision = self.revision.wrapping_add(1);
     }
@@ -2695,8 +3204,23 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         .copied()
         .find(|f| !f.is_srgb())
         .unwrap_or(caps.formats[0]);
+    // ADR-175 — a still has to come out of the ONE render path, which means reading back the swapchain
+    // texture itself. That needs `COPY_SRC` on the surface, which every desktop backend offers and none
+    // is obliged to; asking for it where it is unavailable makes `configure` fail and the viewport never
+    // appears, so the capability decides and the answer is published for the refusal to quote.
+    let can_capture = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+    if !can_capture {
+        crate::diag::log(
+            "viewport: this surface cannot be copied from - rendering a frame to a file is unavailable on this adapter",
+        );
+    }
+    shared.lock().unwrap().frame_capture_supported = can_capture;
     let mut config = wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: if can_capture {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        },
         format,
         width: w,
         height: h,
@@ -3127,7 +3651,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             center: [0.0, -0.02, 0.0], // a hair below the grid so the grid lines read on top
             scale: 60.0,
             color: [0.30, 0.31, 0.34],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4], // no override → use the baked matte vertex material
         }],
@@ -3144,6 +3668,36 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         &dummy_mr_view,
         &albedo_sampler,
     );
+
+    // The presentation hall (see `crate::hall`). Its vertices are built in WORLD space, so its single
+    // instance is the identity — unlike the ground quad, which is a unit quad the instance places and
+    // scales. Rebuilt only when the room's dimensions change, which is when the scene's bounds do.
+    let mut hall_inst = InstanceBuf::new(&device, &inst_bgl, 1);
+    hall_inst.upload(
+        &device,
+        &queue,
+        &inst_bgl,
+        &[Instance {
+            center: [0.0; 3],
+            scale: 1.0,
+            color: [1.0; 3],
+            highlight: 0.0,
+            rotation: IDENTITY_QUAT,
+            material: [0.0; 4], // no override → the baked per-surface material is the material
+        }],
+    );
+    let hall_main_bg = make_mesh_main_bg(
+        &device,
+        &mesh_inst_bgl,
+        &hall_inst.buf,
+        &dummy_view,
+        &dummy_mr_view,
+        &dummy_normal_view,
+        &dummy_mr_view,
+        &albedo_sampler,
+    );
+    let mut hall_built: Option<crate::hall::Hall> = None;
+    let mut hall_buffers: Option<(wgpu::Buffer, wgpu::Buffer, u32)> = None;
 
     let depth_state = wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
@@ -3526,6 +4080,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
     // buffer rather than the contact debugger's, so a debugger toggle cannot erase the brush.
     let mut terrain_overlay = InstanceBuf::new(&device, &inst_bgl, 256);
     let mut terrain_overlay_pts: Vec<Instance> = Vec::new();
+    let mut sketch_overlay = InstanceBuf::new(&device, &inst_bgl, 256);
+    let mut sketch_overlay_pts: Vec<Instance> = Vec::new();
     // M19 — how many entries of each per-slot instance list belong to real entities. Scattered vegetation is
     // appended after that mark every frame and trimmed back to it before the next append, so the entity
     // partition is computed once per scene revision while the foliage follows the camera.
@@ -3599,6 +4155,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             visibility,
             env_source_space,
             working_space,
+            letterbox,
+            capture_rect,
+            drawn_epoch,
         ) = {
             // The real surface aspect, so the very first framing fits the lens the user is looking
             // through rather than an assumed one.
@@ -3617,7 +4176,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     st.orbit,
                     st.elevation,
                     st.distance,
-                    aspect_hint,
+                    st.view_frame(aspect_hint),
                     st.cam_target.into(),
                     st.projection,
                 )
@@ -3686,7 +4245,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         st.orbit,
                         st.elevation,
                         st.distance,
-                        aspect,
+                        st.view_frame(aspect),
                         st.cam_target,
                         st.projection,
                     );
@@ -3990,7 +4549,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         st.orbit,
                         st.elevation,
                         st.distance,
-                        aspect_hint,
+                        st.view_frame(aspect_hint),
                         st.cam_target,
                         st.projection,
                     );
@@ -4037,6 +4596,71 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             } else if st.terrain_cursor_hit.is_some() {
                 st.terrain_cursor_hit = None;
             }
+            // The ground sketch aims from HERE, on the render thread, for the same reason the terrain
+            // brush does: the rubber band, the snap marker and the closing hint must follow the cursor
+            // at frame rate, and a JS mouse-move would put an IPC round trip between the hand and the
+            // line (invariant 4). Only a click crosses the boundary, and it crosses once.
+            if st.sketch_active {
+                let cursor = st
+                    .sketch_test_cursor
+                    .or_else(|| surface_fraction(cursor_pos, client_origin, w, h));
+                // The plane the outline is drawn on. With no corner placed yet and a terrain live, the
+                // ground itself proposes the height — so an outline drawn on a hillside starts ON the
+                // hillside rather than at sea level. The first corner then LOCKS it (`sketch_point`),
+                // and every later corner inherits it, which is what keeps the outline planar.
+                let plane_y = st.sketch_points.first().map_or(st.sketch_plane_y, |p| p[1]);
+                let raw = cursor.and_then(|cur| {
+                    let (ro, rd) = cursor_ray(
+                        cur,
+                        st.orbit,
+                        st.elevation,
+                        st.distance,
+                        st.view_frame(aspect_hint),
+                        st.cam_target,
+                        st.projection,
+                    );
+                    if st.sketch_points.is_empty() && st.terrain.is_active() {
+                        if let Some(hit) = st
+                            .terrain
+                            .terrain()
+                            .and_then(|t| t.raycast(ro, rd, st.distance * 8.0 + 4000.0))
+                        {
+                            return Some(hit);
+                        }
+                    }
+                    // A parallel ray can run along the plane; a perspective one can point away from it.
+                    // Both are "the cursor is not over the ground", and both must say so rather than
+                    // divide by a near-zero and place a corner at infinity.
+                    if rd[1].abs() < 1.0e-5 {
+                        return None;
+                    }
+                    let t = (plane_y - ro[1]) / rd[1];
+                    (t > 0.0).then(|| [ro[0] + rd[0] * t, plane_y, ro[2] + rd[2] * t])
+                });
+                // A tolerance measured in WORLD metres but derived from the camera distance, so the
+                // snap stays the same size on screen whether the outline is a doorway or a runway.
+                let tol = (st.distance * 0.02).clamp(0.05, 5.0);
+                match raw {
+                    Some(raw) => {
+                        let s = metrocalk_editor_shell::sketch::snap_cursor(
+                            raw,
+                            &st.sketch_points,
+                            st.sketch_grid_m,
+                            st.sketch_angle_snap,
+                            tol,
+                        );
+                        st.sketch_cursor = Some(s.point);
+                        st.sketch_snap = Some((s.kind, s.closes));
+                    }
+                    None => {
+                        st.sketch_cursor = None;
+                        st.sketch_snap = None;
+                    }
+                }
+            } else if st.sketch_cursor.is_some() {
+                st.sketch_cursor = None;
+                st.sketch_snap = None;
+            }
             // Rebuild the tool overlay each frame: a ring under the cursor, and the route so far.
             terrain_overlay_pts.clear();
             if st.terrain_tool == TerrainTool::Sculpt {
@@ -4057,6 +4681,20 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 );
             }
             terrain_overlay.upload(&device, &queue, &inst_bgl, &terrain_overlay_pts);
+            // The ground sketch's own overlay. A separate buffer from the terrain tools' because the
+            // two are different sub-engines that can be armed independently, and sharing one vector
+            // would make "what is on screen" depend on the order two unrelated tools were armed in.
+            sketch_overlay_pts.clear();
+            if st.sketch_active {
+                push_sketch_preview(
+                    &mut sketch_overlay_pts,
+                    &st.sketch_points,
+                    st.sketch_cursor,
+                    st.sketch_snap.is_some_and(|(_, closes)| closes),
+                    (st.distance * 0.0016).clamp(0.01, 0.6),
+                );
+            }
+            sketch_overlay.upload(&device, &queue, &inst_bgl, &sketch_overlay_pts);
             // Read here, used by the ground-plane decision in the pass below.
             let terrain_active = st.terrain.is_active();
 
@@ -4243,11 +4881,29 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 lights_buf.upload(&device, &queue, &lights_bgl, &st.lights);
             }
             let aspect = w as f32 / h.max(1) as f32;
+            // The rectangle the picture is composed for, decided ONCE per frame and used by the editor
+            // camera, the cinematic override below and the bars drawn around it.
+            let frame = st.view_frame(aspect);
+            // LETTERBOX. When a cutscene composes for a delivery frame, the final resolve is scissored
+            // to that frame and the swapchain's own black clear becomes the bars.
+            //
+            // Drawn here rather than as an overlay in the editor's DOM for two reasons. The bars belong
+            // to the PICTURE, not to the chrome: Play, the timeline's preview and anything else that
+            // ever takes the camera all get them from the one rectangle the camera was composed for,
+            // with no command, no poll and no second copy of the inset rule to drift. And they are the
+            // only honest way to author a shot for a frame the author's stage is not the shape of.
+            let letterbox = st.delivery_aspect.map(|_| frame_pixels(frame.rect(), w, h));
+            // WHAT A CAPTURE WOULD KEEP: the composed frame, in pixels, whether or not there are bars.
+            // Not `letterbox`, which is `None` when nothing is delivering — and the whole window is the
+            // wrong answer there, because the window includes the strips behind the docks that the
+            // camera was never composed for. This is the same rectangle the projection is sheared to,
+            // which is what makes the file and the picture agree at every aspect.
+            let capture_rect = frame_pixels(frame.rect(), w, h);
             let mut cam = camera_matrix_with(
                 st.orbit,
                 st.elevation,
                 st.distance,
-                aspect,
+                frame,
                 st.cam_target.into(),
                 st.projection,
             );
@@ -4260,7 +4916,18 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // (its position + fov, looking at its authored target). A pure render projection (never Loro).
             if let Some(ov) = st.cam_override {
                 let (eye, target, up) = resolved_camera_aim(ov, Vec3::from(st.cam_target));
-                let proj = Mat4::perspective_rh(ov.fov_deg.to_radians(), aspect, ov.near, ov.far);
+                // Sheared to the same composed frame. A cutscene that solved its pose for a delivery
+                // aspect and was then drawn through a window-shaped frustum would be a picture of a
+                // shot the engine did not film.
+                let distance = (Vec3::from(ov.pos) - target).length();
+                let proj = framed_projection(
+                    Projection::Perspective,
+                    ov.fov_deg,
+                    frame,
+                    distance,
+                    ov.near,
+                    ov.far,
+                );
                 cam = proj * Mat4::look_at_rh(eye, target, up);
                 cam_eye = ov.pos;
             }
@@ -4278,6 +4945,40 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             }
             let scene_bounds = bounds_cache.and_then(|(_, bounds)| bounds);
 
+            // Size the presentation room to the same bounds, and rebuild its mesh only when those
+            // bounds actually move it. `sync_stage` is the ONE place the room's dimensions are decided;
+            // the draw pass reads them rather than deriving a second set of its own.
+            st.sync_stage();
+            if st.hall != hall_built {
+                hall_built = st.hall;
+                hall_buffers = st.hall.map(|hall| {
+                    let mesh = hall.build();
+                    diag_log!(
+                        "presentation hall: {} x {} m, {:.1} m clear, {:.1} m bays, {} triangles",
+                        hall.half_x * 2.0,
+                        hall.half_z * 2.0,
+                        hall.height,
+                        hall.bay,
+                        mesh.triangle_count()
+                    );
+                    (
+                        create_init_buffer(
+                            &device,
+                            "hall-vbuf",
+                            bytemuck::cast_slice(&mesh.vertices),
+                            wgpu::BufferUsages::VERTEX,
+                        ),
+                        create_init_buffer(
+                            &device,
+                            "hall-ibuf",
+                            bytemuck::cast_slice(&mesh.indices),
+                            wgpu::BufferUsages::INDEX,
+                        ),
+                        mesh.indices.len() as u32,
+                    )
+                });
+            }
+
             // Stand the ground receiver under whatever is actually in the scene. Written straight into the
             // existing single-instance buffer (never reallocated), so `ground_main_bg` stays valid.
             {
@@ -4294,7 +4995,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                             center: wanted.0,
                             scale: wanted.1,
                             color: GROUND_ALBEDO,
-                            selected: 0.0,
+                            highlight: 0.0,
                             rotation: IDENTITY_QUAT,
                             material: [0.0; 4],
                         }),
@@ -4349,7 +5050,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                                 center: gv.pos,
                                 scale: 0.0,
                                 color: gv.color,
-                                selected: 0.0,
+                                highlight: 0.0,
                                 rotation: IDENTITY_QUAT,
                                 material: [0.0; 4],
                             })
@@ -4372,7 +5073,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                             center: [g[0] + ax[0] * o, g[1] + ax[1] * o, g[2] + ax[2] * o],
                             scale: 0.0,
                             color: GHOST,
-                            selected: 0.0,
+                            highlight: 0.0,
                             rotation: IDENTITY_QUAT,
                             material: [0.0; 4],
                         };
@@ -4416,6 +5117,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 // the frame by one tick is a frame whose textures and lights are in different spaces —
                 // the mixed-state frame the atomicity requirement exists to forbid.
                 st.working_space,
+                letterbox,
+                capture_rect,
+                // The camera generation THIS frame is being drawn at, read under the same lock as the
+                // camera itself. A capture asked for at a later epoch must not be answered by it.
+                st.pose_epoch,
             )
         };
         queue.write_buffer(
@@ -4762,11 +5468,23 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // lake bed, a canyon floor. Leaving it in draws an opaque grey lid over exactly those places. On
             // the live app it hid the entire Rolling Hills sea floor and made the terrain look like it had
             // never streamed in. The grid goes with it: it describes a surface that is no longer there.
+            //
+            // The presentation HALL replaces the quad rather than joining it. Its own slab runs well
+            // past the wall line, so it is already the ground everywhere the ground was; drawing both
+            // would put two coplanar surfaces a centimetre apart across four hundred metres, which is
+            // z-fighting at exactly the grazing angles a floor is seen at.
             if !terrain_active && visibility.allows(ViewportLayer::GroundShadowReceiver) {
-                rp.set_bind_group(1, &ground_main_bg, &[]);
-                rp.set_vertex_buffer(0, ground_vbuf.slice(..));
-                rp.set_index_buffer(ground_ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                rp.draw_indexed(0..GROUND_IDX.len() as u32, 0, 0..1);
+                if let Some((vbuf, ibuf, indices)) = hall_buffers.as_ref() {
+                    rp.set_bind_group(1, &hall_main_bg, &[]);
+                    rp.set_vertex_buffer(0, vbuf.slice(..));
+                    rp.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..*indices, 0, 0..1);
+                } else {
+                    rp.set_bind_group(1, &ground_main_bg, &[]);
+                    rp.set_vertex_buffer(0, ground_vbuf.slice(..));
+                    rp.set_index_buffer(ground_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..GROUND_IDX.len() as u32, 0, 0..1);
+                }
             }
             if !terrain_active && visibility.allows(ViewportLayer::Grid) {
                 rp.set_pipeline(&grid_pipeline);
@@ -4820,6 +5538,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 rp.set_bind_group(1, &terrain_overlay.bg, &[]);
                 rp.draw(0..terrain_overlay.n, 0..1);
             }
+            // The ground sketch's outline, rubber band and snap marker. Same always-pass overlay
+            // pipeline; empty unless the tool is armed, so it costs nothing otherwise.
+            if visibility.allows(ViewportLayer::GroundSketchOverlay) && sketch_overlay.n > 0 {
+                rp.set_pipeline(&overlay_pipeline);
+                rp.set_bind_group(1, &sketch_overlay.bg, &[]);
+                rp.draw(0..sketch_overlay.n, 0..1);
+            }
             // M9.1 transform gizmo, drawn LAST (over everything), per-segment X/Y/Z colour, always-pass
             // depth. Skipped when nothing is selected (`gizmo_buf.n == 0`) — zero per-frame cost.
             if visibility.allows(ViewportLayer::GizmoAndSnapChrome) && gizmo_buf.n > 0 {
@@ -4833,7 +5558,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         let mut fullscreen = |label: &str,
                               target: &wgpu::TextureView,
                               pipeline: &wgpu::RenderPipeline,
-                              bg: &wgpu::BindGroup| {
+                              bg: &wgpu::BindGroup,
+                              scissor: Option<[u32; 4]>| {
             let mut p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4850,6 +5576,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            // The clear above has already painted the whole attachment black; scissoring the draw is
+            // what leaves that black showing as bars. Only ever set on the final resolve: an
+            // intermediate HDR pass that skipped part of its target would feed the next pass garbage.
+            if let Some([x, y, sw, sh]) = scissor {
+                p.set_scissor_rect(x, y, sw, sh);
+            }
             p.set_pipeline(pipeline);
             p.set_bind_group(0, &cam_bg, &[]); // exposure + presentation profile + encode selector
             p.set_bind_group(1, bg, &[]);
@@ -4890,9 +5622,68 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             let Some((label, target, pipeline, bg)) = resolved else {
                 continue;
             };
-            fullscreen(label, target, pipeline, bg);
+            let scissor = if matches!(pass, PostPass::Resolve) {
+                letterbox
+            } else {
+                None
+            };
+            fullscreen(label, target, pipeline, bg, scissor);
         }
         queue.submit([enc.finish()]);
+        // ADR-175 — KEEP THIS FRAME, if anybody asked for it while it was being drawn.
+        //
+        // Between the submit and the present, because those are the only two lines with a swapchain
+        // texture in hand that already holds the finished picture. Reading it back here — rather than
+        // re-rendering the scene into an offscreen target — is what makes the file and the viewport the
+        // same image by construction: same instance list, same lights, same post route, same final
+        // resolve, same scissored bars. A second renderer would be a second grade, which is precisely
+        // the drift `render_thumbnail`'s own comment records paying for.
+        //
+        // Cropped to the delivery rectangle when there is one, so the FILE is the frame the shot was
+        // composed for and the bars are absent from it rather than baked into it. A capture is rare,
+        // explicit, and stalls this thread while it maps — which is correct: an author who asked for a
+        // still is not orbiting, and a render job wants the frames more than it wants the frame rate.
+        {
+            let due: Vec<FrameRequest> = {
+                let mut st = shared.lock().unwrap();
+                let (mine, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.frame_requests)
+                    .into_iter()
+                    .partition(|r| r.min_epoch <= drawn_epoch);
+                st.frame_requests = later;
+                mine
+            };
+            if !due.is_empty() {
+                let rect = capture_rect;
+                let captured = if can_capture {
+                    capture_presented_frame(&device, &queue, &frame.texture, format, rect)
+                } else {
+                    Err("this graphics adapter does not allow the viewport to be copied, so a frame cannot be written to a file".to_string())
+                };
+                let mut st = shared.lock().unwrap();
+                for request in due {
+                    let result = match &captured {
+                        Ok(png) => FrameResult {
+                            req: request.req,
+                            png: Some(png.clone()),
+                            width: rect[2],
+                            height: rect[3],
+                            reason: None,
+                        },
+                        Err(why) => FrameResult {
+                            req: request.req,
+                            png: None,
+                            width: 0,
+                            height: 0,
+                            reason: Some(why.clone()),
+                        },
+                    };
+                    st.frame_results.push(result);
+                }
+                // A caller that timed out or was cancelled must not be able to grow this without bound.
+                let excess = st.frame_results.len().saturating_sub(16);
+                st.frame_results.drain(0..excess);
+            }
+        }
         frame.present();
 
         let cpu_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
@@ -4929,7 +5720,7 @@ pub fn camera_matrix(orbit: f32, elevation: f32, distance: f32, aspect: f32, tar
         orbit,
         elevation,
         distance,
-        aspect,
+        ViewFrame::whole(aspect),
         target,
         Projection::Perspective,
     )
@@ -4946,7 +5737,7 @@ pub fn camera_matrix_with(
     orbit: f32,
     elevation: f32,
     distance: f32,
-    aspect: f32,
+    frame: ViewFrame,
     target: Vec3,
     projection: Projection,
 ) -> Mat4 {
@@ -4957,19 +5748,18 @@ pub fn camera_matrix_with(
     );
     let eye = target + offset;
     let far = distance * 8.0 + 100.0;
-    let proj = match projection {
-        Projection::Perspective => {
-            Mat4::perspective_rh(CAMERA_FOV_DEG.to_radians(), aspect, 0.1, far)
-        }
-        Projection::Orthographic => {
-            let half_h = distance * (CAMERA_FOV_DEG.to_radians() * 0.5).tan();
-            let half_w = half_h * aspect;
-            // The near plane goes BEHIND the eye. A parallel projection has no apex to clip against, and
-            // starting at the eye would slice away everything between the camera and its orbit target -
-            // which in a top view is most of the scene.
-            Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -far, far)
-        }
-    };
+    // The near plane SCALES with the stand-off. A fixed one destroys depth precision at plant scale:
+    // this is a standard `perspective_rh` with no reversed-Z, so the resolvable depth step grows as
+    // z^2 / near, and at a 500 m stand-off the old fixed 0.1 m near plane resolved roughly 15 cm. Any
+    // two surfaces closer together than that - a floor and the lines painted on it, two faces of an
+    // imported assembly, a slab and its bay joints - became a per-pixel coin toss, which is exactly how
+    // a 400 m apron came to render as blocky grey wedges.
+    //
+    // One per cent of the distance is the rule `metrocalk_animation::shot::cinematic_clip_planes`
+    // already applies to the cutscene camera, so the editor viewport and the film now agree about depth
+    // instead of disagreeing by two orders of magnitude.
+    let near = (distance * 0.01).clamp(0.02, 50.0).min(far * 0.5);
+    let proj = framed_projection(projection, CAMERA_FOV_DEG, frame, distance, near, far);
     proj * Mat4::look_at_rh(eye, target, Vec3::Y)
 }
 
@@ -5115,19 +5905,12 @@ pub fn cursor_ray(
     orbit: f32,
     elevation: f32,
     distance: f32,
-    aspect: f32,
+    frame: ViewFrame,
     target: [f32; 3],
     projection: Projection,
 ) -> ([f32; 3], [f32; 3]) {
-    let inv = camera_matrix_with(
-        orbit,
-        elevation,
-        distance,
-        aspect,
-        target.into(),
-        projection,
-    )
-    .inverse();
+    let inv =
+        camera_matrix_with(orbit, elevation, distance, frame, target.into(), projection).inverse();
     let ndc_x = cursor.0 * 2.0 - 1.0;
     let ndc_y = 1.0 - cursor.1 * 2.0;
     let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
@@ -5146,18 +5929,12 @@ pub fn project_to_screen(
     orbit: f32,
     elevation: f32,
     distance: f32,
-    aspect: f32,
+    frame: ViewFrame,
     target: [f32; 3],
     projection: Projection,
 ) -> Option<(f32, f32)> {
-    let clip = camera_matrix_with(
-        orbit,
-        elevation,
-        distance,
-        aspect,
-        target.into(),
-        projection,
-    ) * Vec3::from(world).extend(1.0);
+    let clip = camera_matrix_with(orbit, elevation, distance, frame, target.into(), projection)
+        * Vec3::from(world).extend(1.0);
     if clip.w <= 1e-6 {
         return None;
     }
@@ -5784,7 +6561,7 @@ fn thumbnail_framing(instance: &Instance, local_bounds: LocalBounds) -> (Instanc
         center: (-offset).to_array(),
         scale: instance.scale,
         color: instance.color,
-        selected: 0.0,
+        highlight: 0.0,
         rotation: rotation.to_array(),
         material: instance.material,
     };
@@ -6041,23 +6818,10 @@ fn render_thumbnail(
     }
     let data = slice.get_mapped_range();
 
-    // De-pad rows + reorder to RGBA8 (the swapchain format is BGRA on the Windows/Vulkan path). Then PNG.
-    let bgra = matches!(
-        format,
-        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-    );
-    let mut rgba = Vec::with_capacity((unpadded * size) as usize);
-    for row in 0..size {
-        let start = (row * padded) as usize;
-        let line = &data[start..start + unpadded as usize];
-        if bgra {
-            for px in line.chunks_exact(4) {
-                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-            }
-        } else {
-            rgba.extend_from_slice(line);
-        }
-    }
+    // De-pad rows + reorder to RGBA8 (the swapchain format is BGRA on the Windows/Vulkan path). Then
+    // PNG. Shared with the frame capture (ADR-175): two readbacks disagreeing about channel order would
+    // put a red-and-blue-swapped still beside a correct thumbnail of the same scene.
+    let rgba = depad_to_rgba(&data, format, padded, unpadded, size);
     drop(data);
     buf.unmap();
 
@@ -6070,6 +6834,120 @@ fn render_thumbnail(
         w.write_image_data(&rgba).ok()?;
     }
     Some(png_bytes)
+}
+
+/// ADR-175 — read the picture just submitted for `texture` back off the GPU, cropped to `rect`
+/// (`[x, y, width, height]` in surface pixels), and PNG-encode it.
+///
+/// Called between the frame's submit and its present, so `texture` is the swapchain image with the
+/// finished frame already in it — nothing is re-rendered and nothing is graded a second time. Every
+/// failure is a sentence rather than a `None`, because the caller's whole job is telling an author why
+/// a file they asked for does not exist.
+fn capture_presented_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    format: wgpu::TextureFormat,
+    rect: [u32; 4],
+) -> Result<Vec<u8>, String> {
+    let [x, y, width, height] = rect;
+    if width == 0 || height == 0 {
+        return Err("the viewport has no visible area to capture".into());
+    }
+    // 256-byte row alignment, exactly as the thumbnail readback does it.
+    let unpadded = width * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded = unpadded.div_ceil(align) * align;
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("frame-readback"),
+        size: u64::from(padded) * u64::from(height),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("frame-capture"),
+    });
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x, y, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([enc.finish()]);
+
+    let slice = buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r.is_ok());
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    if rx.recv().ok() != Some(true) {
+        return Err("the graphics driver did not hand the finished frame back".into());
+    }
+    let data = slice.get_mapped_range();
+    let rgba = depad_to_rgba(&data, format, padded, unpadded, height);
+    drop(data);
+    buf.unmap();
+
+    let mut png_bytes: Vec<u8> = Vec::new();
+    {
+        let mut pe = png::Encoder::new(&mut png_bytes, width, height);
+        pe.set_color(png::ColorType::Rgba);
+        pe.set_depth(png::BitDepth::Eight);
+        let mut w = pe
+            .write_header()
+            .map_err(|e| format!("the PNG header could not be written: {e}"))?;
+        w.write_image_data(&rgba)
+            .map_err(|e| format!("the image data could not be encoded: {e}"))?;
+    }
+    Ok(png_bytes)
+}
+
+/// Drop the row padding a GPU readback carries and put the channels in the order PNG expects.
+///
+/// The swapchain is BGRA on the Windows/Vulkan path and RGBA elsewhere, and the two are the same bytes
+/// in a different order — a capture that skipped this swaps every red and blue in the file, which looks
+/// like a colour-management bug and is not one. Extracted from `render_thumbnail`'s copy so the two
+/// readbacks cannot disagree about it, and so it is testable without a GPU.
+fn depad_to_rgba(
+    data: &[u8],
+    format: wgpu::TextureFormat,
+    padded: u32,
+    unpadded: u32,
+    rows: u32,
+) -> Vec<u8> {
+    let bgra = matches!(
+        format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    );
+    let mut rgba = Vec::with_capacity((unpadded * rows) as usize);
+    for row in 0..rows {
+        let start = (row * padded) as usize;
+        let line = &data[start..start + unpadded as usize];
+        if bgra {
+            for px in line.as_chunks::<4>().0 {
+                rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        } else {
+            rgba.extend_from_slice(line);
+        }
+    }
+    rgba
 }
 
 /// The non-size-dependent resources the thumbnail RTT borrows from the render loop. Grouped so the
@@ -6289,7 +7167,7 @@ fn push_brush_ring(
                 center: p,
                 scale: 0.0,
                 color: COLOR,
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: IDENTITY_QUAT,
                 material: [0.0; 4],
             });
@@ -6306,7 +7184,7 @@ fn push_route_preview(out: &mut Vec<Instance>, points: &[[f32; 3]], cursor: Opti
         center: p,
         scale: 0.0,
         color: c,
-        selected: 0.0,
+        highlight: 0.0,
         rotation: IDENTITY_QUAT,
         material: [0.0; 4],
     };
@@ -6327,6 +7205,113 @@ fn push_route_preview(out: &mut Vec<Instance>, points: &[[f32; 3]], cursor: Opti
     }
 }
 
+/// Build the ground-sketch overlay as line-list endpoint pairs: the outline placed so far, the rubber
+/// band out to the cursor, the edge that would close the loop, and a mark on every corner.
+///
+/// Kept pure and small so the *interaction* is testable without a GPU. Two things it deliberately
+/// draws that a naive preview would not:
+///
+/// * **The closing edge, before the loop is closed.** From two corners on, the shape the author is
+///   about to make is drawn dashed back to the first corner. Without it the outline reads as a path
+///   and the enclosed area — the thing being extruded — is invisible until the last click.
+/// * **A different colour when the next click will close it.** "Snapped to the first corner" and
+///   "near the first corner" look identical in geometry and mean opposite things.
+fn push_sketch_preview(
+    out: &mut Vec<Instance>,
+    points: &[[f32; 3]],
+    cursor: Option<[f32; 3]>,
+    closes: bool,
+    stroke_m: f32,
+) {
+    const EDGE: [f32; 3] = [0.30, 0.80, 1.00]; // placed outline — the confident colour
+    const BAND: [f32; 3] = [0.55, 0.62, 0.70]; // the segment not committed yet
+    const SHUT: [f32; 3] = [0.35, 1.00, 0.55]; // "this click finishes the shape"
+    const MARK: [f32; 3] = [1.00, 0.95, 0.40];
+    // Lift the overlay a few centimetres so it is not z-fighting the ground it describes.
+    const LIFT: f32 = 0.03;
+    let vertex = |p: [f32; 3], c: [f32; 3]| Instance {
+        center: [p[0], p[1] + LIFT, p[2]],
+        scale: 0.0,
+        color: c,
+        highlight: 0.0,
+        rotation: IDENTITY_QUAT,
+        material: [0.0; 4],
+    };
+    // A LINE LIST DRAWS ONE-PIXEL LINES, AND ONE PIXEL IS NOT A DRAWING. Measured on the packaged
+    // `.exe`: a 35 x 56 m outline over the editor grid was a hairline the corner marks had to be found
+    // by. There is no line-width in this pipeline, so an edge is drawn as a RIBBON — three parallel
+    // segments a fraction of the camera distance apart — which is legible at any zoom because
+    // `stroke_m` comes from the same place the snap tolerance does.
+    let mut edge = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+        let (dx, dz) = (b[0] - a[0], b[2] - a[2]);
+        let len = dx.hypot(dz);
+        let (nx, nz) = if len > 1.0e-5 {
+            (-dz / len * stroke_m, dx / len * stroke_m)
+        } else {
+            (0.0, 0.0)
+        };
+        for k in [-1.0_f32, 0.0, 1.0] {
+            out.push(vertex([a[0] + nx * k, a[1], a[2] + nz * k], c));
+            out.push(vertex([b[0] + nx * k, b[1], b[2] + nz * k], c));
+        }
+    };
+    for w in points.windows(2) {
+        edge(w[0], w[1], EDGE);
+    }
+    if let (Some(last), Some(c)) = (points.last(), cursor) {
+        edge(*last, c, if closes { SHUT } else { BAND });
+    }
+    // The edge back to the start: solid once it can actually close, dashed while it is a projection.
+    if let Some(first) = points.first() {
+        let tip = if closes { None } else { cursor };
+        if let Some(end) = tip.or_else(|| (points.len() >= 3).then(|| points[points.len() - 1])) {
+            if points.len() >= 2 {
+                let dashes = 9;
+                for i in 0..dashes {
+                    if i % 2 == 1 {
+                        continue;
+                    }
+                    let t0 = i as f32 / dashes as f32;
+                    let t1 = (i + 1) as f32 / dashes as f32;
+                    let at = |t: f32| {
+                        [
+                            end[0] + (first[0] - end[0]) * t,
+                            end[1] + (first[1] - end[1]) * t,
+                            end[2] + (first[2] - end[2]) * t,
+                        ]
+                    };
+                    edge(at(t0), at(t1), SHUT);
+                }
+            }
+        }
+    }
+    // A cross on every corner, and a bigger one under the cursor so the snapped point is visible
+    // against a busy scene. Sized from the outline so it stays legible at any zoom.
+    let span = points
+        .iter()
+        .chain(cursor.iter())
+        .fold(0.0_f32, |acc, p| {
+            let first = points.first().copied().unwrap_or(*p);
+            acc.max((p[0] - first[0]).hypot(p[2] - first[2]))
+        })
+        .max(1.0);
+    let m = (span * 0.03).clamp(0.08, 1.5);
+    for p in points {
+        for (dx, dz) in [(m, 0.0), (0.0, m)] {
+            out.push(vertex([p[0] - dx, p[1], p[2] - dz], MARK));
+            out.push(vertex([p[0] + dx, p[1], p[2] + dz], MARK));
+        }
+    }
+    if let Some(c) = cursor {
+        let k = m * 1.8;
+        let col = if closes { SHUT } else { MARK };
+        for (dx, dz) in [(k, 0.0), (0.0, k), (k * 0.7, k * 0.7), (k * 0.7, -k * 0.7)] {
+            out.push(vertex([c[0] - dx, c[1], c[2] - dz], col));
+            out.push(vertex([c[0] + dx, c[1], c[2] + dz], col));
+        }
+    }
+}
+
 /// Build the Pipe Forge route overlay as line-list endpoint pairs. Kept pure for interaction regression
 /// tests: N points produce N-1 route segments and three small axis marks at every control point.
 fn pipe_graph_preview_vertices(
@@ -6340,7 +7325,7 @@ fn pipe_graph_preview_vertices(
         center,
         scale: 0.0,
         color,
-        selected: 0.0,
+        highlight: 0.0,
         rotation: IDENTITY_QUAT,
         material: [0.0; 4],
     };
@@ -6446,6 +7431,7 @@ mod viewport_visibility_tests {
             ViewportLayer::MarkerGlyphs,
             ViewportLayer::PhysicsDebugOverlay,
             ViewportLayer::TerrainToolOverlay,
+            ViewportLayer::GroundSketchOverlay,
             ViewportLayer::GizmoAndSnapChrome,
         ];
         let cinematic = ViewportVisibility::from_cinematic(true);
@@ -6474,7 +7460,7 @@ mod shadow_framing_tests {
             center,
             scale,
             color: [0.5; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4],
         }
@@ -6688,7 +7674,7 @@ mod tests {
     /// Fit against the WHOLE surface -- what every framing assertion below is about, and what the
     /// renderer did before it learned that docks hide part of the window.
     fn fit_distance(half_extent: super::Vec3, aspect: f32, orbit: f32, elevation: f32) -> f32 {
-        super::fit_distance_in_viewport(half_extent, aspect, orbit, elevation, [1.0, 1.0])
+        super::fit_distance_in_viewport(half_extent, aspect, orbit, elevation)
     }
 
     // ── cursor coordinate spaces ──────────────────────────────────────────────────────────────
@@ -7765,7 +8751,14 @@ mod tests {
         // what stopped a top view being usable for comparing anything.
         let (orbit, elevation, distance, aspect) = (0.0, 0.0, 20.0, 16.0 / 9.0);
         let screen_size = |projection, depth: f32| {
-            let m = camera_matrix_with(orbit, elevation, distance, aspect, Vec3::ZERO, projection);
+            let m = camera_matrix_with(
+                orbit,
+                elevation,
+                distance,
+                ViewFrame::whole(aspect),
+                Vec3::ZERO,
+                projection,
+            );
             // At orbit 0 the camera sits on +X looking down -X, so DEPTH is the x axis. Probing z
             // would move the points sideways and measure nothing.
             let at = |y: f32| {
@@ -7798,7 +8791,14 @@ mod tests {
         // of projection and not a jump. An independent "ortho scale" would be free to disagree.
         let (orbit, elevation, distance, aspect) = (0.0, 0.0, 20.0, 16.0 / 9.0);
         let height_at_target = |projection| {
-            let m = camera_matrix_with(orbit, elevation, distance, aspect, Vec3::ZERO, projection);
+            let m = camera_matrix_with(
+                orbit,
+                elevation,
+                distance,
+                ViewFrame::whole(aspect),
+                Vec3::ZERO,
+                projection,
+            );
             let at = |y: f32| {
                 let c = m * Vec3::new(0.0, y, 0.0).extend(1.0);
                 c.y / c.w
@@ -7833,7 +8833,7 @@ mod tests {
             center: [x, 0.0, 0.0],
             scale: 1.0,
             color: [1.0, 1.0, 1.0],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0, 0.5, 0.0, 0.0],
         };
@@ -7882,7 +8882,7 @@ mod tests {
                 center: [10.0, 0.0, -4.0],
                 scale: 2.0,
                 color: [1.0, 1.0, 1.0],
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: IDENTITY_QUAT,
                 material: [0.0; 4],
             }],
@@ -7909,7 +8909,7 @@ mod tests {
             center: [x, 0.0, z],
             scale: 1.0,
             color: [1.0, 1.0, 1.0],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4],
         };
@@ -8049,7 +9049,7 @@ mod tests {
                 center: [x, 0.0, -6.0],
                 scale: 2.0,
                 color: [1.0; 3],
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: IDENTITY_QUAT,
                 material: [0.0; 4],
             });
@@ -8141,6 +9141,7 @@ mod tests {
             center: [0.0; 3],
             half_extent: [0.5; 3],
             forward: [0.0, 0.0, 1.0],
+            stage: metrocalk_animation::shot::Stage::OPEN,
         };
         let shot = ShotRecipe {
             id: "s".into(),
@@ -8257,7 +9258,7 @@ mod tests {
             center: [x, 0.0, 0.0],
             scale: 1.0,
             color: [1.0, 1.0, 1.0],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0, 0.5, 0.0, 0.0],
         };
@@ -8271,19 +9272,36 @@ mod tests {
         }
     }
 
-    /// Where a world point lands on the surface, in NDC, for the camera state `st` describes. Written
-    /// out rather than reusing the render path so the assertion is about the framing, not about a
-    /// helper that framing also uses.
-    fn project_ndc(st: &SceneState, world: Vec3) -> (f32, f32) {
-        let (right, up) = camera_right_up(st.orbit, st.elevation);
-        let target = Vec3::from_array(st.cam_target);
-        let half_v = (CAMERA_FOV_DEG.to_radians() * 0.5).tan();
-        let aspect = st.surface_aspect;
-        let rel = world - target;
-        (
-            rel.dot(right) / (st.distance * half_v * aspect),
-            rel.dot(up) / (st.distance * half_v),
+    /// Where a world point lands on the SURFACE, in the same `[0, 1]` top-left fractions the visible
+    /// rectangle is reported in.
+    ///
+    /// Through the shipped projection, deliberately. The previous version of this helper rebuilt a
+    /// symmetric window frustum by hand so the assertion would be "about the framing" -- which was true
+    /// while framing was the only thing that knew about the visible rectangle, and became a way to
+    /// measure a camera the renderer no longer uses the moment the rectangle moved into the projection.
+    fn project_surface(st: &SceneState, world: Vec3) -> (f32, f32) {
+        project_to_screen(
+            world.to_array(),
+            st.orbit,
+            st.elevation,
+            st.distance,
+            st.view_frame(st.known_surface_aspect()),
+            st.cam_target,
+            st.projection,
         )
+        .expect("the subject is in front of the camera")
+    }
+
+    /// Whether a surface fraction lands on the MIDDLE of a rectangle.
+    ///
+    /// The middle and not merely inside: a subject that has drifted a third of the way to an edge is
+    /// still inside the frame, and "inside" would go on passing while the composition rotted. It is
+    /// also a claim that can be defeated — a projection that ignores the rectangle centres on the
+    /// window, which lands inside a hole that contains the window's centre and nowhere near its
+    /// middle.
+    fn centred(rect: [f32; 4], point: (f32, f32)) -> bool {
+        let [x, y, w, h] = rect;
+        (point.0 - w.mul_add(0.5, x)).abs() < 1.0e-3 && (point.1 - h.mul_add(0.5, y)).abs() < 1.0e-3
     }
 
     #[test]
@@ -8334,30 +9352,270 @@ mod tests {
         let (lo, hi) = scene_world_bounds(&docked.instances, &docked.mesh_slots, &docked.meshes)
             .expect("bounds");
         let centre = (lo + hi) * 0.5;
-        let (ndc_x, ndc_y) = project_ndc(&docked, centre);
+        let (sx, sy) = project_surface(&docked, centre);
 
-        // The hole's own centre in NDC, which is where the subject now belongs.
-        let want_x = (0.369_f32 + 0.395 * 0.5).mul_add(2.0, -1.0);
-        let want_y = 1.0 - (0.104_f32 + 0.836 * 0.5) * 2.0;
+        // The hole's own centre, which is where the subject belongs.
+        let (want_x, want_y) = (0.395_f32.mul_add(0.5, 0.369), 0.836_f32.mul_add(0.5, 0.104));
         assert!(
-            (ndc_x - want_x).abs() < 1.0e-3 && (ndc_y - want_y).abs() < 1.0e-3,
-            "subject projected to ({ndc_x}, {ndc_y}), the visible viewport is centred on \
-             ({want_x}, {want_y})"
+            (sx - want_x).abs() < 1.0e-3 && (sy - want_y).abs() < 1.0e-3,
+            "subject landed at ({sx}, {sy}), the visible viewport is centred on ({want_x}, {want_y})"
         );
 
-        // And the old behaviour it replaces: dead centre of the WINDOW, which in this layout is 0.133
-        // NDC left of where the viewer is looking -- 86 px of the captured 1296 px window, a sixth of
-        // the visible viewport's width, and consistently toward the left dock.
+        // And the framing this replaces: dead centre of the WINDOW, which in this layout is 66 px of
+        // the captured 1296 px window left of where the viewer is looking, consistently toward the
+        // left dock.
         let mut whole = docked_scene();
         whole.frame_all();
-        let (was_x, _) = project_ndc(&whole, centre);
+        let (was_x, _) = project_surface(&whole, centre);
         assert!(
-            was_x.abs() < 1.0e-3,
-            "the framing this replaces centred on the window: {was_x}"
+            (was_x - 0.5).abs() < 1.0e-3,
+            "a viewport that owns the window centres on it: {was_x}"
         );
         assert!(
-            (was_x - want_x).abs() > 0.12,
+            (was_x - want_x).abs() > 0.05,
             "and that is a real displacement, not a rounding difference: {was_x} vs {want_x}"
+        );
+    }
+
+    // ── the composition holds while the picture is USED ──────────────────────────────────────────
+    //
+    // Framing is a user action; orbiting, zooming and opening a dock are not, and none of them
+    // re-frames. While the visible rectangle was applied as an offset to the ORBIT TARGET, each of
+    // these three left an offset that had been solved for a frame that no longer existed - so the
+    // subject a user had just framed walked out of the picture without anybody touching the framing.
+
+    /// The scene, framed in the production dock layout, then interfered with.
+    fn framed_in_the_dock_layout() -> SceneState {
+        let mut st = docked_scene();
+        st.visible_rect = [0.369, 0.104, 0.395, 0.836];
+        st.frame_all();
+        st
+    }
+
+    fn scene_centre(st: &SceneState) -> Vec3 {
+        let (lo, hi) =
+            scene_world_bounds(&st.instances, &st.mesh_slots, &st.meshes).expect("bounds");
+        (lo + hi) * 0.5
+    }
+
+    #[test]
+    fn orbiting_a_framed_subject_leaves_it_in_the_visible_viewport() {
+        let centre = scene_centre(&framed_in_the_dock_layout());
+        for turn in [0.4_f32, 1.1, 2.3, -0.9] {
+            let mut st = framed_in_the_dock_layout();
+            st.orbit += turn;
+            let point = project_surface(&st, centre);
+            assert!(
+                centred(st.composition_rect(), point),
+                "orbiting by {turn} rad put the subject at {point:?}, off centre in {:?}",
+                st.composition_rect()
+            );
+        }
+    }
+
+    #[test]
+    fn zooming_a_framed_subject_leaves_it_in_the_visible_viewport() {
+        let centre = scene_centre(&framed_in_the_dock_layout());
+        for scale in [0.25_f32, 0.5, 2.0, 4.0] {
+            let mut st = framed_in_the_dock_layout();
+            st.distance *= scale;
+            let point = project_surface(&st, centre);
+            assert!(
+                centred(st.composition_rect(), point),
+                "zooming by {scale}x put the subject at {point:?}, off centre in {:?}",
+                st.composition_rect()
+            );
+        }
+    }
+
+    #[test]
+    fn opening_a_dock_under_a_framed_subject_leaves_it_in_the_visible_viewport() {
+        // The measured layouts from the ADR-162 captures: the stage is 715 px tall with the bottom
+        // dock closed and 270 px with it open, in the same 840 px window.
+        let mut st = docked_scene();
+        st.visible_rect = [0.369, 0.048, 0.395, 0.851];
+        st.frame_all();
+        let centre = scene_centre(&st);
+        let framed_at = project_surface(&st, centre);
+        assert!(centred(st.composition_rect(), framed_at));
+
+        // The dock opens. Nothing else happens: no re-frame, no camera command.
+        st.visible_rect = [0.369, 0.048, 0.395, 0.321];
+        let point = project_surface(&st, centre);
+        assert!(
+            centred(st.composition_rect(), point),
+            "opening the bottom dock put the subject at {point:?}, off centre in {:?}",
+            st.composition_rect()
+        );
+    }
+
+    // ── the delivery frame ───────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_full_frame_is_exactly_the_symmetric_projection_it_replaces() {
+        // The shear has to be free when there is nothing to shear. Two aspect ratios and both
+        // projections, against the glam constructors the render loop used before.
+        for aspect in [16.0 / 9.0, 0.6_f32] {
+            let frame = ViewFrame::whole(aspect);
+            let got = framed_projection(
+                Projection::Perspective,
+                CAMERA_FOV_DEG,
+                frame,
+                20.0,
+                0.2,
+                400.0,
+            );
+            let want = Mat4::perspective_rh(CAMERA_FOV_DEG.to_radians(), aspect, 0.2, 400.0);
+            for (a, b) in got.to_cols_array().iter().zip(want.to_cols_array()) {
+                assert!(
+                    (a - b).abs() < 1.0e-5,
+                    "perspective at {aspect}: {got:?} vs {want:?}"
+                );
+            }
+            let got = framed_projection(
+                Projection::Orthographic,
+                CAMERA_FOV_DEG,
+                frame,
+                20.0,
+                0.2,
+                400.0,
+            );
+            let half_h = 20.0 * (CAMERA_FOV_DEG.to_radians() * 0.5).tan();
+            let want = Mat4::orthographic_rh(
+                -half_h * aspect,
+                half_h * aspect,
+                -half_h,
+                half_h,
+                -400.0,
+                400.0,
+            );
+            for (a, b) in got.to_cols_array().iter().zip(want.to_cols_array()) {
+                assert!(
+                    (a - b).abs() < 1.0e-4,
+                    "orthographic at {aspect}: {got:?} vs {want:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_sheared_frame_puts_its_own_centre_where_the_rectangle_is() {
+        // The whole claim of the off-axis projection in four numbers: a point on the view axis lands at
+        // the middle of the composed rectangle, wherever that rectangle is.
+        for rect in [
+            [0.0, 0.0, 1.0, 1.0],
+            [0.369, 0.104, 0.395, 0.836],
+            [0.6, 0.0, 0.4, 0.25],
+            [0.0, 0.75, 0.5, 0.25],
+        ] {
+            let frame = ViewFrame::new(1296.0 / 839.0, rect);
+            let vp = camera_matrix_with(
+                0.7,
+                0.3,
+                25.0,
+                frame,
+                Vec3::new(3.0, 1.0, -2.0),
+                Projection::Perspective,
+            );
+            let clip = vp * Vec3::new(3.0, 1.0, -2.0).extend(1.0);
+            let ndc = clip.truncate() / clip.w;
+            let (sx, sy) = ((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5);
+            let [x, y, w, h] = rect;
+            assert!(
+                (sx - w.mul_add(0.5, x)).abs() < 1.0e-4 && (sy - h.mul_add(0.5, y)).abs() < 1.0e-4,
+                "the orbit target landed at ({sx}, {sy}) for {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_delivery_frame_insets_the_visible_rectangle_to_its_own_ratio() {
+        // A 16:9-ish stage delivering scope letterboxes; delivering vertical pillarboxes. The check is
+        // on the RESULT's aspect, not on the arithmetic, so it holds whatever the inset does.
+        let surface = 1600.0 / 900.0;
+        let stage = [0.2, 0.1, 0.6, 0.8]; // 1600*0.6 x 900*0.8 = 960 x 720, aspect 1.333
+        for want in [2.39_f32, 16.0 / 9.0, 1.0, 9.0 / 16.0] {
+            let inner = inset_to_aspect(stage, surface, want);
+            assert!(
+                (frame_aspect(surface, inner) - want).abs() < 1.0e-3,
+                "delivering {want} gave {inner:?}, which is {}",
+                frame_aspect(surface, inner)
+            );
+            // Inside the stage, and centred on it.
+            assert!(
+                inner[2] <= stage[2] + 1.0e-4 && inner[3] <= stage[3] + 1.0e-4,
+                "{inner:?}"
+            );
+            assert!(
+                ((inner[0] + inner[2] * 0.5) - (stage[0] + stage[2] * 0.5)).abs() < 1.0e-4
+                    && ((inner[1] + inner[3] * 0.5) - (stage[1] + stage[3] * 0.5)).abs() < 1.0e-4,
+                "the bars are not equal: {inner:?}"
+            );
+        }
+        // The frame it already is changes nothing at all.
+        assert_eq!(
+            inset_to_aspect(stage, surface, frame_aspect(surface, stage)),
+            stage
+        );
+    }
+
+    #[test]
+    fn the_delivery_frame_is_what_a_shot_is_composed_for() {
+        let mut st = docked_scene();
+        st.visible_rect = [0.369, 0.104, 0.395, 0.836];
+        let stage = st.composition_aspect();
+        assert!(
+            (stage - 1296.0 / 839.0 * 0.395 / 0.836).abs() < 1.0e-3,
+            "{stage}"
+        );
+        st.delivery_aspect = Some(2.39);
+        assert_eq!(
+            st.composition_rect(),
+            st.adopted_visible_rect(),
+            "a delivery frame with nothing holding the camera letterboxes nothing"
+        );
+        // A cutscene takes the viewport. This is the state `present_cinematic_moment` writes.
+        st.cam_override = Some(CamView {
+            pos: [0.0, 2.0, 8.0],
+            look_at: Some([0.0, 1.0, 0.0]),
+            fov_deg: 50.0,
+            near: 0.1,
+            far: 400.0,
+        });
+        assert!(
+            (st.composition_aspect() - 2.39).abs() < 1.0e-3,
+            "a cutscene delivering scope is composed for scope, not for the stage: {}",
+            st.composition_aspect()
+        );
+        // And the bars are the difference between the two rectangles, top and bottom only.
+        let [_, _, w, h] = st.composition_rect();
+        assert!(
+            (w - 0.395).abs() < 1.0e-4,
+            "scope on a taller stage letterboxes, never pillarboxes"
+        );
+        assert!(h < 0.836, "and the bars are real: {h}");
+        st.delivery_aspect = None;
+        assert_eq!(st.composition_rect(), st.adopted_visible_rect());
+    }
+
+    #[test]
+    fn a_frames_pixel_rectangle_always_names_pixels_inside_the_surface() {
+        assert_eq!(frame_pixels(FULL_FRAME, 1600, 900), [0, 0, 1600, 900]);
+        assert_eq!(
+            frame_pixels([0.25, 0.5, 0.5, 0.5], 1600, 900),
+            [400, 450, 800, 450]
+        );
+        // A rectangle the sanitiser rejects, and one so thin the rounding could produce a zero width:
+        // a scissor of zero width is a validation error, not a thin picture.
+        assert_eq!(
+            frame_pixels([0.0, 0.0, 0.0, 0.0], 1600, 900),
+            [0, 0, 1600, 900]
+        );
+        let thin = frame_pixels([0.5, 0.5, 0.021, 0.021], 100, 100);
+        assert!(thin[2] >= 1 && thin[3] >= 1, "{thin:?}");
+        assert!(
+            thin[0] + thin[2] <= 100 && thin[1] + thin[3] <= 100,
+            "{thin:?}"
         );
     }
 
@@ -8394,11 +9652,11 @@ mod tests {
             "a part framed for the window is cropped by the docks: {whole_window_distance} -> {}",
             st.distance
         );
-        let (ndc_x, _) = project_ndc(&st, Vec3::new(6.0, 0.0, 0.0));
-        let want_x = (0.369_f32 + 0.395 * 0.5).mul_add(2.0, -1.0);
+        let (sx, _) = project_surface(&st, Vec3::new(6.0, 0.0, 0.0));
+        let want_x = 0.395_f32.mul_add(0.5, 0.369);
         assert!(
-            (ndc_x - want_x).abs() < 1.0e-3,
-            "the focused part projected to {ndc_x}, the visible viewport is centred on {want_x}"
+            (sx - want_x).abs() < 1.0e-3,
+            "the focused part landed at {sx}, the visible viewport is centred on {want_x}"
         );
     }
 
@@ -8510,7 +9768,7 @@ mod tests {
             center: [1.0, 2.0, 3.0],
             scale: 0.001,
             color: [1.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4],
         };
@@ -8531,7 +9789,7 @@ mod tests {
             center: [75.0, -20.0, 9.0], // world placement must not leak into a portrait
             scale: 0.001,
             color: [0.7, 0.8, 0.9],
-            selected: 1.0,
+            highlight: 1.0,
             rotation: IDENTITY_QUAT,
             material: [0.0; 4],
         };
@@ -8546,7 +9804,7 @@ mod tests {
         );
         assert!((Vec3::from(framed.center) - Vec3::new(-1.0, 0.0, 0.0)).length() < 1.0e-6);
         assert_eq!(
-            framed.selected, 0.0,
+            framed.highlight, 0.0,
             "portrait selection must not tint the source material"
         );
         assert!(
@@ -8646,6 +9904,57 @@ mod tests {
         assert!(v.iter().all(|p| p.scale == 0.0));
     }
 
+    #[test]
+    fn the_ground_sketch_preview_draws_the_shape_the_next_click_would_make() {
+        // Two corners down and a cursor: the outline so far, the rubber band, AND the dashed edge
+        // back to the start. That third one is the whole point — without it the drawing reads as a
+        // path and the enclosed area, which is the thing being extruded, is invisible until the end.
+        let pts = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]];
+        let mut out = Vec::new();
+        push_sketch_preview(&mut out, &pts, Some([4.0, 0.0, 3.0]), false, 0.05);
+        assert!(out.len() % 2 == 0, "a line list is endpoint PAIRS");
+        assert!(out.iter().all(|p| p.scale == 0.0));
+        // Every vertex is lifted off the ground it describes, or it z-fights the floor.
+        assert!(
+            out.iter().all(|p| p.center[1] > 0.0),
+            "the overlay floats above the plane"
+        );
+        let closing = [0.35_f32, 1.00, 0.55];
+        assert!(
+            out.iter().any(|p| p.color == closing),
+            "the edge back to the first corner is drawn"
+        );
+    }
+
+    #[test]
+    fn an_empty_ground_sketch_draws_nothing_at_all() {
+        // Armed with nothing placed and the cursor off the ground: the tool costs zero vertices, so
+        // arming it cannot dirty a frame that has nothing to show.
+        let mut out = Vec::new();
+        push_sketch_preview(&mut out, &[], None, false, 0.05);
+        assert!(
+            out.is_empty(),
+            "{} vertices for an empty outline",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn the_ground_sketch_marks_a_closing_click_differently_from_a_near_miss() {
+        // "Snapped to the first corner" and "near the first corner" are identical in geometry and
+        // opposite in meaning, so they must not be identical on screen.
+        let pts = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 0.0, 3.0]];
+        let mut near = Vec::new();
+        push_sketch_preview(&mut near, &pts, Some([0.2, 0.0, 0.1]), false, 0.05);
+        let mut shut = Vec::new();
+        push_sketch_preview(&mut shut, &pts, Some([0.0, 0.0, 0.0]), true, 0.05);
+        assert_ne!(
+            near.iter().map(|p| p.color).collect::<Vec<_>>(),
+            shut.iter().map(|p| p.color).collect::<Vec<_>>(),
+            "the closing state must be visible, not merely true"
+        );
+    }
+
     /// A bare scene of `n` unit-scale cubes on a line — enough to exercise the focus state transition
     /// (no GPU; `focus_on`/`clear_focus` touch only plain fields).
     fn scene(n: usize) -> SceneState {
@@ -8658,7 +9967,7 @@ mod tests {
                 center: [i as f32 * 2.0, 1.0, 0.0],
                 scale: 1.0,
                 color: [0.5, 0.5, 0.5],
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: IDENTITY_QUAT,
                 material: [0.0; 4],
             });
@@ -8681,7 +9990,7 @@ mod tests {
         // Selected + focused are the same entity; the shader keeps it lit while dimming the rest.
         assert_eq!(st.selected, Some(2));
         assert_eq!(st.focused, Some(2));
-        assert_eq!(st.instances[2].selected, 1.0);
+        assert_eq!(st.instances[2].highlight, 1.0);
         // The framing was saved for restore, and the revision bumped so the new flags upload.
         assert_eq!(st.pre_focus_distance, Some(60.0));
         assert_ne!(st.revision, rev0);

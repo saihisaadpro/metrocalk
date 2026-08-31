@@ -7,7 +7,7 @@ import { Button } from "../theme/primitives";
 import { ShortcutBadge } from "../theme/workspace";
 import { color, elevation, motion, radius, space, z } from "../theme/tokens";
 
-export type ViewportTool = "select" | "move" | "rotate" | "scale" | "pipe";
+export type ViewportTool = "select" | "move" | "rotate" | "scale" | "draw" | "pipe";
 
 export interface ViewportToolAvailability {
   disabled?: boolean;
@@ -41,6 +41,7 @@ const TOOLS: readonly ToolDefinition[] = [
   { id: "move", label: "Move", description: "Translate the active selection", shortcut: "W" },
   { id: "rotate", label: "Rotate", description: "Rotate the active selection", shortcut: "E" },
   { id: "scale", label: "Scale", description: "Resize the active selection", shortcut: "R" },
+  { id: "draw", label: "Draw", description: "Draw an outline on the ground and raise it into a solid", shortcut: "D" },
   { id: "pipe", label: "Pipe", description: "Draw and bake a routed pipe asset" },
 ] as const;
 
@@ -50,6 +51,7 @@ const TOOL_ELEMENT_IDS: Partial<Record<ViewportTool, string>> = {
   move: "vpMove",
   rotate: "vpRotate",
   scale: "vpScale",
+  draw: "vpDraw",
   pipe: "vpPipe",
 };
 
@@ -60,7 +62,7 @@ const TOOL_ELEMENT_IDS: Partial<Record<ViewportTool, string>> = {
  *  way to know that except by reading both files. That is the shape the Constitution forbids: a
  *  subsystem with its own icon component is one restyle away from being the odd one out, and the five
  *  marks could not be reused by a command palette or a context menu that wanted the same tool. They
- *  live in [`theme/icons.tsx`] now under `cursor`/`move`/`rotate`/`scale`/`pipe`, with `select` a
+ *  live in [`theme/icons.tsx`] now under `cursor`/`move`/`rotate`/`scale`/`draw`/`pipe`, with `select` a
  *  declared alias for `cursor`, so one tool means one picture everywhere it appears. */
 function ToolIcon({ tool }: { tool: ViewportTool }) {
   return <Icon name={tool} size="lg" className="mtk-tool-rail__icon" />;
@@ -126,6 +128,15 @@ export function ViewportToolRail({
         flexDirection: "column",
         width: compact ? 42 : 126,
         minWidth: 42,
+        // THE RAIL MUST FIT THE STAGE IT FLOATS ON, and this is a rule rather than a tuning because
+        // the thing that broke it was adding one tool. A sixth entry made the rail 25px taller than
+        // the stage in every short-window regime (`shell-dock-floor` at 420px, `shell-dock-docked` and
+        // `shell-dock-animate` at 640, `shell-dock-model` at 700) — and `#viewport` is `overflow:
+        // hidden`, so the sixth tool and the minimize control were simply GONE, with nothing on screen
+        // saying so. A height cap with a real scrollbar keeps every tool reachable at any stage height,
+        // and keeps the seventh tool from re-breaking this.
+        maxHeight: `calc(100% - ${space.xxl * 2 + space.md}px)`,
+        overflowY: "auto",
         padding: space.xs,
         border: `1px solid ${color.border.default}`,
         borderRadius: radius.lg,

@@ -1,0 +1,71 @@
+//! The shot cards — the one gesture that puts a camera move into a scene.
+//!
+//! Shared rather than duplicated because there are now two places a shot is added from: the Gameplay
+//! panel's compact Cinematics block (300px, where a cutscene is authored beside its roles and its
+//! effects) and the Cutscene timeline in the Animate dock (where it is edited against a clock). The
+//! card grid is the same object in both, down to the `shot-${kind}` handles the tests and the `.exe`
+//! E2E key on, and two copies of it would drift the first time a card's refusal wording changed.
+//!
+//! IT IS THE SHARED `ChoiceGrid`, NOT A GRID OF ITS OWN (ADR-189). Roles, shots and effects are one
+//! gesture — pick a card, one undoable commit lands on the selected object — and this file used to be
+//! the third private opinion about what that looks like: `repeat(auto-fill, minmax(120px, 1fr))` over
+//! compact buttons with the sentence that says what the shot DOES hidden in a `title`. A description
+//! that exists only as a tooltip is invisible to touch, to the keyboard, and to anyone reading the
+//! panel rather than hunting in it.
+
+import { Icon } from "../theme/icons";
+import { ChoiceCard, ChoiceGrid } from "../theme/workspace";
+import { color, text } from "../theme/tokens";
+import type { ShotSpec } from "../transport/protocol";
+
+export interface ShotCatalogueProps {
+  specs: ShotSpec[];
+  /** Readability floor for a column, in px — the grid takes as many as fit above it. The narrow dock
+   *  lands on one; the wide timeline gains columns rather than stretching two into billboards. */
+  minColumn?: number;
+  disabled?: boolean;
+  /** Why the whole grid is refusing, in the user's words — never a bare dark button. */
+  disabledReason?: string;
+  onPick: (kind: string) => void;
+}
+
+export function ShotCatalogue({
+  specs,
+  minColumn,
+  disabled = false,
+  disabledReason,
+  onPick,
+}: ShotCatalogueProps) {
+  // AN EMPTY CATALOGUE MUST NOT RENDER AN EMPTY GROUP. `cinema_catalog` answers with nothing wherever
+  // the cinematics sub-engine is absent — the browser build is exactly that case — and both call sites
+  // then drew a labelled group containing no cards, under a pacing row that sets the pacing of a
+  // cutscene there is no way to add. Say why instead. The guard lives here rather than in either
+  // caller because both callers had it wrong for the same reason.
+  if (specs.length === 0) {
+    return (
+      <div data-testid="cinema-unavailable" style={{ ...text.itemLabel, color: color.text.muted }}>
+        No shots are available here — the cinematics sub-engine runs in the desktop editor.
+      </div>
+    );
+  }
+
+  return (
+    <ChoiceGrid label="Add a shot" data-testid="shot-catalogue" minColumn={minColumn}>
+      {specs.map((spec) => (
+        <ChoiceCard
+          key={spec.kind}
+          data-testid={`shot-${spec.kind}`}
+          icon={<Icon name={spec.kind} size="md" fallback="camera" />}
+          label={spec.label}
+          description={spec.blurb}
+          disabled={disabled}
+          disabledReason={disabledReason}
+          title={disabled ? disabledReason : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it`}
+          onSelect={() => onPick(spec.kind)}
+        />
+      ))}
+    </ChoiceGrid>
+  );
+}
+
+export default ShotCatalogue;

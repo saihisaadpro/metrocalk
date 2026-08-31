@@ -116,7 +116,13 @@ function Diagnostic({ diagnostic }: { diagnostic: CookDiagnostic }) {
   );
 }
 
-export function MatchPanel({ client }: { client: EditorClient }) {
+export interface MatchPanelProps {
+  client: EditorClient;
+  /** Open the Cutscene timeline in the Animate dock — handed down to the Cinematics block. */
+  onOpenTimeline?: () => void;
+}
+
+export function MatchPanel({ client, onOpenTimeline }: MatchPanelProps) {
   const [validation, setValidation] = useState<MatchValidation>(IDLE);
   const [status, setMatchStatus] = useState<MatchStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -226,21 +232,20 @@ export function MatchPanel({ client }: { client: EditorClient }) {
     return (
       <div data-testid="match-panel" style={{ padding: space.md, display: "flex", flexDirection: "column", gap: space.md }}>
         <RolesSection client={client} />
-        <CinemaSection client={client} />
+        <CinemaSection client={client} onOpenTimeline={onOpenTimeline} />
         <VfxSection client={client} />
-        {/* THE ACTION IS INSIDE THE EMPTY STATE, AND THE EMPTY STATE IS COMPACT. This panel is not
-            empty — three authoring sections sit above it — so the full-size `EmptyPanelState` put a
-            40px icon and a five-line centred paragraph in the MIDDLE of a populated column, with the
-            button floating below it and a second centred paragraph below that. `<ux_quality>` 1 is
-            the rule it broke: the control that starts an action owns its outcome, so the button
-            belongs to the block that explains it, not to a row underneath. */}
+        {/* THE BUTTON IS PART OF THE EMPTY STATE, AND NOTHING COMES AFTER IT.
+            `EmptyPanelState` has had a `primaryAction` slot the whole time; this panel put its button
+            in a centred row underneath instead, and then added a SECOND paragraph below the button.
+            Measured in `gameplay-object-selected`: that trailing paragraph was painted 32px below the
+            bottom of a 620px window — unreachable, and the last word after a call to action. One
+            description now, and it absorbed the useful half of the sentence it replaces. */}
         <EmptyPanelState
-          compact
           icon={<Icon name="sword" size="xl" />}
           title="This scene doesn't have a match yet"
-          description="A play area, a lane, the actors that fight over it and the waves that spawn — all ordinary scene objects you can then move, retune and undo in one step."
+          description="A play area, a lane, the actors that fight over it and the waves that spawn — all ordinary scene objects you can move, edit and undo in one step."
           primaryAction={
-            <Button variant="primary" onClick={create} disabled={busy}>
+            <Button variant="primary" onClick={create} disabled={busy} data-testid="match-create">
               Create a starter match
             </Button>
           }
@@ -279,13 +284,17 @@ export function MatchPanel({ client }: { client: EditorClient }) {
     // match, so nothing could name the state a user actually opens it in.
     <div data-testid="match-panel" style={{ padding: space.md, display: "flex", flexDirection: "column", gap: space.md }}>
       <RolesSection client={client} />
-      <CinemaSection client={client} />
+      <CinemaSection client={client} onOpenTimeline={onOpenTimeline} />
       <VfxSection client={client} />
       {/* ── the authored scene ─────────────────────────────────────────────────────────────────────── */}
-      <section>
-        <h3 style={{ margin: `0 0 ${space.xs}px`, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
-          Your match
-        </h3>
+      <DisclosureSection
+        data-testid="match-summary"
+        title="Your match"
+        summary={validation.ok ? "ready to run" : `${errors.length} to fix`}
+        density="compact"
+        landmark={false}
+        storageKey="match-summary"
+      >
         <div style={summaryGrid}>
           <Stat label="Actors" value={String(validation.actor_count)} />
           <Stat label="Waves" value={String(validation.wave_count)} />
@@ -300,20 +309,23 @@ export function MatchPanel({ client }: { client: EditorClient }) {
             Definitions fingerprint <code>{validation.cook_digest}</code>
           </p>
         ) : null}
-      </section>
+      </DisclosureSection>
 
       {/* ── what is wrong, and where ───────────────────────────────────────────────────────────────── */}
       {errors.length > 0 || warnings.length > 0 || startError ? (
-        <section>
-          <h3 style={{ margin: `0 0 ${space.xs}px`, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
-            {errors.length > 0 ? "Fix these before running" : "Worth knowing"}
-          </h3>
+        <DisclosureSection
+          data-testid="match-diagnostics"
+          title={errors.length > 0 ? "Fix these before running" : "Worth knowing"}
+          summary={`${(startError ?? validation.diagnostics).length} item${(startError ?? validation.diagnostics).length === 1 ? "" : "s"}`}
+          density="compact"
+          landmark={false}
+        >
           <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
             {(startError ?? validation.diagnostics).map((diagnostic, index) => (
               <Diagnostic key={`${diagnostic.code}-${diagnostic.entity ?? "scene"}-${index}`} diagnostic={diagnostic} />
             ))}
           </ul>
-        </section>
+        </DisclosureSection>
       ) : null}
 
       {/* ── transport ──────────────────────────────────────────────────────────────────────────────── */}
@@ -368,10 +380,14 @@ export function MatchPanel({ client }: { client: EditorClient }) {
             </p>
           ) : null}
           {/* ── standing orders ─────────────────────────────────────────────────────────────────── */}
-          <div style={{ marginTop: space.sm }} data-testid="match-orders">
-            <h4 style={{ margin: `0 0 ${space.xs}px`, font: font.ui, fontSize: fontSize.body, color: color.text.primary }}>
-              Orders
-            </h4>
+          <DisclosureSection
+            data-testid="match-orders"
+            title="Orders"
+            summary={hero?.attack_order ? String(hero.attack_order) : "none standing"}
+            density="compact"
+            landmark={false}
+            storageKey="match-orders"
+          >
             <p style={meta}>
               An order stays given. Your hero keeps fighting under it until you replace it or clear it —
               you do not press a button per swing.
@@ -437,7 +453,7 @@ export function MatchPanel({ client }: { client: EditorClient }) {
                 ? `Standing order: ${hero.attack_order}`
                 : "Standing order: none — your hero acts only when you tell it to."}
             </p>
-          </div>
+          </DisclosureSection>
           {status.last_rejection ? (
             <p style={{ ...meta, color: color.warn.text }}>
               Last order refused: {status.last_rejection}

@@ -141,6 +141,20 @@ export function VfxSection({ client }: { client: EditorClient }) {
     }
   }
 
+  // The group's condition, on the group's own header line — see `RolesSection` for why the fold is
+  // persisted rather than forced, and why the live particle count belongs here: a budget warning
+  // nobody can see is the "legible cost" clause failing in the one state where the cost is paid.
+  const subject = summary?.name ?? selected;
+  const condition = playing && live
+    ? `${live.total} particle${live.total === 1 ? "" : "s"}`
+    : selected
+      ? fx.layers > 0
+        ? `${subject} · ${fx.layers} effect${fx.layers === 1 ? "" : "s"} · ${fx.particles} particles`
+        : String(subject)
+      : specs.length > 0
+        ? `${specs.length} to choose from`
+        : "needs a selection";
+
   return (
     // See `RolesSection` for why this is a `DisclosureSection`. Closed by default alongside
     // Cinematics: the summary reports the layer count while it is shut, so nothing is hidden — the
@@ -149,7 +163,7 @@ export function VfxSection({ client }: { client: EditorClient }) {
       data-testid="vfx-section"
       title="Effects"
       icon={<Icon name="sparkle" size="md" />}
-      summary={fx.layers > 0 ? `${fx.layers} on this object · ${fx.particles} particles` : specs.length > 0 ? `${specs.length} to choose from` : undefined}
+      summary={condition}
       storageKey="gameplay.effects"
       tone="card"
       density="compact"
@@ -189,6 +203,16 @@ export function VfxSection({ client }: { client: EditorClient }) {
         )}
       </div>
 
+      {/* AN EMPTY CATALOGUE MUST NOT RENDER A PICKER. `vfx_catalog` answers with nothing wherever
+          the particle sub-engine is not present — the browser dev build is exactly that case — and
+          the section drew "Run the next effect" over a live dropdown with an empty grid underneath
+          it: a labelled control that cannot lead anywhere. */}
+      {specs.length === 0 ? (
+        <div data-testid="vfx-unavailable" style={metaText}>
+          No effects are available here — the particle sub-engine runs in the desktop editor.
+        </div>
+      ) : (
+      <>
       <label style={{ ...metaText, display: "grid", gap: space.xxs }}>
         Run the next effect
         <SelectField
@@ -206,7 +230,6 @@ export function VfxSection({ client }: { client: EditorClient }) {
         </SelectField>
       </label>
 
-      {specs.length > 0 && (
       <ChoiceGrid label="Add an effect">
         {specs.map((spec) => (
           <ChoiceCard
@@ -231,6 +254,7 @@ export function VfxSection({ client }: { client: EditorClient }) {
           />
         ))}
       </ChoiceGrid>
+      </>
       )}
 
       {selected && fx.reads.length > 0 && (

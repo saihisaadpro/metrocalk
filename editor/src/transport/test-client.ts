@@ -4,7 +4,137 @@
 
 import { vi } from "vitest";
 import type { EditorClient } from "./session";
-import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type MatchStatus, type TerrainReply, type TerrainStats } from "./protocol";
+import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type AnimationWorkspaceInfo, type DeliveryFrame, type FramingCatalog, type FramingEdit, type GroundSketchState, type ImportDialogResponse, type MatchStatus, type RenderReply, type ShotRow, type SubjectCatalog, type TerrainReply, type TerrainStats } from "./protocol";
+
+/** The render a test drives. MUTABLE and module-scoped on purpose: a render is the one thing in this
+ *  client with a life longer than a single call — start, poll, poll, done — and a stub that answered
+ *  each call independently could not express that. `resetTestClientRender()` puts it back, because a
+ *  fixture that leaks between tests decides verdicts by run order. */
+const RENDER_FIXTURE: RenderReply = {
+  running: false,
+  done: false,
+  entity: null,
+  frames: 0,
+  written: 0,
+  width: 0,
+  height: 0,
+  fps: 24,
+  seconds: 0,
+  folder: "",
+  stem: "",
+  bytes: 0,
+  elapsedMs: 0,
+  failures: [],
+  message: "",
+  reason: null,
+};
+
+/** Put the render fixture back to "nothing has been rendered". Call it in a `beforeEach` of any test
+ *  file that starts a render. */
+export function resetTestClientRender(): void {
+  Object.assign(RENDER_FIXTURE, {
+    running: false,
+    done: false,
+    entity: null,
+    frames: 0,
+    written: 0,
+    width: 0,
+    height: 0,
+    fps: 24,
+    seconds: 0,
+    folder: "",
+    stem: "",
+    bytes: 0,
+    elapsedMs: 0,
+    failures: [],
+    message: "",
+    reason: null,
+  });
+}
+
+/** One authored shot, with the numbers a timeline needs. Shaped like what `cinema_list` really
+ *  sends — a `startSeconds` of 0, an `effectiveSeconds` that is the authored length at Normal
+ *  pacing — so a test that renders it is rendering the same object the `.exe` produces. */
+const HERO_ROW: ShotRow = {
+  id: "shot-0000hero",
+  index: 0,
+  reads: "a full shot of Crate from three-quarters, pushing in — 2.5s",
+  seconds: 2.5,
+  effectiveSeconds: 2.5,
+  startSeconds: 0,
+  openSeconds: 0,
+  blendSeconds: 0,
+  size: "full",
+  angle: "three_quarter",
+  motion: "push_in",
+  amount: 0.35,
+  subject: "e1",
+  subjectName: "Crate",
+};
+
+/** A subject catalogue shaped like the one `cinema_subject_catalog` really sends: the owner under
+ *  its own heading, the assembly it belongs to, one part and one neighbour — with the `parts` counts
+ *  that are the whole reason the list is worth reading. `Empty Marker` has none, which is the row a
+ *  test needs to prove the picker warns before the film does.
+ *
+ *  The GROUP STRINGS are the engine's, not the shell's: the headings are sent, so a stub that
+ *  invented one would make a grouping test green against a word the engine never says. */
+const SUBJECTS: SubjectCatalog = {
+  owner: "e1",
+  ownerName: "Crate",
+  current: "e1",
+  candidates: [
+    { id: "e1", name: "Crate", group: "This object", parts: 1, framable: true, current: true },
+    { id: "e9", name: "Assembly Hall", group: "What it is part of", parts: 46, framable: true, current: false },
+    { id: "e2", name: "Lid", group: "What it is made of", parts: 1, framable: true, current: false },
+    { id: "e3", name: "Empty Marker", group: "Beside it", parts: 0, framable: false, current: false },
+  ],
+  query: "",
+  matches: 4,
+  truncated: false,
+};
+
+/** A framing vocabulary with the same WIRE VALUES the Rust catalogue publishes. The labels are the
+ *  shell's to choose and a test must not assert them; the values are the contract, and a stub that
+ *  invented one would make every framing test green against a word the engine refuses. */
+const FRAMING_CATALOG: FramingCatalog = {
+  sizes: [
+    { value: "extreme_wide", label: "Distant", blurb: "The subject is a speck in its world" },
+    { value: "wide", label: "Wide", blurb: "The whole subject with air around it" },
+    { value: "full", label: "Full", blurb: "The subject fills most of the height" },
+    { value: "medium", label: "Medium", blurb: "Closer - detail starts to read" },
+    { value: "close", label: "Close", blurb: "Tight on the subject" },
+    { value: "extreme_close", label: "Very close", blurb: "One thing, very large" },
+  ],
+  angles: [
+    { value: "front", label: "Front", blurb: "Facing the subject head-on" },
+    { value: "three_quarter", label: "Three-quarter", blurb: "Off to one side, slightly above" },
+    { value: "profile", label: "Profile", blurb: "Directly to the side" },
+    { value: "behind", label: "Behind", blurb: "Looking where it looks" },
+    { value: "low", label: "From below", blurb: "The subject towers" },
+    { value: "high", label: "From above", blurb: "The subject is small" },
+  ],
+  motions: [
+    { value: "hold", label: "Hold", blurb: "Locked off - the camera does not move" },
+    { value: "push_in", label: "Push in", blurb: "Creep toward the subject" },
+    { value: "pull_out", label: "Pull out", blurb: "Drift away" },
+    { value: "orbit", label: "Orbit", blurb: "Circle the subject" },
+    { value: "crane_up", label: "Crane up", blurb: "Rise while holding the aim" },
+    { value: "crane_down", label: "Crane down", blurb: "Descend while holding the aim" },
+  ],
+  minSeconds: 0.2,
+  maxSeconds: 20,
+  maxShots: 12,
+  stillMotions: ["hold"],
+  deliveries: [
+    { value: "viewport", label: "Match viewport", blurb: "Compose for the stage as it is now" },
+    { value: "widescreen", label: "16:9 widescreen", blurb: "The broadcast and web default" },
+    { value: "scope", label: "2.39:1 scope", blurb: "Anamorphic scope" },
+    { value: "academy", label: "4:3 academy", blurb: "Classic" },
+    { value: "square", label: "1:1 square", blurb: "Square" },
+    { value: "vertical", label: "9:16 vertical", blurb: "Vertical" },
+  ],
+};
 
 function emptyAnimationState(id: string | null): AnimationWorkspaceInfo {
   return {
@@ -63,7 +193,34 @@ function emptyMatchStatus(): MatchStatus {
   };
 }
 
+/** The gizmo's space and pivot, per `fakeClient()` call — see the comment on `gizmoDebug` below for
+ *  why these are state and not two more constants. */
+/** One ground-sketch read-model, overridable field by field — so a test states only the part it is
+ *  about and cannot drift from the reply's real shape. */
+function groundSketch(over: Partial<GroundSketchState> = {}): GroundSketchState {
+  return {
+    active: false,
+    points: [],
+    cursor: null,
+    snap: "",
+    closes: false,
+    closed: false,
+    segmentM: 0,
+    perimeterM: 0,
+    areaM2: 0,
+    widthM: 0,
+    depthM: 0,
+    planeY: 0,
+    gridM: 0.25,
+    angleSnap: true,
+    canBuild: false,
+    message: "nothing is drawn yet \u2014 click on the ground to place the first corner",
+    ...over,
+  };
+}
+
 export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
+  const gizmoState = { space: "world", pivot: "origin" };
   return {
     setField: vi.fn(() => "op"),
     bind: vi.fn(() => "op"),
@@ -133,7 +290,8 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     animationGraphSetPreviewParameters: (_graphId, values) => Promise.resolve({ ok: true, message: "Transient parameters updated.", accepted: values }),
     animationGraphClearPreviewParameters: () => Promise.resolve({ ok: true, message: "Transient parameters reset.", accepted: {} }),
     removeEntity: vi.fn(),
-    duplicateEntity: () => Promise.resolve(null),
+    duplicateEntity: vi.fn(() => Promise.resolve(null as string | null)),
+    duplicateEntities: vi.fn(() => Promise.resolve([] as string[])),
     focusEntity: vi.fn(),
     reportViewportRect: vi.fn(),
     makeDynamic: () => Promise.resolve(true),
@@ -175,6 +333,13 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
       ? { created: null, handle: null, triangles: 0, ms: 0, message: "pick two different objects", reason: "pick two different objects" }
       : { created: `combined-${op}`, handle: "mtkasset:test-combined", triangles: 960, ms: 4, message: `Union · 960 triangles`, reason: null })),
     shapeMeld: vi.fn(() => Promise.resolve({ created: "melded-1", handle: "mtkasset:test-meld", triangles: 1400, ms: 6, message: "Melded into one shape · 1400 triangles", reason: null })),
+    sketchTool: vi.fn((on: boolean) => Promise.resolve(groundSketch({ active: on }))),
+    sketchPoint: vi.fn(() => Promise.resolve(groundSketch({ active: true, points: [[0, 0, 0]], cursor: [4, 0, 0], snap: "grid", segmentM: 4, message: "one corner is a point, not a shape \u2014 place at least two more" }))),
+    sketchPointExact: vi.fn(() => Promise.resolve(groundSketch({ active: true, points: [[0, 0, 0], [7.5, 0, 0]], cursor: [7.5, 0, 3], snap: "locked angle", perimeterM: 7.5, widthM: 7.5, message: "two corners are a line, not a shape \u2014 place at least one more" }))),
+    sketchUndo: vi.fn(() => Promise.resolve(groundSketch({ active: true }))),
+    sketchClear: vi.fn(() => Promise.resolve(groundSketch({ active: true }))),
+    sketchState: vi.fn(() => Promise.resolve(groundSketch({ active: true }))),
+    sketchCommit: vi.fn(() => Promise.resolve({ created: "sketched-1", handle: "mtkasset:test-sketch", triangles: 48, ms: 4, message: "Raised your drawing into a solid \u00b7 48 triangles", reason: null })),
     roleCatalog: vi.fn(() => Promise.resolve([
       { kind: "collectible", label: "Collectible", blurb: "Spins; vanishes and scores when something touches it", adds: "spin animation · touch trigger · pickup rule · +1 on the Score counter" },
       { kind: "solid", label: "Solid obstacle", blurb: "An immovable body other things collide with", adds: "fixed physics body · auto-fit collider" },
@@ -236,7 +401,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     setWorkingSpace: vi.fn((space: string) => Promise.resolve(space)),
     setEnvironmentColourSpace: vi.fn((space: string) => Promise.resolve(space)),
     vfxProbe: vi.fn(() => Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 })),
-    cameraProbe: vi.fn(() => Promise.resolve({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0 })),
+    cameraProbe: vi.fn(() => Promise.resolve({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0, frame: [0, 0, 1, 1] as [number, number, number, number], visibleRect: [0, 0, 1, 1] as [number, number, number, number] })),
     vfxCatalog: vi.fn(() => Promise.resolve([
       { kind: "fire", label: "Fire", blurb: "It burns", icon: "\u{1F525}", adds: "a rising flame", burst: false },
       { kind: "sparks", label: "Sparks", blurb: "A hit landing", icon: "\u26A1", adds: "a one-shot spray of sparks", burst: true },
@@ -244,15 +409,148 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     vfxAdd: vi.fn((id: string) => Promise.resolve({ entity: id, layers: 1, particles: 72, reads: ["\u{1F525} Fire - 72 particles, 1.0s per particle"], problems: [], message: "Added Fire", reason: null })),
     vfxRemove: vi.fn((id: string) => Promise.resolve({ entity: id, layers: 0, particles: 0, reads: [], problems: [], message: "Effect removed", reason: null })),
     vfxList: vi.fn((id: string) => Promise.resolve({ entity: id, layers: 0, particles: 0, reads: [], problems: [], message: "", reason: null })),
+    // The `icon` field these three carried was removed from `ShotSpec` on both sides by ADR-137 —
+    // `theme/icons.tsx` keys its drawings on `kind` — so the emoji here described a contract that no
+    // longer exists on either side of the boundary.
     cinemaCatalog: vi.fn(() => Promise.resolve([
-      { kind: "establish", label: "Establishing", blurb: "Show where we are before we look at anything closely", icon: "\u{1F304}", adds: "a wide, slowly pulling-out shot from the front" },
-      { kind: "hero", label: "Hero shot", blurb: "The workhorse - three-quarters on, pushing in", icon: "\u{1F3AC}", adds: "a full-body three-quarter shot that creeps closer" },
-      { kind: "closeup", label: "Close-up", blurb: "Tight and still - for the moment that matters", icon: "\u{1F50D}", adds: "a close, locked-off shot in profile" },
+      { kind: "establish", label: "Establishing", blurb: "Show where we are before we look at anything closely", adds: "a wide, slowly pulling-out shot from the front" },
+      { kind: "hero", label: "Hero shot", blurb: "The workhorse - three-quarters on, pushing in", adds: "a full-body three-quarter shot that creeps closer" },
+      { kind: "closeup", label: "Close-up", blurb: "Tight and still - for the moment that matters", adds: "a close, locked-off shot in profile" },
     ])),
-    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, reads: ["a full shot of Crate, three-quarters on, pushing in over 2.5s"], problems: [], message: "Added a hero shot", reason: null })),
-    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], problems: [], message: "Shot removed", reason: null })),
-    cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, reads: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
-    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, reads: [], problems: [], message: "", reason: null })),
+    cinemaAddShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: "Added a hero shot", reason: null })),
+    cinemaRemoveShot: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, reads: [], rows: [], problems: [], message: "Shot removed", reason: null })),
+    cinemaSetMood: vi.fn((id: string, mood: "calm" | "normal" | "tense") => Promise.resolve({ entity: id, shots: 1, seconds: mood === "calm" ? 6.25 : 2.5, mood, delivery: "viewport" as const, reads: [], rows: [], problems: [], message: `Pacing set to ${mood}`, reason: null })),
+    cinemaSetDelivery: vi.fn((id: string, delivery: DeliveryFrame) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Composing for ${delivery}`, reason: null })),
+    cinemaList: vi.fn((id: string) => Promise.resolve({ entity: id, shots: 0, seconds: 0, mood: "normal" as const, delivery: "viewport" as const, reads: [], rows: [], problems: [], message: "", reason: null })),
+    cinemaFramingCatalog: vi.fn(() => Promise.resolve(FRAMING_CATALOG)),
+    cinemaSetShotSubject: vi.fn((id: string, index: number, subject: string) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, subject, subjectName: SUBJECTS.candidates.find((c) => c.id === subject)?.name ?? subject }], problems: [], message: `Shot ${index + 1} now frames ${subject}`, reason: null })),
+    // The stub SEARCHES, rather than returning the same four rows to every query: a picker that
+    // ignored its own search box would otherwise pass every assertion about having one.
+    cinemaSubjectCatalog: vi.fn((_id: string, _index: number | null, query: string) => {
+      const needle = query.trim().toLowerCase();
+      if (!needle) return Promise.resolve(SUBJECTS);
+      const hits = SUBJECTS.candidates
+        .filter((c) => c.name.toLowerCase().includes(needle))
+        .map((c) => ({ ...c, group: "Matches" }));
+      return Promise.resolve({ ...SUBJECTS, candidates: hits, query: query.trim(), matches: hits.length });
+    }),
+    // The chain a click could mean: the object, then what it is part of. Built from the same fixture
+    // the picker's list uses, so a rung and a row can never disagree about a name or a count.
+    cinemaSubjectChain: vi.fn((id: string) => {
+      const self = SUBJECTS.candidates.find((c) => c.id === id);
+      const chain = self
+        ? [{ ...self, group: "This object", current: false },
+           ...SUBJECTS.candidates.filter((c) => c.group === "What it is part of").map((c) => ({ ...c, current: false }))]
+        : [];
+      return Promise.resolve({ ...SUBJECTS, owner: id, ownerName: self?.name ?? "", current: null, candidates: chain, matches: chain.length });
+    }),
+    cinemaSetShotSeconds: vi.fn((id: string, index: number, seconds: number) => Promise.resolve({ entity: id, shots: 1, seconds, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, seconds, effectiveSeconds: seconds }], problems: [], message: `Shot ${index + 1} now runs ${seconds.toFixed(1)}s`, reason: null })),
+    cinemaMoveShot: vi.fn((id: string, _from: number, to: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [HERO_ROW], problems: [], message: `Shot moved to position ${to + 1}`, reason: null })),
+    cinemaSetShotFraming: vi.fn((id: string, index: number, edit: FramingEdit) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index, size: (edit.size as ShotRow["size"]) ?? HERO_ROW.size, angle: (edit.angle as ShotRow["angle"]) ?? HERO_ROW.angle, motion: (edit.motion as ShotRow["motion"]) ?? HERO_ROW.motion, amount: edit.amount ?? HERO_ROW.amount }], problems: [], message: `Shot ${index + 1} is now re-framed`, reason: null })),
+    // A pose that MOVES WITH THE CLOCK. A stub returning one fixed camera would let a panel that
+    // ignored `seconds` entirely pass every assertion about previewing, which is the one thing these
+    // tests exist to catch; the push-in here is the same shape `push_in` solves for, at fixture scale.
+    cinemaPreview: vi.fn((id: string, seconds: number, active: boolean) =>
+      Promise.resolve(
+        active
+          ? {
+              active: true,
+              entity: id,
+              seconds,
+              shotIndex: 0,
+              shots: 1,
+              reads: HERO_ROW.reads,
+              subjectName: HERO_ROW.subjectName,
+              progress: Math.min(1, seconds / HERO_ROW.effectiveSeconds),
+              blending: false,
+              eye: [3, 2, 8 - seconds] as [number, number, number],
+              lookAt: [0, 1, 0] as [number, number, number],
+              fovDeg: 50,
+              message: `Previewing shot 1 of 1 at ${seconds.toFixed(1)}s`,
+              reason: null,
+            }
+          : {
+              active: false,
+              entity: null,
+              seconds: 0,
+              shotIndex: null,
+              shots: 0,
+              reads: "",
+              subjectName: "",
+              progress: 0,
+              blending: false,
+              eye: [0, 0, 0] as [number, number, number],
+              lookAt: [0, 0, 0] as [number, number, number],
+              fovDeg: 50,
+              message: "Preview off \u2014 the editor camera is back.",
+              reason: null,
+            },
+      ),
+    ),
+    // A render that ACTUALLY ADVANCES. A stub answering one fixed row would let a panel that never
+    // polls pass every assertion about progress, which is the one thing these tests exist to catch:
+    // each `cinemaRenderStatus` call writes one more frame until the plan is full, then goes `done`.
+    cinemaRenderPlan: vi.fn((id: string, fps: number, shot: number | null) => {
+      const seconds = shot === null ? 12.5 : 2.5;
+      const frames = Math.max(1, Math.round(seconds * fps));
+      return Promise.resolve({ ...RENDER_FIXTURE, entity: id, fps, frames, seconds, message: `${frames} frames · ${seconds.toFixed(1)}s at ${fps} fps` });
+    }),
+    cinemaRenderStart: vi.fn((id: string, fps: number, shot: number | null, stem: string) => {
+      RENDER_FIXTURE.running = true;
+      RENDER_FIXTURE.done = false;
+      RENDER_FIXTURE.entity = id;
+      RENDER_FIXTURE.fps = fps;
+      RENDER_FIXTURE.stem = stem;
+      RENDER_FIXTURE.frames = shot === null ? 60 : 24;
+      RENDER_FIXTURE.seconds = RENDER_FIXTURE.frames / Math.max(1, fps);
+      RENDER_FIXTURE.written = 0;
+      RENDER_FIXTURE.bytes = 0;
+      RENDER_FIXTURE.width = 0;
+      RENDER_FIXTURE.height = 0;
+      RENDER_FIXTURE.folder = "C:/renders/skid-weld-line";
+      RENDER_FIXTURE.failures = [];
+      RENDER_FIXTURE.message = `Rendering frame 1 of ${RENDER_FIXTURE.frames}`;
+      RENDER_FIXTURE.reason = null;
+      return Promise.resolve({ ...RENDER_FIXTURE });
+    }),
+    cinemaRenderStatus: vi.fn(() => {
+      if (RENDER_FIXTURE.running) {
+        RENDER_FIXTURE.written = Math.min(RENDER_FIXTURE.frames, RENDER_FIXTURE.written + 20);
+        RENDER_FIXTURE.width = 1920;
+        RENDER_FIXTURE.height = 803;
+        RENDER_FIXTURE.bytes = RENDER_FIXTURE.written * 512_000;
+        RENDER_FIXTURE.elapsedMs = RENDER_FIXTURE.written * 40;
+        if (RENDER_FIXTURE.written >= RENDER_FIXTURE.frames) {
+          RENDER_FIXTURE.running = false;
+          RENDER_FIXTURE.done = true;
+          RENDER_FIXTURE.message = `Rendered ${RENDER_FIXTURE.frames} frames at 1920x803 in 2.4s`;
+        } else {
+          RENDER_FIXTURE.message = `Rendering frame ${RENDER_FIXTURE.written + 1} of ${RENDER_FIXTURE.frames}`;
+        }
+      }
+      return Promise.resolve({ ...RENDER_FIXTURE });
+    }),
+    cinemaRenderCancel: vi.fn(() => {
+      RENDER_FIXTURE.running = false;
+      RENDER_FIXTURE.done = true;
+      RENDER_FIXTURE.message = `Render stopped — ${RENDER_FIXTURE.written} frame(s) kept.`;
+      return Promise.resolve({ ...RENDER_FIXTURE });
+    }),
+    viewportCapture: vi.fn(() =>
+      Promise.resolve({
+        ...RENDER_FIXTURE,
+        running: false,
+        done: true,
+        frames: 1,
+        written: 1,
+        width: 1920,
+        height: 803,
+        folder: "C:/renders/frame.png",
+        bytes: 512_000,
+        message: "Saved 1920x803 to C:/renders/frame.png",
+        reason: null,
+      }),
+    ),
     conditionCatalog: vi.fn(() => Promise.resolve([
       { kind: "score_at_least", label: "The Score is at least…", blurb: "gate this behind points the player has already earned", needs: "number", reads: "the Score is at least {n}" },
       { kind: "still_active", label: "It hasn't been used yet", blurb: "this object has not been collected or beaten", needs: "none", reads: "it hasn't been used yet" },
@@ -269,8 +567,10 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     renameEntity: () => Promise.resolve(true),
     groupEntities: () => Promise.resolve("group-1"),
     ungroupEntity: () => Promise.resolve(true),
-    multiEdit: vi.fn(() => Promise.resolve(true)),
+    multiEdit: vi.fn((ids: string[]) => Promise.resolve({ ok: true, changed: ids.length, reason: null })),
+    setRotation: vi.fn((ids: string[]) => Promise.resolve({ ok: true, changed: ids.length, reason: null })),
     deleteDeactivate: vi.fn(() => Promise.resolve(true)),
+    deleteDeactivateMany: vi.fn(() => Promise.resolve(true)),
     copySubtree: vi.fn(),
     cutSubtree: () => Promise.resolve(true),
     pasteClipboard: () => Promise.resolve("paste-1"),
@@ -288,9 +588,21 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     gizmoMode: vi.fn(),
     gizmoSelect: () => Promise.resolve(true),
     gizmoSelected: () => Promise.resolve(null),
-    gizmoDebug: () => Promise.resolve(["translate", false, false, "world", "origin"]),
-    gizmoSpaceToggle: () => Promise.resolve("local"),
-    gizmoPivotToggle: () => Promise.resolve("center"),
+    // THE THREE OF THESE ARE ONE PIECE OF STATE, AND THEY USED TO BE THREE CONSTANTS THAT
+    // CONTRADICTED EACH OTHER. `gizmoSpaceToggle` answered "local" for ever while `gizmoDebug` kept
+    // answering "world", so any refresh landing AFTER a toggle reverted the toolbar's label to the
+    // value it had just been told to leave. Whether the assertion or the refresh won was decided by
+    // how loaded the machine was — a real product would answer both reads from one place, and a fake
+    // that does not is a flake generator, not a simplification.
+    gizmoDebug: () => Promise.resolve(["translate", false, false, gizmoState.space, gizmoState.pivot]),
+    gizmoSpaceToggle: () => {
+      gizmoState.space = gizmoState.space === "world" ? "local" : "world";
+      return Promise.resolve(gizmoState.space);
+    },
+    gizmoPivotToggle: () => {
+      gizmoState.pivot = gizmoState.pivot === "origin" ? "center" : "origin";
+      return Promise.resolve(gizmoState.pivot);
+    },
     gizmoPickDrag: () => Promise.resolve(false),
     gizmoDragEnd: vi.fn(),
     readTransform: () => Promise.resolve([0, 0, 0, 0, 0, 0, 1, 1]),
@@ -310,6 +622,12 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     setRenderProfile: (profile) => Promise.resolve(profile),
     renderProfileDebug: () => Promise.resolve("cinematic"),
     viewportPick: () => Promise.resolve(null),
+    // Nothing under the cursor by default — the honest answer for a client with no viewport. A test
+    // that drives the aim gesture overrides it with the id it means to be pointing at.
+    viewportPeek: vi.fn((): Promise<string | null> => Promise.resolve(null)),
+    // The lit count the real engine answers with. A test that cares asserts on the ARGUMENT — which
+    // subjects the editor asked the stage to light — because the count is the engine's to produce.
+    viewportHover: vi.fn((_ids: string[]): Promise<number> => Promise.resolve(0)),
     dragStart: vi.fn(),
     dragEnd: vi.fn(),
     zoom: vi.fn(),
@@ -318,7 +636,9 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     catalogSearch: () => Promise.resolve({ items: [] }),
     addItem: vi.fn(() => Promise.resolve({ created: "e-new", balance: null, seam: null })),
     importAsset: vi.fn(() => Promise.resolve("imported-1")),
-    importAssetDialog: vi.fn(() => Promise.resolve("imported-1")),
+    importAssetDialog: vi.fn(() =>
+      Promise.resolve({ entityId: "imported-1", outcome: "imported", message: "Imported crane.step." } as ImportDialogResponse),
+    ),
     projectState: () => Promise.resolve({ path: null, dirty: false, recents: [], error: null }),
     newProject: vi.fn(() => Promise.resolve({ path: null, dirty: false, recents: [], error: null })),
     openProject: vi.fn(() => Promise.resolve({ path: "p.mtk", dirty: false, recents: ["p.mtk"], error: null })),

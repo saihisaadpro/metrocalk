@@ -26,6 +26,10 @@
     {
       "module": "src/panels/StatusBar.tsx",
       "reason": "Carries connection state — including 'not connected'. Absent, the shell looks fine while being unreachable."
+    },
+    {
+      "module": "src/panels/DescribeBar.tsx",
+      "reason": "North star #2's only control, and it is on the stage from the first frame. It used to be three clicks and a scroll inside a collapsed disclosure in the Build workspace, where being lazy cost nothing because nobody could reach it quickly anyway; as the stage composer it is one of the first things on screen, and a front door that pops in after a chunk fetch is the same defect as an empty state that arrives late. Measured: +8,137 bytes on the entry, of which 6,220 is the lazy chunk it replaces."
     }
   ],
   "mustNotBeStaticallyReachable": [

@@ -23,7 +23,7 @@ fn a_plugin_loads_and_runs_behind_the_trait() {
         .expect("the example plugin loads behind the trait");
     let input = br#"{"ids":["1_0","1_1","1_2"],"seed":7,"spacing":2.0}"#;
     let out = p.call("arrange", input).expect("the plugin runs");
-    // The output is an AiPatch (the ADR-017 shape the host commits) — 3 entities × (px,py,pz) setField ops.
+    // The output is an AiPatch (the ADR-017 shape the host commits) — 3 entities x (x,y,z) setField ops.
     let patch: serde_json::Value = serde_json::from_slice(&out).expect("output is JSON");
     assert_eq!(patch["clientOpId"], "plugin-arrange");
     let ops = patch["ops"].as_array().expect("ops array");
@@ -33,7 +33,7 @@ fn a_plugin_loads_and_runs_behind_the_trait() {
     assert_eq!(ops[0]["id"], "1_0");
     assert!(
         ops[0]["value"].is_number(),
-        "Transform.px is a numeric value"
+        "Transform.x is a numeric value"
     );
 }
 

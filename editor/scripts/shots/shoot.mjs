@@ -202,69 +202,50 @@ function installClipRect() {
     box.height = Math.max(0, box.bottom - box.top);
     return box;
   };
-}
 
-/** Runs IN THE PAGE. A cheap, stable fingerprint of the layout: how wide the frame is, and where
- *  every visible control sits inside it.
- *
- *  IT IS INSTALLED BEFORE THE CLICKS, NOT AFTER THEM, and that is the whole of the repair below. It
- *  used to be an inline closure read only either side of the capture, which answered "did the camera
- *  move anything" and could not answer the earlier question: **had the page finished moving before
- *  anything was measured at all**. It had not. A workspace behind `React.lazy` resolves its chunk
- *  asynchronously, the driver waited a flat 300 ms per click, and on a loaded machine that is a coin
- *  toss — `shell-dock-tabs` failed a full 47-scene run with six tabs measured at 0px on screen and
- *  the disturbance check firing beside them, then passed twice on its own in the same tree. A gate
- *  whose verdict depends on how busy the box is trains everyone to re-run it, which is the same
- *  ending as not having it. */
-function installFingerprint() {
-  window.__mtkFingerprint = () => {
+  // THE SURFACE UNDER TEST IS THE FRAME **PLUS WHAT THE SCENE PORTALLED OUT OF IT**.
+  //
+  // Every claim and every invariant used to be evaluated inside `[data-testid="shot-frame"]`, and
+  // `theme/Popover.tsx` portals `Modal`/`Popover` to `document.body` BY DESIGN — a raised `z-index`
+  // cannot escape an ancestor's `overflow: hidden`. So a dialog, popover, context menu, command
+  // palette or toast was **unassertable**, and the constitution names four of those as signature
+  // surfaces. Not "hard to assert": the frame does not contain them, so `present` found nothing,
+  // `absent` found nothing, and `textContent` did not include a word of them.
+  //
+  // MEASURED BEFORE IT WAS FIXED, because a suspected gap and a real one look identical in a green
+  // run. A scene rendering the command palette OPEN and claiming `absent: [".mtk-command-palette"]`
+  // plus `text_absent: ["Frame all"]` — both false on screen, in a capture that shows the dialog,
+  // its search field and that exact row — printed `ok` and exit 0. That transcript is the evidence
+  // this function exists; the `--self-test` mutants below are what keep it true.
+  //
+  // A portal root is a body child that is NOT the harness's own mount and that actually renders:
+  // the `<script>` tag is a body child too, and folding its source into the text claims would make
+  // `text_absent: ["null"]` fire on JavaScript nobody photographed.
+  window.__mtkRoots = () => {
     const frame = document.querySelector('[data-testid="shot-frame"]');
-    if (!frame) return "no frame";
-    const box = frame.getBoundingClientRect();
-    const sel = 'button, a[href], input, select, textarea, [role="button"]';
-    const rows = [...frame.querySelectorAll(sel)].map((el) => {
-      const r = el.getBoundingClientRect();
-      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
-    });
-    return `${Math.round(box.width)}×${Math.round(box.height)}|${rows.length}|${rows.join(" ")}`;
+    if (!frame) return [];
+    const NOT_RENDERED = new Set(["SCRIPT", "STYLE", "LINK", "TEMPLATE", "NOSCRIPT", "META", "TITLE"]);
+    const portals = [...document.body.children].filter(
+      (el) => !el.contains(frame) && !NOT_RENDERED.has(el.tagName) && el.getClientRects().length > 0,
+    );
+    return [frame, ...portals];
   };
 }
 
-/** Wait until the layout stops moving, and FAIL LOUDLY if it never does.
- *
- *  Two identical readings `QUIET_MS` apart is the bar. A flat sleep answers "has enough time passed
- *  on THIS machine", which is a question about the machine; this answers "has the page finished",
- *  which is the question the driver actually has. The ceiling is real rather than a fallback: a
- *  surface that is still moving after `SETTLE_MS` is either animating forever or re-rendering in a
- *  loop, and photographing it under a caption about a static layout is exactly the "picture is not
- *  evidence of the verdict" failure the disturbance check below exists to name.
- *
- *  `QUIET_MS` is longer than the 180 ms `--mtk-motion-base` used by the disclosure and dock
- *  transitions, so a section mid-open cannot read as settled between two frames of its own
- *  animation. */
-const QUIET_MS = 220;
-const SETTLE_MS = 5000;
-
-async function settle(page) {
-  const started = Date.now();
-  let previous = null;
-  for (;;) {
-    const now = await page.evaluate(() => window.__mtkFingerprint());
-    if (now === previous) return;
-    if (Date.now() - started > SETTLE_MS) {
-      throw new Error(
-        `the layout never settled: it was still moving ${SETTLE_MS} ms after the scene reached its ` +
-          "state, so any measurement taken here is of a frame, not of a layout",
-      );
-    }
-    previous = now;
-    await new Promise((r) => setTimeout(r, QUIET_MS));
-  }
-}
-
-function layoutInvariants(windowIsTheSubject) {
-  const frame = document.querySelector('[data-testid="shot-frame"]');
+function layoutInvariants({ rootIndex, windowIsTheSubject }) {
+  // ONE ROOT PER CALL. The nine invariants below are written against a single containing surface and
+  // stop their ancestor walks at it; running them over several roots at once would need every one of
+  // those walks to know which root it was under. The driver calls this once per root instead, so the
+  // rules themselves did not have to change shape to reach a portal.
+  const frame = window.__mtkRoots()[rootIndex];
   if (!frame) return [];
+  // A PORTALLED OVERLAY'S BOUNDARY IS THE WINDOW, NOT A PANEL. `Modal` renders `position: fixed;
+  // inset: 0` into `document.body`: it has no panel to escape, and R1's "past the panel's right
+  // edge" would be measured against a box that IS the viewport. So for a portal root the reference
+  // rectangle is the window on both axes — which also makes R5 (content leaves the window downwards)
+  // unconditional here, rather than gated on a scene having declared the window its subject. A
+  // dialog taller than the screen is off the screen whatever the scene said about its own width.
+  const isPortal = rootIndex > 0;
   const out = [];
   const TOL = 1; // sub-pixel rounding; fractional layout is not a defect
 
@@ -310,7 +291,13 @@ function layoutInvariants(windowIsTheSubject) {
     return `<${el.tagName.toLowerCase()}${cls}>` + (txt ? ` "${txt}"` : "");
   };
   const visible = (el, r) => {
-    if (r.width < 1 && r.height < 1) return false;
+    // ONE PIXEL IN BOTH AXES IS NOT A SURFACE A READER CAN BE SHOWN ANYTHING ON. The bound used to be
+    // `< 1`, which is off by exactly the size the screen-reader-only pattern uses: `.mtk-visually-
+    // hidden` is `width: 1px; height: 1px; overflow: hidden`, so every one of them was judged visible
+    // and R2 reported each as text truncated with nothing to say so — a confident finding about a
+    // sentence written to be unseen. Nothing legible fits in a 1x1 box, so excluding it costs no
+    // coverage; the rules keep judging anything larger on either axis.
+    if (r.width <= 1 && r.height <= 1) return false;
     const cs = getComputedStyle(el);
     return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
   };
@@ -376,10 +363,12 @@ function layoutInvariants(windowIsTheSubject) {
 
   const box = frame.getBoundingClientRect();
   const fs = getComputedStyle(frame);
-  const inner = {
-    left: box.left + parseFloat(fs.paddingLeft || 0) + parseFloat(fs.borderLeftWidth || 0),
-    right: box.right - parseFloat(fs.paddingRight || 0) - parseFloat(fs.borderRightWidth || 0),
-  };
+  const inner = isPortal
+    ? { left: 0, right: window.innerWidth }
+    : {
+        left: box.left + parseFloat(fs.paddingLeft || 0) + parseFloat(fs.borderLeftWidth || 0),
+        right: box.right - parseFloat(fs.paddingRight || 0) - parseFloat(fs.borderRightWidth || 0),
+      };
   const els = [...frame.querySelectorAll("*")];
 
   // R1 — CONTENT ESCAPES ITS PANEL. An element painted outside the frame's content box has left the
@@ -444,7 +433,7 @@ function layoutInvariants(windowIsTheSubject) {
   // while the same row inside a scroller hanging off the window keeps a bottom edge below it and
   // does. One definition, now five readers, and the last special case that had its own opinion about
   // where an element is has been removed.
-  if (windowIsTheSubject) {
+  if (windowIsTheSubject || isPortal) {
     for (const el of els) {
       if (!visible(el, el.getBoundingClientRect())) continue;
       if (getComputedStyle(el).position === "fixed") continue; // positioned against the window by design
@@ -1001,9 +990,144 @@ if (scenes.length === 0) {
   process.exit(1);
 }
 
+/** The cap on `settle`, and it is a CAP rather than a budget: nothing waits for it when the page has
+ *  settled, and when it expires the scene's own claim decides the verdict and prints its own message. */
+const SETTLE_CAP_MS = 8_000;
+
+/** Runs IN THE PAGE. A cheap, stable fingerprint of the layout: how wide the frame is, and where every
+ *  visible control sits inside it.
+ *
+ *  ONE DEFINITION, THREE READERS, and the third is why it moved to `window`. It was written for the
+ *  post-capture comparison — did the screenshot move the page it photographed — and `settle` needs the
+ *  SAME reading, because "has this page stopped moving" and "did it move" are the same question asked
+ *  a moment apart. `settle`'s first version sampled `innerHTML.length` instead, which is a different
+ *  question: markup can be final while three controls are still sliding into place, and `shell-build`
+ *  failed on exactly that in three consecutive full runs — every assertion green, the capture reporting
+ *  that the layout had moved underneath it. Settling on the thing the gate measures makes the two agree
+ *  by construction rather than by a margin someone has to keep guessing at.
+ *
+ *  Installed on `window` rather than closed over because the readers are separate `page.evaluate` /
+ *  `waitForFunction` calls, which serialize a function and not its scope. */
+/** The first real difference between two fingerprints, in words. Runs in NODE, on the two strings the
+ *  page produced, so it costs nothing until something has already gone wrong. */
+function describeDrift(before, after) {
+  const [beforeBox, beforeCount, ...beforeRest] = before.split("|");
+  const [afterBox, afterCount, ...afterRest] = after.split("|");
+  if (beforeBox !== afterBox) return `the frame went from ${beforeBox} to ${afterBox}`;
+  if (beforeCount !== afterCount) {
+    return `the frame held ${beforeCount} control(s) before the capture and ${afterCount} after it`;
+  }
+  const a = (beforeRest.join("|") || "").split(" ");
+  const b = (afterRest.join("|") || "").split(" ");
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return `control #${i} moved from \`${a[i] ?? "(absent)"}\` to \`${b[i] ?? "(absent)"}\` (TAG:left,top,width)`;
+  }
+  return "the two readings differ in a way this summary cannot name, which is itself a defect in it";
+}
+
+function installFingerprint() {
+  window.__mtkFingerprint = () => {
+    const frame = document.querySelector('[data-testid="shot-frame"]');
+    if (!frame) return "no frame";
+    const box = frame.getBoundingClientRect();
+    const sel = 'button, a[href], input, select, textarea, [role="button"]';
+    const rows = [...frame.querySelectorAll(sel)].map((el) => {
+      const r = el.getBoundingClientRect();
+      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
+    });
+    return `${Math.round(box.width)}×${Math.round(box.height)}|${rows.length}|${rows.join(" ")}`;
+  };
+}
+
+/** Wait for the page to be FINISHED, not for a length of time to have passed.
+ *
+ *  WHAT WAS HERE AND WHY IT WAS WRONG. Two `setTimeout`s — 250 ms after `goto` "because the panels
+ *  fetch their report in an effect", and 300 ms after each click "because the workspace is lazy-loaded
+ *  behind Suspense". Both are a WALL-CLOCK BUDGET STANDING IN FOR A CONDITION, which is a bug this
+ *  repository has now paid for in four separate places. The budget is not wrong on an idle machine; it
+ *  is wrong on a busy one, and a gate that passes when the machine is quiet and fails when it is not
+ *  has stopped being a gate and become a coin.
+ *
+ *  MEASURED HERE: `shell-dock-model` passed twice in isolation and failed inside the 53-scene run,
+ *  reporting the Model workspace's content box as 0px tall with 188px of content in it. That is not a
+ *  layout defect, it is a photograph taken while a dynamic `import()` was still in flight.
+ *
+ *  THE CONDITION IS THE SCENE'S OWN CLAIM, and the first attempt at this file got that wrong in an
+ *  instructive way. Waiting for the markup to stop changing is NOT the condition: while a lazy chunk is
+ *  in flight the DOM is perfectly stable — it is showing the Suspense fallback — so a stability poll
+ *  reports "settled" and the capture happens anyway. Five scenes went red on that version. `present`
+ *  and `text_present` already say what has to be on screen, so those are what is waited for, and
+ *  stability is kept only as the second half of the condition (a lazy panel that mounts in pieces can
+ *  satisfy a selector one frame before it finishes laying out).
+ *
+ *  `want === null` asks for stability alone. That is right before the gesture that brings the claim's
+ *  subject into existence, and wrong after it.
+ *
+ *  AND A STABLE FINGERPRINT IS NOT THE SAME AS A FINISHED PAGE (ADR-170). `shell-dock-short` failed
+ *  once inside a 56-scene run — `.mtk-bottom-dock__content measures 0px tall` — and passed twice in
+ *  isolation immediately afterwards, with the post-capture drift check naming the cause in one line:
+ *  a control moved 32px between the assertions and the shutter. The dock's height is a CSS
+ *  `transition`, so the page is not "changing" in any way the DOM can be polled for: it is animating,
+ *  and an animation that has not STARTED yet — the class lands in one frame, the transition begins in
+ *  the next — presents four perfectly identical fingerprints in a row before it moves anything.
+ *  Sampling harder cannot fix that; sampling is the wrong question. `getAnimations()` is the right
+ *  one: it asks the engine what is still in flight and is the only reading here that distinguishes
+ *  "nothing has moved for 400 ms" from "nothing is going to move".
+ *
+ *  ONLY TRANSITIONS ARE WAITED FOR, and that is not a hedge. The Suspense fallback's spinner is
+ *  `animation: mtk-spin 800ms linear INFINITE` — it is running by design and will never finish, so a
+ *  settle that waited for `getAnimations()` to empty would burn the whole cap on every lazy workspace
+ *  and then capture the fallback. A `CSSTransition` is exactly the class of movement that takes the
+ *  layout out from under a settled fingerprint, and every one of them ends. */
+async function settle(page, want) {
+  await page.evaluate(() => {
+    window.__mtkSettle = { last: null, same: 0 };
+  });
+  await page
+    .waitForFunction(
+      (w) => {
+        const frame = document.querySelector('[data-testid="shot-frame"]');
+        if (!frame) return false;
+        if (w) {
+          for (const [sel, atLeast] of w.present) {
+            if (frame.querySelectorAll(sel).length < atLeast) return false;
+          }
+          const text = frame.textContent ?? "";
+          for (const s of w.text) if (!text.includes(s)) return false;
+        }
+        // Nothing still moving. A running CSS transition is invisible to a DOM poll, and a transition
+        // that has been declared but has not begun is invisible to everything else.
+        if (typeof CSSTransition !== "undefined" && typeof document.getAnimations === "function") {
+          for (const animation of document.getAnimations()) {
+            if (animation instanceof CSSTransition && animation.playState === "running") return false;
+          }
+        }
+        const now = window.__mtkFingerprint();
+        const state = window.__mtkSettle;
+        state.same = now === state.last ? state.same + 1 : 0;
+        state.last = now;
+        // Four consecutive identical readings at the fixed cadence below — ~400 ms of a page whose
+        // controls have all stopped moving, paid whether or not anything was ever pending. That is
+        // the price of the whole suite being a gate rather than a coin, and on 53 scenes it is ~30 s.
+        return state.same >= 4;
+      },
+      // A FIXED 100 ms CADENCE, NOT `raf`. Two reasons, and the second is the one that cost a run.
+      // rAF is throttled by whatever else the page is doing, so the sampling interval — and therefore
+      // what "four identical readings" means in milliseconds — varies with load, which is the property
+      // this whole rewrite exists to remove. And 4 rAF frames is ~65 ms of quiet, which is not enough
+      // to outlast an async reply already in flight: `shell-build`'s asset catalogue arrives from a
+      // `catalog()` promise and takes the frame from 35 controls to 104, and the gap between the
+      // toolbar mounting and the library landing is a perfectly stable page. 4 × 100 ms is.
+      { polling: 100, timeout: SETTLE_CAP_MS },
+      want,
+    )
+    .catch(() => {});
+}
+
 let failed = 0;
 for (const scene of scenes) {
   const { id, looking_for, expect, viewport, click } = scene;
+  const typing = scene.type;
   const page = await browser.newPage();
   // EVERY SCENE STARTS FROM A FIRST-RUN USER'S STATE. Chromium serves one storage area to every
   // `file://` page in a run, and the shell remembers real things there: which docks are pinned
@@ -1035,13 +1159,19 @@ for (const scene of scenes) {
   page.on("pageerror", (e) => problems.push(`pageerror: ${e}`));
   page.on("console", (m) => m.type() === "error" && problems.push(`console.error: ${m.text()}`));
 
+  // What the claim says must be on screen — the positive half of it, which is the only half a wait can
+  // be satisfied by. `absent` and `text_absent` are true of an empty page, so waiting on them would
+  // wait for nothing.
+  const positives = { present: expect.present ?? [], text: expect.text_present ?? [] };
   await page.goto(`${href}?scene=${id}`, { waitUntil: "networkidle0" });
-  await new Promise((r) => setTimeout(r, 250)); // the panels fetch their report in an effect
+  await page.evaluate(installFingerprint);
+  // Before the gesture, only stability: a scene WITH a `click` reaches its subject through that click,
+  // so requiring the claim here would burn the cap waiting for something no one has asked for yet.
+  await settle(page, click?.length ? null : positives);
 
   // Drive the scene to the state it claims to photograph. A selector that matches nothing is a
   // FAILURE: silently skipping it would capture the default state under a caption describing
   // another, and a caption nothing evaluates is what this harness exists to stop.
-  await page.evaluate(installFingerprint);
   for (const sel of click ?? []) {
     const el = await page.$(sel);
     if (!el) {
@@ -1049,11 +1179,27 @@ for (const scene of scenes) {
       break;
     }
     await el.click();
-    await settle(page); // the workspace is lazy-loaded behind Suspense
+    await settle(page, null);
   }
-  // And once more after the last click, because a scene with NO clicks still mounts panels that fetch
-  // in an effect — the 250 ms above is the same flat guess one step earlier.
-  await settle(page);
+
+  // Then the text, into the control the clicks reached. `page.$` searches the whole document rather
+  // than the frame, so this reaches a field inside a portalled dialog — which is the only place the
+  // command palette's query has ever lived. `clickCount: 3` selects whatever is in the field first,
+  // so a scene that types twice replaces rather than appends and cannot depend on what ran before it.
+  for (const [sel, value] of typing ?? []) {
+    const el = await page.$(sel);
+    if (!el) {
+      problems.push(`type into \`${sel}\` matched nothing — the scene never reached the state it claims`);
+      break;
+    }
+    await el.click({ clickCount: 3 });
+    await el.type(value, { delay: 0 });
+    await new Promise((r) => setTimeout(r, 300)); // the results are re-ranked on the next render
+  }
+
+  // The gestures are done, so the claim's subject is now something to WAIT for rather than something
+  // to hope arrived — this is the wait that covers a workspace lazy-loaded behind Suspense.
+  if (click?.length || typing?.length) await settle(page, positives);
 
   // MEASURE BEFORE CAPTURING, because capturing MOVES THINGS. `screenshot({ fullPage: true })`
   // resizes the page to the content box and puts it back, and a shell that lays itself out from
@@ -1071,15 +1217,31 @@ for (const scene of scenes) {
   await page.evaluate(installClipRect);
   const claim = await page.evaluate((e) => {
     const out = [];
-    const frame = document.querySelector('[data-testid="shot-frame"]');
+    const roots = window.__mtkRoots();
+    const frame = roots[0];
     if (!frame) return ["the harness itself never mounted"];
-    const text = frame.textContent ?? "";
+
+    // EVERY QUERY BELOW SPANS THE FRAME **AND** ANYTHING THE SCENE PORTALLED TO `document.body`.
+    // See `installClipRect` for the measurement that proved this was needed. `matches` is checked as
+    // well as `querySelectorAll` because a portal root can BE the match — `Modal` renders the
+    // `role="dialog"` element itself into the body, and a claim about it would otherwise be looking
+    // only at its descendants.
+    const qsa = (sel) =>
+      roots.flatMap((r) => (r.matches(sel) ? [r, ...r.querySelectorAll(sel)] : [...r.querySelectorAll(sel)]));
+    const qs = (sel) => qsa(sel)[0] ?? null;
+    // A clip walk stops at the root the element is UNDER, never at `roots[0]`: handing a portalled
+    // element the frame would walk it past `document.body` and intersect it with rectangles that are
+    // not its ancestors at all.
+    const rootOf = (el) => roots.find((r) => r === el || r.contains(el)) ?? frame;
+    const clip = (el) => window.__mtkClipRect(el, rootOf(el));
+    const text = roots.map((r) => r.textContent ?? "").join(" ");
+
     for (const [sel, atLeast] of e.present ?? []) {
-      const n = frame.querySelectorAll(sel).length;
+      const n = qsa(sel).length;
       if (n < atLeast) out.push(`expected at least ${atLeast} \`${sel}\`, found ${n}`);
     }
     for (const sel of e.absent ?? []) {
-      const n = frame.querySelectorAll(sel).length;
+      const n = qsa(sel).length;
       if (n) out.push(`expected no \`${sel}\`, found ${n}`);
     }
     for (const s of e.text_present ?? []) {
@@ -1123,7 +1285,7 @@ for (const scene of scenes) {
     const ceiling = (axis, pairs) => {
       const tall = axis === "height";
       for (const [sel, px] of pairs ?? []) {
-        const el = frame.querySelector(sel);
+        const el = qs(sel);
         if (!el) {
           out.push(`max_${axis} needs \`${sel}\`, which is not there`);
           continue;
@@ -1141,13 +1303,13 @@ for (const scene of scenes) {
     const floor = (axis, pairs) => {
       const tall = axis === "height";
       for (const [sel, px] of pairs ?? []) {
-        const el = frame.querySelector(sel);
+        const el = qs(sel);
         if (!el) {
           out.push(`min_${axis} needs \`${sel}\`, which is not there`);
           continue;
         }
         const box = el.getBoundingClientRect();
-        const seen = window.__mtkClipRect(el, frame);
+        const seen = clip(el);
         const claimed = Math.round(tall ? box.height : box.width);
         const onScreen = Math.round(tall ? seen.height : seen.width);
         if (onScreen >= px - 1) continue;
@@ -1195,8 +1357,8 @@ for (const scene of scenes) {
     // sheet takes no layout space, so the stage's room is the whole column, and that is true of any
     // future overlay for the same reason rather than because it is the dock.
     if (e.stage_floor != null) {
-      const col = frame.querySelector(".mtk-stage-column");
-      const vp = frame.querySelector("[data-testid='viewport']");
+      const col = qs(".mtk-stage-column");
+      const vp = qs("[data-testid='viewport']");
       if (!col || !vp) out.push("stage_floor needs .mtk-stage-column and the viewport, and one is not there");
       else {
         // …AND A SIBLING CANNOT RAISE ITS OWN ENTITLEMENT. Reading the declared `min-height` alone
@@ -1219,7 +1381,7 @@ for (const scene of scenes) {
         }
         const room = Math.max(0, Math.round(col.clientHeight - taken));
         const want = Math.min(e.stage_floor, room);
-        const seen = Math.round(window.__mtkClipRect(vp, frame).height);
+        const seen = Math.round(clip(vp).height);
         if (seen < want - 1) {
           out.push(
             `the stage measures ${seen}px tall against the ${want}px it is owed here — its ${e.stage_floor}px ` +
@@ -1247,14 +1409,14 @@ for (const scene of scenes) {
     // against building a waiver mechanism early). A scene that claims "these controls are reachable
     // here" is a claim with an owner, and it is the claim that was missing.
     for (const sel of e.unclipped ?? []) {
-      const els = [...frame.querySelectorAll(sel)];
+      const els = [...qsa(sel)];
       if (!els.length) {
         out.push(`unclipped needs \`${sel}\`, which matches nothing`);
         continue;
       }
       for (const el of els) {
         const r = el.getBoundingClientRect();
-        const c = window.__mtkClipRect(el, frame);
+        const c = clip(el);
         const lost = Math.round(r.width - c.width);
         const lostY = Math.round(r.height - c.height);
         if (lost > 1 || lostY > 1) {
@@ -1267,56 +1429,25 @@ for (const scene of scenes) {
         }
       }
     }
-    // AN ELLIPSIS IS HONEST AND IT IS STILL A DEFECT PAST A POINT, AND NOTHING HERE COULD SAY SO.
-    //
-    // `unclipped` catches a control an ancestor cut away; `min_width` catches one squeezed below a
-    // click target. Neither can see a control that is exactly the size it decided to be, painting a
-    // word that has been reduced to a letter. Both defects this claim was written for measured
-    // clean under every other rule in this file: the bottom dock's seven workspace tabs at a 1280
-    // window read `M… I… Fo… An… L… Pro… Ru…` (each tab a legal 64px target, none clipped), and the
-    // Animate workspace's surface tabs read `Ti… Cu… Gr…` at their 44px floor. There is no way to
-    // tell Model from Import in the first, and the second names three different editors.
-    //
-    // `scrollWidth > clientWidth` is the browser's own answer to "did this element have to hide some
-    // of its content", which is the question, and it costs two property reads. Per scene rather than
-    // universal for the same reason `unclipped` is: a truncated row in a long list of names is
-    // ordinary, and an invariant that fires on those is one that gets waived.
-    for (const sel of e.untruncated ?? []) {
-      const els = [...frame.querySelectorAll(sel)];
-      if (!els.length) {
-        out.push(`untruncated needs \`${sel}\`, which matches nothing`);
-        continue;
-      }
-      for (const el of els) {
-        const hidden = el.scrollWidth - el.clientWidth;
-        if (hidden <= 1) continue;
-        const label = (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 24) || sel;
-        out.push(
-          `\`${sel}\` "${label}" needs ${el.scrollWidth}px and has ${el.clientWidth}px, so ` +
-            `${hidden}px of its text is an ellipsis — every character of a shortened word is honest ` +
-            "and the word is still unreadable",
-        );
-      }
-    }
     // CONSERVATION, WHERE A FLOOR IS ARITHMETICALLY UNREACHABLE. See `Expect.fills` for why this
     // exists rather than a waiver on `min_height`. The children must tile the container's content
     // box: measured on screen (so a child clipped away is a child that did not tile), summed, and
     // compared to the container. A gap means something is missing; a surplus means two of them are
     // on the same pixels; either way the column is not accounted for.
     for (const [csel, kids] of e.fills ?? []) {
-      const container = frame.querySelector(csel);
+      const container = qs(csel);
       if (!container) {
         out.push(`fills needs \`${csel}\`, which is not there`);
         continue;
       }
-      const have = kids.map((k) => [k, frame.querySelector(k)]);
+      const have = kids.map((k) => [k, qs(k)]);
       const gone = have.filter(([, el]) => !el).map(([k]) => k);
       if (gone.length) {
         out.push(`fills \`${csel}\` names ${gone.join(", ")}, which ${gone.length > 1 ? "are" : "is"} not there`);
         continue;
       }
       const box = container.clientHeight;
-      const parts = have.map(([k, el]) => [k, Math.round(window.__mtkClipRect(el, frame).height)]);
+      const parts = have.map(([k, el]) => [k, Math.round(clip(el).height)]);
       const sum = parts.reduce((a, [, h]) => a + h, 0);
       if (Math.abs(sum - box) > 1) {
         out.push(
@@ -1329,8 +1460,8 @@ for (const scene of scenes) {
       }
     }
     for (const [sa, sb] of e.same_line ?? []) {
-      const a = frame.querySelector(sa);
-      const b = frame.querySelector(sb);
+      const a = qs(sa);
+      const b = qs(sb);
       if (!a || !b) {
         out.push(`same_line needs both \`${sa}\` and \`${sb}\`; ${a ? sb : sa} is not there`);
         continue;
@@ -1356,8 +1487,8 @@ for (const scene of scenes) {
     // asserts the ORDER too (`sa` above `sb`), because two blocks that swapped places are still
     // stacked, and a fix printed above the complaint it fixes is not the thing being claimed.
     for (const [sa, sb] of e.stacked ?? []) {
-      const a = frame.querySelector(sa);
-      const b = frame.querySelector(sb);
+      const a = qs(sa);
+      const b = qs(sb);
       if (!a || !b) {
         out.push(`stacked needs both \`${sa}\` and \`${sb}\`; ${a ? sb : sa} is not there`);
         continue;
@@ -1385,7 +1516,16 @@ for (const scene of scenes) {
   // precondition: a scene that set the WINDOW is a scene whose bottom edge is the window's, and a
   // scene that set a frame width is a `maxWidth` box on a page that is allowed to scroll. The
   // driver already rejects a scene that states both, so this reads one flag and not two.
-  const evaluated = await page.evaluate(layoutInvariants, Boolean(scene.viewport));
+  // ONCE PER ROOT — the frame, then each surface the scene portalled to `document.body`. A run that
+  // judged nothing and a run that agreed about everything print the same "ok" line, so the count of
+  // surfaces reached is reported below rather than left to be inferred from silence.
+  const rootCount = await page.evaluate(() => window.__mtkRoots().length);
+  const evaluated = [];
+  for (let rootIndex = 0; rootIndex < rootCount; rootIndex++) {
+    evaluated.push(
+      ...(await page.evaluate(layoutInvariants, { rootIndex, windowIsTheSubject: Boolean(scene.viewport) })),
+    );
+  }
   // A COUNTED BLIND SPOT IS NOT A FINDING. An invariant that cannot judge something must say so —
   // silence reads as coverage — but saying so is not the same as failing, and routing both down one
   // list would have made every graph scene red for a limitation of the rule rather than a defect in
@@ -1395,8 +1535,6 @@ for (const scene of scenes) {
   const notes = evaluated.filter((l) => l.startsWith("NOTE "));
   const layout = evaluated.filter((l) => !l.startsWith("NOTE "));
 
-  // The same reading the settle above already took, now used for its original question: did the
-  // CAPTURE move anything. One definition on `window`, three readers.
   const before = await page.evaluate(() => window.__mtkFingerprint());
 
   // `fullPage` exists so a panel taller than the window is captured whole. A scene that set its own
@@ -1414,13 +1552,12 @@ for (const scene of scenes) {
   // are about the same thing, and any future capture path that starts moving the page fails here
   // instead of quietly making every screenshot a lie.
   const after = await page.evaluate(() => window.__mtkFingerprint());
-  const disturbed =
-    before === after
-      ? []
-      : [
-          "the capture DISTURBED the layout it captured — the assertions above were checked against " +
-            "one layout and the PNG shows another, so the picture is not evidence of the verdict",
-        ];
+  // NAME WHAT MOVED. The first version of this check asserted that the two readings differed and
+  // stopped there, which is a verdict with no lead in it: three consecutive full runs reported that
+  // `shell-build`'s layout had moved and nothing in the output said which of its 30-odd controls, by
+  // how much, or in which direction — so the only way to act on it was to guess. A gate that can
+  // detect a difference can afford to print it.
+  const disturbed = before === after ? [] : [`the capture DISTURBED the layout it captured — ${describeDrift(before, after)}. The assertions above were checked against one layout and the PNG shows another, so the picture is not evidence of the verdict`];
 
   const bad = [...problems, ...claim, ...layout, ...disturbed];
   if (colours === null) bad.push("the capture is not an 8-bit RGB/RGBA PNG, so it was not checked");
@@ -1436,7 +1573,11 @@ for (const scene of scenes) {
     console.error(`        looking for: ${looking_for}`);
     for (const b of bad) console.error(`        ${b}`);
   } else {
-    console.log(`ok    ${id}.png  (${colours} colours)  ${looking_for}`);
+    // The reach, in numbers, beside the verdict. `1 surface` is the frame alone; anything more means
+    // the scene portalled something to `document.body` and it WAS judged — the distinction a bare
+    // "ok" cannot make, and the one that used to hide four signature surfaces behind a green run.
+    const reach = rootCount > 1 ? `, ${rootCount} surfaces` : "";
+    console.log(`ok    ${id}.png  (${colours} colours${reach})  ${looking_for}`);
   }
   for (const n of notes) console.log(`        ${n}`);
   await page.close();

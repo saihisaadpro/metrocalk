@@ -10,6 +10,7 @@ public static class MetrocalkWindowGeometry {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [DllImport("user32.dll", SetLastError=true)] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
@@ -58,9 +59,27 @@ if ($occluded) {
   $occludingTitle = $sb.ToString()
 }
 
+# The WINDOW rect as well as the client rect, because two different captures of this app are framed by
+# two different rectangles and a number measured on one is not a number about the other.
+#
+# `gdigrab` films a screen rectangle derived from the CLIENT area; `PrintWindow` returns the whole
+# WINDOW, title bar and border included. A window capture measured as if it were a film frame includes
+# the editor's white docks and header, which pin YHIGH near 233 no matter what the 3D viewport shows: a
+# frame whose viewport is entirely one dark surface -- the camera inside a machine, the exact failure
+# this lane exists to detect -- measures an interdecile range of 166 that way and 0 when cropped to the
+# viewport. Reporting the window origin is what lets the caller crop one into the other.
+$window = New-Object MetrocalkWindowGeometry+RECT
+if (-not [MetrocalkWindowGeometry]::GetWindowRect($handle, [ref]$window)) {
+  throw "GetWindowRect failed for '$ProcName' with Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())."
+}
+
 [ordered]@{
   processId = (Get-Process -Name $ProcName).Id
   hwnd = [long]$handle
+  windowX = $window.Left
+  windowY = $window.Top
+  windowWidth = $window.Right - $window.Left
+  windowHeight = $window.Bottom - $window.Top
   occluded = $occluded
   occludedBy = $occludingTitle
   x = $origin.X

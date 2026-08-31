@@ -106,3 +106,95 @@ test("shows immediate progress, prevents duplicate authoring commands, and resto
   expect(screen.getByTestId("authCreate").getAttribute("aria-disabled")).toBeNull();
   expect(screen.getByTestId("authLight").getAttribute("aria-disabled")).toBeNull();
 });
+
+// ── ADR-169 — THE TRIGGER COUNTED THE SELECTION AND THE VERBS DID ONE OF IT ────────────────────────
+// The Actions trigger has read "Actions · 12" off `ids.length` since M10.6, and Duplicate and Delete
+// both closed over `primary`. So the control named twelve objects, the tooltip said "the selection",
+// and one object was cloned or deactivated — with a toast promising a Ctrl-Z that would have needed
+// twelve if the loop had simply been written the obvious way.
+
+/** Three objects, all selected, the third one primary — the state the menu already counted. */
+function threeSelected(): void {
+  act(() => {
+    projectionStore.getState().bulkLoad([
+      { id: "a", name: "A", parentId: null, components: { Transform: { x: 0, y: 0, z: 0 } } },
+      { id: "b", name: "B", parentId: null, components: { Transform: { x: 1, y: 0, z: 0 } } },
+      { id: "c", name: "C", parentId: null, components: { Transform: { x: 2, y: 0, z: 0 } } },
+    ]);
+    projectionStore.getState().select("a");
+    projectionStore.getState().toggleSelect("b");
+    projectionStore.getState().toggleSelect("c");
+  });
+}
+
+test("Delete acts on the WHOLE selection, in one transaction, and says how many", async () => {
+  threeSelected();
+  const client = fakeClient();
+  render(<AuthoringToolbar client={client} />);
+  fireEvent.click(screen.getByRole("button", { name: /^actions/i }));
+
+  const del = screen.getByTestId("authDelete");
+  expect(del.textContent).toContain("Delete 3");
+  fireEvent.click(del);
+
+  await waitFor(() => expect(client.deleteDeactivateMany).toHaveBeenCalledTimes(1));
+  expect([...vi.mocked(client.deleteDeactivateMany).mock.calls[0][0]].sort()).toEqual(["a", "b", "c"]);
+  // The single-entity command is NOT how a selection is deleted: three calls would be three undo steps.
+  expect(client.deleteDeactivate).not.toHaveBeenCalled();
+  await waitFor(() => expect(uiStore.getState().status).toContain("deactivated 3"));
+  // Every one of them is dimmed in the hierarchy, not just the primary.
+  for (const id of ["a", "b", "c"]) {
+    expect(projectionStore.getState().deactivated[id]).toBe(true);
+  }
+});
+
+test("Duplicate clones the WHOLE selection, in one transaction, and selects a clone", async () => {
+  threeSelected();
+  const client = fakeClient();
+  vi.mocked(client.duplicateEntities).mockResolvedValue(["a2", "b2", "c2"]);
+  render(<AuthoringToolbar client={client} />);
+  fireEvent.click(screen.getByRole("button", { name: /^actions/i }));
+
+  const dup = screen.getByTestId("authDuplicate");
+  expect(dup.textContent).toContain("Duplicate 3");
+  fireEvent.click(dup);
+
+  await waitFor(() => expect(client.duplicateEntities).toHaveBeenCalledTimes(1));
+  expect([...vi.mocked(client.duplicateEntities).mock.calls[0][0]].sort()).toEqual(["a", "b", "c"]);
+  expect(client.duplicateEntity).not.toHaveBeenCalled();
+  await waitFor(() => expect(uiStore.getState().status).toContain("duplicated 3"));
+});
+
+test("with one object selected both verbs read and behave exactly as they did", async () => {
+  act(() => {
+    projectionStore.getState().bulkLoad([
+      { id: "a", name: "A", parentId: null, components: { Transform: { x: 0, y: 0, z: 0 } } },
+    ]);
+    projectionStore.getState().select("a");
+  });
+  const client = fakeClient();
+  render(<AuthoringToolbar client={client} />);
+  fireEvent.click(screen.getByRole("button", { name: /^actions/i }));
+  // No count in the label when there is nothing to count — a "Delete 1" is noise, not information.
+  expect(screen.getByTestId("authDelete").textContent).toContain("Delete");
+  expect(screen.getByTestId("authDelete").textContent).not.toContain("Delete 1");
+  fireEvent.click(screen.getByTestId("authDelete"));
+  await waitFor(() => expect(client.deleteDeactivateMany).toHaveBeenCalledWith(["a"]));
+  await waitFor(() => expect(uiStore.getState().status).toContain("deactivated —"));
+});
+
+test("a refused batch says the engine's reason, not a generic sentence", async () => {
+  threeSelected();
+  const client = fakeClient();
+  vi.mocked(client.multiEdit).mockResolvedValue({
+    ok: false,
+    changed: 0,
+    reason: "1 of 3 selected objects have no Transform",
+  });
+  render(<AuthoringToolbar client={client} />);
+  fireEvent.click(screen.getByRole("button", { name: /^actions/i }));
+  fireEvent.click(screen.getByTestId("authNudge"));
+  await waitFor(() =>
+    expect(uiStore.getState().status).toBe("1 of 3 selected objects have no Transform"),
+  );
+});

@@ -353,6 +353,28 @@ export const calmSecondsForKinds = (kinds) => kinds.reduce((seconds, kind) => {
  * without it a film assembled from fifteen part-sized subjects never once shows how big the factory is:
  * every shot is framed on its own subject's bounds, so even a "vista" of a clamp is a shot of a clamp.
  */
+/**
+ * The cards whose framing is wider than a machine, and which therefore belong to the PLANT.
+ *
+ * `vista` resolves to `extreme_wide` and `establish`/`birdseye` to `wide`. Those framings put the camera
+ * far enough back that their subject occupies a small fraction of the picture — which is the point of a
+ * wide shot, and is why the subject has to be something worth seeing at that size.
+ *
+ * MEASURED, on the first film taken with a sound legibility metric: five of the thirty shots gave a wide
+ * or extreme-wide card to a SMALL PART — a motor, a load hook, a hand welding gun, a fan filter. The
+ * sampled stills at those moments are uniform ground plane meeting uniform background with one strut at
+ * the edge of frame. The camera was placed correctly, the subject was in shot, and the picture was of an
+ * empty floor, because at that distance a 30 cm motor is a speck. Those frames measured an interdecile
+ * luma range of 14 to 29 against a floor of 40.
+ *
+ * No amount of occlusion testing rejects them: nothing is in the way. The shot is doing exactly what it
+ * was asked to do, and the ask was wrong. In a 262 m weld line the context a wide shot exists to
+ * establish IS the line, so a wide card is framed on the assembly and the part keeps the closer card of
+ * its pair. Every pair in `CALM_SHOT_PAIRS` contains at most one of these, so no subject loses its own
+ * shot to the rule.
+ */
+export const CONTEXT_FRAMED_KINDS = Object.freeze(["establish", "vista", "birdseye"]);
+
 export function buildCalmShotAssignments(subjects, { assemblyId = null } = {}) {
   const list = subjects ?? [];
   const lastIndex = list.length - 1;
@@ -364,6 +386,13 @@ export function buildCalmShotAssignments(subjects, { assemblyId = null } = {}) {
       } else if (index === lastIndex) {
         kinds = [{ kind: "orbit", subject: subject.id }, { kind: "pullback", subject: assemblyId }];
       }
+    }
+    // A wide card frames the plant, not the part standing in it. Applied after the opening/closing
+    // special cases so it cannot contradict them — those already frame the assembly.
+    if (assemblyId) {
+      kinds = kinds.map((entry) => (CONTEXT_FRAMED_KINDS.includes(entry.kind)
+        ? { ...entry, subject: assemblyId }
+        : entry));
     }
     return {
       id: subject.id,

@@ -108,8 +108,15 @@ export function timelineTickAt(
 export const TIMELINE_DIVISIONS = 10;
 
 export function timelineTicks(duration: number, label: (value: number) => string): TimelineTickMark[] {
+  // NOT ROUNDED. This used to be `Math.round((duration * index) / TIMELINE_DIVISIONS)` and it was
+  // wrong twice over on any duration that is not a multiple of ten. It is a POSITION as well as a
+  // number: at a 6.5s duration the last division rounded to 7 and the label sat past the end of its
+  // own lane, and three pairs of divisions rounded to the SAME value — which the ruler then used as
+  // its React key, so it rendered duplicate keys and dropped divisions. The only reason no consumer
+  // saw it is that the first one measures in 60000ths of a second, where every tenth is an integer.
+  // Formatting belongs to the caller's `label`, which is the function that knows the unit.
   return Array.from({ length: TIMELINE_DIVISIONS + 1 }, (_, index) => {
-    const value = Math.round((duration * index) / TIMELINE_DIVISIONS);
+    const value = (duration * index) / TIMELINE_DIVISIONS;
     return { value, label: label(value) };
   });
 }
@@ -357,7 +364,11 @@ export function TimelineRuler({
         <TimelinePlayhead tick={currentTick} duration={duration} handle />
         {ticks.map((tick, index) => (
           <span
-            key={tick.value}
+            // The DIVISION is the identity, not the value it lands on: two divisions of a short
+            // sequence can share a rendered number, and keying on the number silently dropped one of
+            // them. `timelineTicks` no longer rounds, but a caller may still hand over a list with
+            // repeats, and a key that depends on the data is a key that can collide.
+            key={index}
             className={[
               "mtk-timeline__tick",
               index === 0 && "mtk-timeline__tick--first",
@@ -493,6 +504,82 @@ export function TimelineChip({
         </Button>
       )}
     </span>
+  );
+}
+
+export interface TimelineClipProps extends DataAttrs {
+  /** Where the clip starts, in the caller's own time unit. */
+  start: number;
+  /** How long it lasts, same unit. */
+  length: number;
+  /** The whole lane's span, same unit. */
+  duration: number;
+  /** What it is, painted inside the bar. */
+  label: string;
+  /** The full sentence behind the (ellipsised) label. */
+  title?: string;
+  selected?: boolean;
+  /** Ruled in danger, never only tinted: a clip the sequence has a warning about. */
+  invalid?: boolean;
+  /** The bar under the playhead. Reads as live, and is a different thing from selected. */
+  live?: boolean;
+  onClick?: () => void;
+  /** A duration, a count — the one number that belongs ON the bar. */
+  meta?: ReactNode;
+}
+
+/**
+ * A SPAN on a lane — a thing that lasts, as opposed to [[TimelineKey]] and [[TimelineChip]], which
+ * are things that happen at an instant.
+ *
+ * WHY THIS WAS MISSING. Both of this module's first consumers annotate a moment: a keyframe is a
+ * time, a marker is a time, a recorded frame is a time. Nothing in the editor had ever drawn a
+ * DURATION, so a cutscene — whose entire content is four lengths in a row — could only ever be a
+ * bulleted list of sentences, and the one number that decides what a cut feels like had nowhere to
+ * be. The geometry is the same `timelineOffset` every other mark uses, plus a width; putting it here
+ * rather than in the panel is what keeps a shot bar and a keyframe diamond agreeing about where 4.2s
+ * is.
+ *
+ * `min-width` is in the stylesheet beside the lane height it is a fraction of. A 0.2s shot inside a
+ * four-minute sequence is a bar a fraction of a pixel wide, and a control you cannot hit is not a
+ * control; below that floor adjacent bars overlap, which is the honest picture of shots too short to
+ * tell apart.
+ */
+export function TimelineClip({
+  start,
+  length,
+  duration,
+  label,
+  title,
+  selected = false,
+  invalid = false,
+  live = false,
+  onClick,
+  meta,
+  ...rest
+}: TimelineClipProps) {
+  const span = duration > 0 ? duration : 1;
+  const width = Math.max(0, Math.min(1, length / span)) * 100;
+  return (
+    <Button
+      variant="ghost"
+      className={[
+        "mtk-timeline__clip",
+        invalid && "is-invalid",
+        live && "is-live",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      data-selected={selected || undefined}
+      aria-pressed={selected}
+      title={title ?? label}
+      style={{ left: timelineOffset(start, duration), width: `${width}%` }}
+      onClick={onClick}
+      {...rest}
+    >
+      <span className="mtk-timeline__clip-label">{label}</span>
+      {meta !== undefined && <span className="mtk-timeline__clip-meta">{meta}</span>}
+    </Button>
   );
 }
 

@@ -1,10 +1,39 @@
 import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import { projectionStore } from "../store/projection";
 import { playStore } from "../store/play";
 import { walletStore } from "../store/wallet";
 import { toastStore } from "../store/toasts";
+
+// THE TWO HEAVY FILES GET THEIR OWN NUMBER, AND HERE IS THE MEASUREMENT.
+//
+// A 5000ms per-test default is a wall-clock budget, and vitest runs 77 files in parallel on
+// whatever cores are left. Measured on this tree, 2026-08-26: run ALONE this file takes 12.8s,
+// its slowest test 3634ms; run inside the full suite — on an otherwise IDLE box — it
+// timed out at 5000ms, in different tests on different runs, which is the signature of
+// contention rather than of a hang. Raising the GLOBAL timeout would hide every real hang in
+// the suite; these are the files that need the room, so this is where the number lives. 20s is
+// ~5.5x this file's own worst case and still nothing like the forever a deadlock takes.
+//
+// 2026-08-31: BOTH NUMBERS HAVE TO MOVE, AND ONLY ONE OF THEM EVER DID. The per-test budget above was
+// 20s while Testing Library's `asyncUtilTimeout` (`src/test-setup.ts`) is 15s, so a `findBy` waiting
+// on a lazily-imported workspace gave up at 15s inside a 20s test and the extra 5s bought nothing.
+// The suite has meanwhile grown 77 -> 89 files as three lanes merged, and the four failures were all
+// the same shape: a chunk Vite transforms on demand, under a parallel runner.
+//
+// AND THE OBVIOUS FIX IS THE WRONG ONE, MEASURED: raising `asyncUtilTimeout` with a file-level
+// `configure()` made the run WORSE, 4 failures -> 13 and 219s -> 685s. `configure()` is global to the
+// worker, vitest reuses a worker across files, and a 30s async budget therefore leaked into every
+// later file in that worker — so `AnimationGraphEditor`, which had been green all evening, started
+// holding a slot for 30s per failed query and starving everything behind it. A budget is scoped to
+// the CALL that needs it or it is not scoped at all: the three waits below name their own, and the
+// per-test number only has to be larger than the largest of them.
+vi.setConfig({ testTimeout: 40_000 });
+
+/** The wait for a workspace Vite has not transformed yet. Named once so the three sites that need it
+ *  cannot drift apart, and so the number is attached to its reason. */
+const LAZY_CHUNK = { timeout: 25_000 } as const;
 
 afterEach(() => {
   projectionStore.getState().reset();
@@ -29,11 +58,10 @@ describe("editor app — end-to-end wiring", () => {
     // selecting it renders the schema-driven inspector header (≥2: the hierarchy row + the inspector)
     act(() => projectionStore.getState().select("player"));
     fireEvent.click(screen.getByTestId("rail-right-properties"));
-    await waitFor(
-      () => expect(document.getElementById("inspector")?.textContent).toContain("Player"),
-      { timeout: 10_000 },
-    );
-  }, 10_000);
+    // No local timeout: the deadline for "a lazy workspace has resolved" is stated once, in
+    // `test-setup.ts`. This wait carried its own 10 s and still crossed it in a full-suite run.
+    await waitFor(() => expect(document.getElementById("inspector")?.textContent).toContain("Player"));
+  });
 
   it("Play is unmistakable ON THE STAGE: a persistent badge appears only while playing (C2)", () => {
     render(<App />);
@@ -51,9 +79,35 @@ describe("editor app — end-to-end wiring", () => {
     act(() => projectionStore.getState().reset());
     expect(screen.getByTestId("emptyState").textContent).toMatch(/start with something tangible/i);
     expect(screen.queryByTestId("onboarding")).toBeNull();
+    expect(screen.getByTestId("emptyDescribe")).toBeTruthy(); // the CTA this card's header always promised
     expect(screen.getByTestId("emptyPipe")).toBeTruthy();
     expect(screen.getByTestId("emptyAssets")).toBeTruthy();
     expect(screen.getByTestId("emptyImport")).toBeTruthy();
+  });
+
+  it("north star #2 is ON THE STAGE at first paint — no workspace to open, no chunk to wait for", () => {
+    render(<App />);
+    // No rail click, no `findBy`, no lazy boundary: the composer is in the first render. It used to take
+    // Build → scroll → open a collapsed disclosure headed "Optional assisted creation".
+    const composer = screen.getByTestId("describebar");
+    expect(composer).toBeTruthy();
+    expect(screen.getByTestId("describe")).toBeTruthy();
+    // And it is a CHILD of the one stage-footer anchor rather than a fourth surface writing its own
+    // `position: absolute; left: 50%`. That containment is the thing that makes a collision impossible;
+    // asserting the two elements' rects would assert nothing in jsdom, which lays nothing out.
+    const footer = screen.getByTestId("stage-footer");
+    expect(footer.contains(composer)).toBe(true);
+    expect(footer.contains(screen.getByTestId("onboarding"))).toBe(true);
+  });
+
+  it("Play owns the stage: the composer withdraws with the rest of the stage's authoring surfaces", () => {
+    render(<App />);
+    expect(screen.getByTestId("describebar")).toBeTruthy();
+    act(() => playStore.getState().refresh({ playing: true, paused: false }));
+    // One statement, one anchor: withdrawing the footer withdraws everything anchored to it, which is
+    // what stops a future stage surface being added and forgotten in the `!playing` guard.
+    expect(screen.queryByTestId("stage-footer")).toBeNull();
+    expect(screen.queryByTestId("describebar")).toBeNull();
   });
 
   it("a spend in one panel updates the displayed balance EVERYWHERE (single source of truth — C7)", async () => {
@@ -61,15 +115,12 @@ describe("editor app — end-to-end wiring", () => {
     const bal = await screen.findByTestId("balance");
     await waitFor(() => expect(bal.textContent).toBe("100"));
 
-    // Describe lives in the Build workspace, which is an on-demand rail destination: it is MOUNTED WHEN
-    // OPENED now, not rendered-and-hidden behind every other engine. So the test opens it, exactly as a
-    // user must. (It used to be reachable without this click because the dock rendered all six engines
-    // at once and hid five — a testid you can query from a workspace you are not in is not evidence that
-    // a user can reach it.)
-    fireEvent.click(screen.getByTestId("engine-build"));
-    fireEvent.change(await screen.findByTestId("describe"), { target: { value: "a nonexistent thingamajig" } });
+    // Describe is ON THE STAGE — no rail click, no workspace to open, no lazy chunk to wait for. It used
+    // to be a collapsed disclosure inside the Build workspace, and this test had to open Build to reach
+    // north star #2 at all; that click was the measurement of the defect and its absence here is the fix.
+    fireEvent.change(screen.getByTestId("describe"), { target: { value: "a nonexistent thingamajig" } });
     fireEvent.click(screen.getByTestId("describeBtn"));
-    fireEvent.click(await screen.findByTestId("genBtn"));
+    fireEvent.click(await screen.findByTestId("genBtn", {}, LAZY_CHUNK));
 
     // the top-bar Wallet's displayed balance dropped — it reads the SAME store the DescribeBar wrote to
     await waitFor(() => expect(bal.textContent).toBe("90"));
@@ -121,11 +172,41 @@ describe("editor app — end-to-end wiring", () => {
     expect(window.localStorage.getItem("metrocalk:shell-layout:v1:right-collapsed")).toBe("false");
   });
 
+  it("routes viewport clicks to the ground sketch, and the solid stands where it was drawn", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Draw" }));
+    await screen.findByTestId("ground-sketch", {}, LAZY_CHUNK);
+
+    // Four corners of a 12 x 8 m rectangle, placed by clicking the STAGE — the same seam a hand uses.
+    const viewport = screen.getByTestId("viewport");
+    for (let i = 0; i < 4; i++) fireEvent.click(viewport, { clientX: 100 + i * 40, clientY: 100 + i * 30 });
+    await waitFor(() => expect(screen.getByTestId("ground-sketch-dims").textContent).toContain("12.00 × 8.00 m"));
+    expect(screen.getByTestId("ground-sketch-dims").textContent).toContain("96.00 m²");
+
+    // A fifth click lands on the first corner: that FINISHES the outline rather than adding a corner.
+    fireEvent.click(viewport, { clientX: 100, clientY: 100 });
+    await waitFor(() => expect(screen.getByTestId("ground-sketch-message").textContent).toContain("Outline closed"));
+    expect(screen.getByTestId("ground-sketch-dims").textContent).toContain("4 corners");
+
+    fireEvent.click(screen.getByTestId("ground-sketch-raise"));
+    const selected = await waitFor(() => {
+      const id = projectionStore.getState().selectedId;
+      expect(id).toBeTruthy();
+      return id as string;
+    });
+    const entity = projectionStore.getState().displayed[selected];
+    expect(entity?.components.ShapeRecipe).toBeTruthy();
+    // THE POINT OF THE WHOLE FEATURE: the solid stands at the outline's own centre, not on the
+    // scatter spot a sketch pad in a panel has to invent because it has no world to point at.
+    expect(entity?.components.Transform?.x).toBe(6);
+    expect(entity?.components.Transform?.z).toBe(4);
+  });
+
   it("routes viewport clicks to Pipe Forge, then bakes a selectable asset", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Pipe" }));
     // Pipe Forge is intentionally a production code-split workspace; allow its test transform to resolve.
-    await screen.findByTestId("pipe-forge-start", {}, { timeout: 5_000 });
+    await screen.findByTestId("pipe-forge-start", {}, LAZY_CHUNK);
     fireEvent.click(screen.getByTestId("pipe-forge-start"));
     await waitFor(() => expect(screen.getByTestId("pipe-forge").getAttribute("data-active")).toBe("true"));
 
@@ -164,7 +245,7 @@ describe("editor app — end-to-end wiring", () => {
     // click. The rail's `aria-selected` is synchronous and stays so — where you are must never wait on
     // a network — and the gap between the two is what `LazyWorkspace`'s named "Loading build workspace…"
     // is for.
-    expect(await screen.findByTestId("assetbrowser")).toBeTruthy();
+    expect(await screen.findByTestId("assetbrowser", {}, LAZY_CHUNK)).toBeTruthy();
 
     // A bottom engine opens the bottom dock — same rail, different surface, because a timeline needs width.
     fireEvent.click(screen.getByTestId("engine-logic"));
@@ -217,7 +298,7 @@ describe("editor app — end-to-end wiring", () => {
   it("opens the searchable command palette from Ctrl/Cmd+K", async () => {
     render(<App />);
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
-    expect(await screen.findByTestId("command-palette")).toBeTruthy();
+    expect(await screen.findByTestId("command-palette", {}, LAZY_CHUNK)).toBeTruthy();
     expect(await screen.findByRole("combobox", { name: /search commands/i })).toBeTruthy();
   });
 

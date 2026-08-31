@@ -24,6 +24,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   buildCalmShotAssignments,
+  CONTEXT_FRAMED_KINDS,
   buildKeysForProfile,
   chooseFilmedSubjects,
   closedLoopEndValue,
@@ -37,7 +38,15 @@ import {
 import {
   exactNamedChild,
   NATIVE_IMPORT_LIFECYCLE_EVENT,
+  gestureStrandedBeforeTheApplication,
+  occludedByForeignWindow,
 } from "../lib/native-cad-drop.js";
+// The legibility threshold and its parser belong to the video gate. Imported so the window-sampled
+// measurement and the film's own measurement can never drift into two different numbers.
+import {
+  parseSignalStatsMetadata,
+  QUALITY_THRESHOLDS,
+} from "../scripts/video-quality-gate.mjs";
 
 const e2eDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const evidenceRoot = realpathSync.native(path.resolve(e2eDir, "../evidence/native-cad-drop"));
@@ -66,6 +75,7 @@ if (statSync(fixture).size < FACTORY_ACCEPTANCE.minimumFixtureBytes) {
 const oleDropScript = realpathSync.native(path.resolve(e2eDir, "scripts/ole-drop-file.ps1"));
 const captureScript = realpathSync.native(path.resolve(e2eDir, "scripts/capture-composited-window.ps1"));
 const windowGeometryScript = realpathSync.native(path.resolve(e2eDir, "scripts/window-client-rect.ps1"));
+const stageTopmostScript = realpathSync.native(path.resolve(e2eDir, "scripts/stage-topmost.ps1"));
 const videoQualityGateScript = realpathSync.native(path.resolve(e2eDir, "scripts/video-quality-gate.mjs"));
 const ffmpegDirectory = path.resolve(
   os.homedir(),
@@ -80,6 +90,41 @@ const cancelledImportTimeoutMs = 12 * 60_000;
 const completedImportTimeoutMs = 20 * 60_000;
 const artifacts = [];
 const artifactPaths = new Set();
+
+const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
+// Deliberately the video gate's `visualSampleIntervalSeconds`. The window-sampled legibility fraction is
+// only comparable to the numbers measured on the previously delivered films if it is sampled the same way.
+const FILM_SAMPLE_INTERVAL_SECONDS = QUALITY_THRESHOLDS.visualSampleIntervalSeconds;
+
+/**
+ * The detail floor a sampled still must clear to count as a picture of something.
+ *
+ * CALIBRATED AGAINST THE DELIVERED FILM, NOT CHOSEN — the same way the interdecile-luma floor of 40 was.
+ * Two anchor populations were built by LOOKING at all 59 stills of the run-10 film and sorting them by
+ * eye, then each metric was asked whether it separates them:
+ *
+ *   must FAIL (camera buried, or frame is empty ground meeting void)
+ *     interdecile 3 .. 153      edge energy 0.00 .. 1.09
+ *   must PASS (machinery, readable)
+ *     interdecile 95 .. 140     edge energy 2.21 .. 5.08
+ *
+ * On interdecile luma the two populations OVERLAP ALMOST ENTIRELY: the film's single highest reading,
+ * 153, is the lens flush against a white cabinet, and a good factory frame reads 95. No threshold on
+ * that metric separates them; the 40 floor works only on the bad frames that happen to be dark. On edge
+ * energy the populations are DISJOINT with a 2x gap, and any floor in [1.2, 2.1] separates them.
+ *
+ * 1.2 is the bottom of that interval, chosen so the term is as forgiving as the evidence allows — it is
+ * an additional requirement on top of the luma floor, and an additional requirement should be the
+ * weakest one that does its job. Every frame it newly rejects was rendered and inspected: the lens
+ * against a yellow plate, inside a white cabinet, a flat pale panel, an extreme close on a white disc,
+ * a grey wall, a flat slab, and both ends of the film where the line is a thin strip on empty floor.
+ * No good frame was rejected.
+ *
+ * PIPELINE-BOUND. `edgedetect` output depends on its low/high parameters and on the crop resolution, so
+ * this number means nothing away from `edgedetect=low=0.1:high=0.3` over the film rectangle. Both are
+ * fixed in `measureSampledLegibility` and must move together with this constant.
+ */
+const MINIMUM_FRAME_EDGE_ENERGY = 1.2;
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const sha256 = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
@@ -113,7 +158,17 @@ function writeJson(name, value) {
 }
 
 function captureComposited(label, preserveWindow = false) {
-  const output = exactNamedChild(runDir, `${label}.png`);
+  return captureCompositedTo(exactNamedChild(runDir, `${label}.png`), label, preserveWindow, true);
+}
+
+/**
+ * The same PrintWindow capture, to a caller-chosen path.
+ *
+ * Split out for the film sampler, which writes hundreds of frames into their own directory rather than
+ * one labelled still into the run root — and which must NOT record each of them as a top-level run
+ * artifact, or the manifest becomes a list of frame files with the evidence buried inside it.
+ */
+function captureCompositedTo(output, label, preserveWindow = false, record = false) {
   const args = [
     "-NoLogo",
     "-NoProfile",
@@ -143,7 +198,11 @@ function captureComposited(label, preserveWindow = false) {
     );
     throw error;
   }
-  recordArtifact(output);
+  // ...which the film sampler must NOT do: it writes hundreds of frames, and recording each one turns
+  // the manifest into a list of frame files with the evidence buried inside it. The doc comment above
+  // said exactly that and the code did it anyway — 59 of run 10's 133 recorded artifacts are film
+  // frames. A comment is not a mechanism.
+  if (record) recordArtifact(output);
   return output;
 }
 
@@ -210,6 +269,34 @@ function readWindowClientRect() {
   return JSON.parse(stdout.trim());
 }
 
+/**
+ * Put the editor in (or take it out of) the always-on-top Z-order band.
+ *
+ * The occlusion invariant below is a guard against a STATE; this removes the ordinary way of entering
+ * it. Three consecutive production runs got as far as the camera handoff and then threw at that guard
+ * because an unrelated window had come to the foreground during the fifteen minutes it takes to get
+ * there. A topmost window is not painted over by an ordinary one whether or not it has focus.
+ *
+ * It deliberately does NOT weaken the guard: the check still runs, still samples, and still refuses,
+ * because a full-screen or itself-topmost application would still cover the stage.
+ */
+function setStageTopmost(topmost) {
+  const stdout = execFileSync("powershell.exe", [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    stageTopmostScript,
+    "-Topmost",
+    topmost ? "on" : "off",
+    "-ProcName",
+    processName,
+  ], { encoding: "utf8", timeout: 30_000, windowsHide: true });
+  return JSON.parse(stdout.trim());
+}
+
 async function measureViewportCapture() {
   const client = readWindowClientRect();
   const dom = await browser.execute(() => {
@@ -238,11 +325,233 @@ async function measureViewportCapture() {
     `The stage capture rectangle escaped the measured client: ${JSON.stringify({ x, y, width, height, client, dom })}`);
   // gdigrab records the DESKTOP at this rectangle, not the window. If anything covers the editor, the
   // film is of THAT application - and a luminance/motion quality gate cannot tell the difference, so the
-  // run would go green over a recording of the wrong program. Refuse, and name what is in the way.
-  invariant(client.occluded !== true,
-    `The editor is occluded by "${client.occludedBy}", so a desktop recording would film that window `
-      + `instead of the cinematic. Close or windowed-mode it before recording: ${JSON.stringify(client)}`);
-  return { x, y, width, height, client, dom, scaleX, scaleY };
+  // run would go green over a recording of the wrong program.
+  //
+  // Reported rather than asserted. Refusing here is right for the RECORDING and wrong for the RUN: it
+  // ended four separate production runs, each after fifteen minutes of real work, over the state of a
+  // window belonging to somebody else. What the direction actually has to prove is measured from the
+  // window itself (sampled inside the playback loop), which PrintWindow reads whether or not the desktop
+  // is covered. So the desktop film is best-effort and the caller decides; the guard is unchanged in
+  // what it detects and still blocks a recording of the wrong program.
+  // THE SAME RECTANGLE, EXPRESSED FOR THE OTHER CAPTURE.
+  //
+  // `x,y,width,height` frame the film on the DESKTOP. A PrintWindow still is the whole WINDOW, whose
+  // origin is the window rect, so measuring one as if it were the other silently includes the editor's
+  // white docks, header and status bar. Those pin YHIGH near 233 regardless of what the 3D shows:
+  // measured on a real still, a frame whose viewport was filled with one flat dark colour -- the camera
+  // inside a machine, the failure this entire lane exists to detect -- reads an interdecile range of
+  // 166 uncropped and 0 cropped. The uncropped measure would have called a wholly buried film perfect.
+  const sampleCrop = {
+    x: x - client.windowX,
+    y: y - client.windowY,
+    width,
+    height,
+    // Carried so the measurement can verify a sampled still really is the window these offsets are
+    // expressed against, instead of cropping the right picture at the wrong place.
+    windowWidth: client.windowWidth,
+    windowHeight: client.windowHeight,
+  };
+  invariant(
+    Number.isInteger(sampleCrop.x) && Number.isInteger(sampleCrop.y)
+      && sampleCrop.x >= 0 && sampleCrop.y >= 0
+      && sampleCrop.x + width <= client.windowWidth
+      && sampleCrop.y + height <= client.windowHeight,
+    `The film rectangle does not lie inside the window a PrintWindow still captures, so the two `
+      + `measurements cannot be put on one scale: ${JSON.stringify({ sampleCrop, client, x, y, width, height })}`);
+  return { x, y, width, height, sampleCrop, client, dom, scaleX, scaleY, desktopClear: client.occluded !== true };
+}
+
+/**
+ * WHY THE VERDICT IS SAMPLED FROM THE WINDOW AND NOT FROM THE FILM
+ * ---------------------------------------------------------------
+ * The number this whole pass is about is "how much of the delivered direction is a shot of machinery
+ * rather than the inside of a machine". It was only ever obtainable from the desktop recording, and a
+ * desktop recording needs a desktop nobody else is using. Four production runs died on that: a YouTube
+ * window, a browser tab, twice more. Each had already imported 15,711 parts, authored 24 mechanisms and
+ * directed 30 shots before it asked the desktop for permission.
+ *
+ * `PrintWindow` with `PW_RENDERFULLCONTENT` reads the window's OWN presentation - the composited
+ * WebView2 and the wgpu surface beneath it - and works while the window is occluded. It is how every
+ * still in every one of those runs landed. So the frames are sampled there, inside the same playback
+ * loop that waits for the camera handoff, and the desktop film is a second deliverable rather than the
+ * only source of the verdict.
+ */
+
+/**
+ * The interdecile luma range of every sampled still, in one FFmpeg pass over the sequence.
+ *
+ * `YHIGH - YLOW` is what separates a picture of machinery from a picture of one surface: a wall two
+ * centimetres from the lens is well exposed, perfectly stable, and contains nothing. The threshold and
+ * the required fraction are the video gate's, imported rather than copied, so the two measurements
+ * cannot drift apart into two different definitions of the same word.
+ */
+function measureSampledLegibility(directory, frames, crop, filmSeconds) {
+  // The crop offsets are expressed against the WINDOW rect, so they only mean what they say if a
+  // sampled still really is the window. Checked rather than assumed: if PrintWindow ever returned the
+  // client area instead, every crop would silently slice the wrong region of the right picture, and the
+  // resulting fraction would look entirely reasonable. Uncropped, this measurement's minimum over a
+  // whole run was 95 against a threshold of 40 -- a floor of 2.4x the bar, i.e. a check that could not
+  // fail. That is the failure this guard exists to make loud.
+  invariant(frames.length > 0, "No stills were sampled, so there is nothing to measure.");
+  const probed = spawnSync(ffprobe, [
+    "-v", "error", "-select_streams", "v:0",
+    "-show_entries", "stream=width,height", "-of", "csv=p=0",
+    frames[0].file,
+  ], { encoding: "utf8", timeout: 60_000, windowsHide: true });
+  invariant(probed.status === 0, `Could not measure a sampled still: ${probed.stderr}`);
+  const [sampleWidth, sampleHeight] = `${probed.stdout}`.trim().split(",").map(Number);
+  invariant(
+    sampleWidth === crop.windowWidth && sampleHeight === crop.windowHeight,
+    `A sampled still is ${sampleWidth}x${sampleHeight} but the crop was computed against a `
+      + `${crop.windowWidth}x${crop.windowHeight} window, so it would cut the wrong rectangle.`);
+  const completed = spawnSync(ffmpeg, [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "image2",
+    "-i",
+    path.join(directory, "frame-%04d.png"),
+    "-vf",
+    // Crop FIRST, to exactly the rectangle the delivered film occupies. Without this the editor's own
+    // chrome is measured as though it were the picture, and the resulting fraction is not on the same
+    // scale as the 74.4% and 75.2% measured on the two previously delivered films.
+    `crop=${crop.width}:${crop.height}:${crop.x}:${crop.y},`
+      + "format=yuv444p,signalstats,metadata=mode=print:file=-",
+    "-f",
+    "null",
+    NULL_DEVICE,
+  ], { encoding: "utf8", timeout: 15 * 60_000, maxBuffer: 256 * 1024 * 1024, windowsHide: true });
+  if (completed.error) throw completed.error;
+  invariant(completed.status === 0,
+    `Measuring the sampled stills failed (exit ${completed.status}): ${completed.stderr}`);
+  // ── DETAIL, because tonal range is necessary and not sufficient ──────────────────────────────────
+  //
+  // `YHIGH - YLOW` catches a frame filled by ONE tone. It does not catch a frame filled by TWO. The
+  // camera flush against a large PALE surface, with the dark background showing at the frame edge, is
+  // maximal interdecile range and no picture at all — measured on the delivered film, the single
+  // HIGHEST reading of all 59 stills (153) is the lens against a white cabinet, and a frame that is 85%
+  // one flat pale panel reads 134, inside the top decile. A genuine factory frame full of machinery
+  // reads 132. The metric that was introduced to catch "a wall is bright and still" cannot catch "a wall
+  // is bright AND dark".
+  //
+  // Mean edge energy is the missing half: a picture of machinery is full of boundaries, and a surface is
+  // not. One extra pass over stills already on disk, no new dependency.
+  const edges = spawnSync(ffmpeg, [
+    "-nostdin", "-hide_banner", "-loglevel", "error",
+    "-f", "image2",
+    "-i", path.join(directory, "frame-%04d.png"),
+    "-vf", `crop=${crop.width}:${crop.height}:${crop.x}:${crop.y},`
+      + "format=gray,edgedetect=low=0.1:high=0.3,signalstats,metadata=mode=print:file=-",
+    "-f", "null", NULL_DEVICE,
+  ], { encoding: "utf8", timeout: 15 * 60_000, maxBuffer: 256 * 1024 * 1024, windowsHide: true });
+  if (edges.error) throw edges.error;
+  invariant(edges.status === 0, `Measuring detail in the sampled stills failed: ${edges.stderr}`);
+  const detail = parseSignalStatsMetadata(edges.stdout)
+    .map((frame) => frame.metrics.YAVG)
+    .filter(Number.isFinite);
+
+  // The gate's own parser, imported rather than re-written: two parsers for one metric is two
+  // definitions of the same word waiting to disagree.
+  const readings = parseSignalStatsMetadata(completed.stdout)
+    .map((frame) => (Number.isFinite(frame.metrics.YHIGH) && Number.isFinite(frame.metrics.YLOW)
+      ? frame.metrics.YHIGH - frame.metrics.YLOW
+      : null))
+    .filter((value) => value !== null);
+  invariant(readings.length === frames.length,
+    `Read ${readings.length} contrast readings for ${frames.length} sampled stills; the series must be `
+      + "complete or the fraction is computed over an unknown denominator.");
+  invariant(detail.length === frames.length,
+    `Read ${detail.length} detail readings for ${frames.length} sampled stills.`);
+  // A frame counts as a picture of something only if it has BOTH tonal range and structure. Strictly
+  // stricter than the previous rule, which is the honest direction for a check that was shown to pass
+  // frames it should not.
+  const isLegible = (index) => readings[index] >= QUALITY_THRESHOLDS.minimumFrameInterdecileLuma
+    && detail[index] >= MINIMUM_FRAME_EDGE_ENERGY;
+  const legible = readings.filter((_, index) => isLegible(index)).length;
+  const obscured = frames
+    .map((frame, index) => ({ ...frame, interdecileLuma: readings[index], edgeEnergy: detail[index], index }))
+    .filter((frame) => !isLegible(frame.index));
+  const sorted = [...readings].sort((left, right) => left - right);
+  const at = (fraction) => sorted[Math.min(sorted.length - 1, Math.floor(fraction * sorted.length))];
+
+  // ── THE SAME QUESTION, ASKED OF DURATION RATHER THAN OF FRAMES ────────────────────────────────────
+  //
+  // The criterion is "what fraction of the FILM is a picture of something". Counting frames answers that
+  // only while the samples are evenly spaced, and they are not: each capture costs a PowerShell launch,
+  // and that cost rises under exactly the machine load that slows the engine down. Measured on run 11,
+  // whose film overlapped an unrelated test suite for its first minute: the opening 60 s was sampled
+  // every 6.29 s against a steady state of 3.3 s, and it was the film's WORST stretch (50% obscured
+  // against 14% across the rest). The sampler thinned out precisely where the picture was worst.
+  //
+  // So each sample also stands for the interval until the next one, and the same readings are summed
+  // that way. On run 11 the two disagree by 1.7 points and a third estimator — imputing the samples the
+  // thin window did not get — puts it 1.4 points the other side. That spread is the same size as the
+  // margin over the floor, which is the whole reason both are reported and the WEAKER governs: a number
+  // whose value depends on which defensible estimator you picked has not cleared anything.
+  let legibleSeconds = 0;
+  let measuredSeconds = 0;
+  const gaps = [];
+  frames.forEach((frame, index) => {
+    const until = index + 1 < frames.length ? frames[index + 1].atSeconds : filmSeconds;
+    const span = Math.max(0, until - frame.atSeconds);
+    gaps.push(span);
+    measuredSeconds += span;
+    if (isLegible(index)) legibleSeconds += span;
+  });
+  const legibleTimeFraction = measuredSeconds > 0
+    ? Number((legibleSeconds / measuredSeconds).toFixed(6))
+    : null;
+  const meanGap = gaps.length ? gaps.reduce((total, gap) => total + gap, 0) / gaps.length : 0;
+  const worstGap = gaps.length ? Math.max(...gaps) : 0;
+  return {
+    metric: "signalstats YHIGH - YLOW (interdecile luma range) per sampled still",
+    source: "PrintWindow PW_RENDERFULLCONTENT window capture (occlusion-independent)",
+    // Recorded because the number means nothing without it: uncropped, this measure cannot report an
+    // obscured frame as obscured.
+    croppedTo: crop,
+    sampledFrames: readings.length,
+    legibleFrames: legible,
+    legibleFrameFraction: Number((legible / Math.max(1, readings.length)).toFixed(6)),
+    minimumInterdecileLuma: sorted[0] ?? null,
+    p50: at(0.5) ?? null,
+    p90: at(0.9) ?? null,
+    threshold: QUALITY_THRESHOLDS.minimumFrameInterdecileLuma,
+    edgeThreshold: MINIMUM_FRAME_EDGE_ENERGY,
+    metricDetail: "signalstats YAVG after edgedetect (mean edge energy) per sampled still",
+    requiredFraction: QUALITY_THRESHOLDS.minimumLegibleFrameFraction,
+    // Duration-weighted, and the cadence statistics that say whether the two can be trusted to agree.
+    legibleTimeFraction,
+    legibleSeconds: Number(legibleSeconds.toFixed(1)),
+    measuredSeconds: Number(measuredSeconds.toFixed(1)),
+    meanSampleGapSeconds: Number(meanGap.toFixed(2)),
+    worstSampleGapSeconds: Number(worstGap.toFixed(2)),
+    // The verdict: the weaker of the two defensible readings. Reported as its own field so nobody has
+    // to recompute which one governed.
+    governingFraction: legibleTimeFraction === null
+      ? Number((legible / Math.max(1, readings.length)).toFixed(6))
+      : Math.min(legibleTimeFraction, Number((legible / Math.max(1, readings.length)).toFixed(6))),
+    obscuredFrames: obscured.map((frame) => ({
+      atSeconds: frame.atSeconds,
+      interdecileLuma: frame.interdecileLuma,
+      edgeEnergy: frame.edgeEnergy,
+      shotIndex: frame.shotIndex ?? null,
+      subjectId: frame.subjectId ?? null,
+      file: path.basename(frame.file),
+    })),
+    // The WHOLE series, not only the failures. A run that reports just its obscured frames cannot answer
+    // "was the shot before it any good either", which is the first question a low fraction raises — and
+    // answering it meant re-measuring the stills by hand.
+    samples: frames.map((frame, index) => ({
+      atSeconds: frame.atSeconds,
+      interdecileLuma: readings[index],
+      edgeEnergy: detail[index],
+      shotIndex: frame.shotIndex ?? null,
+      subjectId: frame.subjectId ?? null,
+      file: path.basename(frame.file),
+    })),
+  };
 }
 
 function encoderArguments(encoder) {
@@ -593,26 +902,16 @@ function persistOleLog(handle) {
 }
 
 /**
- * Did the helper refuse the gesture because a window that is NOT the editor covered the drop point?
- *
- * The distinction is the whole point. A foreign window taking the foreground mid-drag (a console another
- * tool spawned, a notification toast) is an accident of a shared desktop and is worth retrying. The
- * editor covering its OWN drop target is a product defect — a modal that swallows drops — and retrying
- * that would turn a real bug into a flaky test that eventually passes.
- */
-function occludedByForeignWindow(log) {
-  const gesture = /DROP_GESTURE: target-hit-test-failed: under=\d+ root=(\d+)/.exec(log);
-  const target = /DROP_TARGET: pid=\d+ hwnd=(\d+)/.exec(log);
-  return Boolean(gesture && target && gesture[1] !== target[1]);
-}
-
-/**
  * Perform the real OS drag, retrying only when a foreign window stole the drop point.
  *
  * Each attempt is a complete, genuine Win32 CF_HDROP gesture and keeps its own evidence file, so a run
  * that needed two tries says so rather than hiding it.
  */
-async function startOleDropSurvivingOcclusion(attempt, dropHandles, maxAttempts = 3) {
+// Four rather than three, because the costs are wildly asymmetric: one more gesture costs about forty
+// seconds, and the run it saves costs fifteen minutes of import, authoring and direction. The bound
+// still exists — a genuinely broken drop target must not be retried until it accidentally works — and
+// every attempt keeps its own log, so a run that needed four says so in its evidence.
+async function startOleDropSurvivingOcclusion(attempt, dropHandles, maxAttempts = 4) {
   for (let index = 0; ; index += 1) {
     const handle = startOleDrop(index === 0 ? attempt : `${attempt}-again${index}`);
     dropHandles.push(handle);
@@ -625,11 +924,30 @@ async function startOleDropSurvivingOcclusion(attempt, dropHandles, maxAttempts 
       }
       persistOleLog(handle);
       const log = `${handle.stdout}\n${handle.stderr}`;
-      if (index + 1 >= maxAttempts || !occludedByForeignWindow(log)) throw error;
-      // Let whatever took the foreground finish, then put the editor back in front and try again.
-      await browser.pause(2_000);
-      await browser.maximizeWindow();
-      await browser.pause(800);
+      let stolen = false;
+      try {
+        stolen = occludedByForeignWindow(log);
+      } catch (predicateError) {
+        // The predicate refuses to guess when the helper's output format has drifted. Report BOTH: the
+        // attempt's own failure is what happened, and the unreadable log is why we cannot say whether
+        // retrying is warranted. Answering "not occluded" here is the exact substitution that made the
+        // original defect invisible for six runs.
+        error.message = `${error.message}\n\n${predicateError.message}`;
+        throw error;
+      }
+      const stranded = gestureStrandedBeforeTheApplication(log);
+      if (index + 1 >= maxAttempts || !(stolen || stranded)) throw error;
+      // Let whatever took the foreground finish, then try the SAME gesture again.
+      //
+      // This used to call `browser.maximizeWindow()` here, to put the editor back in front. The helper
+      // already raises, restores and foregrounds its target itself, so that was redundant for its stated
+      // purpose — and it was not free: it resized the window between attempts, so attempt two was a
+      // different gesture at a different geometry rather than a repeat of attempt one. The only gesture
+      // in this harness's recorded history that stranded inside ole32's modal loop was the only one ever
+      // run at the resized geometry. That is one observation and not a proof, but a retry that changes
+      // the thing it is retrying cannot tell a transient from a state it created, which is reason enough
+      // on its own. The pause stays: whatever took the foreground needs time to finish.
+      await browser.pause(2_800);
     }
   }
 }
@@ -996,6 +1314,7 @@ describe("production factory cinematic direction", () => {
     let lifecycleRecording = { events: [], listenerError: null };
     let playing = false;
     let cleanCaptureStage = false;
+    let stagePinned = false;
     let recordingHandle = null;
     let inFlightBatchId = null;
     const cadLogOffset = existsSync(cadLog) ? statSync(cadLog).size : 0;
@@ -1157,10 +1476,31 @@ describe("production factory cinematic direction", () => {
       const environment = await invoke("reset_environment");
       invariant(profile === "cinematic" && workingSpace === "acesCg" && closeEnough(exposure, 0.45),
         `The cinematic presentation did not apply: ${JSON.stringify({ profile, workingSpace, exposure })}`);
+
+      // The room the plant is filmed in. Every film before this one was shot in the studio set - a
+      // single ground quad meeting a dark void - and that is why its wide cards measured mostly-empty
+      // frames: a 30 cm motor at extreme_wide is a speck in an empty field, and the whole 262 m line
+      // broadside is a ribbon in one. The hall is what a wide card can establish.
+      //
+      // Asserted rather than assumed, twice over, because the two questions are different: the command
+      // reports the set it APPLIED, and presentation_set_state reports the room it actually SIZED. A
+      // scene whose bounds are not yet published answers "factoryHall" to the first and "built: false"
+      // to the second, and filming that would be the studio again under a name that says otherwise.
+      const presentationSet = await invoke("set_presentation_set", { set: "factoryHall" });
+      invariant(presentationSet === "factoryHall",
+        `The presentation set did not apply: ${JSON.stringify(presentationSet)}`);
+
       await invoke("view_preset", { preset: "persp" });
       await invoke("frame_all");
       await browser.pause(1_000);
-      manifest.presentation = { profile, workingSpace, exposure, environment };
+
+      const stage = await invoke("presentation_set_state");
+      invariant(stage?.set === "factoryHall" && stage?.built === true,
+        `The factory hall was requested but not built: ${JSON.stringify(stage)}`);
+      invariant(Number(stage?.hall?.lengthMetres) > 0 && Number(stage?.hall?.clearHeightMetres) > 0,
+        `The factory hall reported no dimensions: ${JSON.stringify(stage)}`);
+
+      manifest.presentation = { profile, workingSpace, exposure, environment, presentationSet, stage };
       captureComposited("06-imported-factory-overview");
 
       // The drop overlay's "Import report" button is the operator's route to this panel, and stays the
@@ -1357,13 +1697,28 @@ describe("production factory cinematic direction", () => {
       invariant(typeof assemblyId === "string" && assemblyId.length > 0,
         `The import did not report the assembly wrapper to establish on: ${JSON.stringify(manifest.retryImport)}`);
       const cinematics = await authorCinematics(subjects, assemblyId);
-      // The opening and closing shots must genuinely frame the whole factory rather than a part of it,
-      // otherwise the film never shows the scale of what was imported.
-      const assemblyFramedShots = cinematics.cutscenes
-        .flatMap(({ kinds }) => kinds)
-        .filter(({ subject }) => subject === assemblyId);
-      invariant(assemblyFramedShots.length === 2,
-        `Expected an establishing and a closing shot framed on the assembly, got ${JSON.stringify(assemblyFramedShots)}`);
+      // WIDE FRAMINGS BELONG TO THE PLANT; every subject still gets a shot of its own.
+      //
+      // Asserted as the rule rather than as a count. The previous form required exactly two
+      // assembly-framed shots, which was a true statement about the direction as it happened to be
+      // written rather than a statement about what makes the film legible — and it would have had to be
+      // edited to whatever number came out, which is not an assertion at all.
+      const allKinds = cinematics.cutscenes.flatMap(({ kinds }) => kinds);
+      const assemblyFramedShots = allKinds.filter(({ subject }) => subject === assemblyId);
+      const misframedWideShots = allKinds.filter(
+        ({ kind, subject }) => CONTEXT_FRAMED_KINDS.includes(kind) && subject !== assemblyId);
+      invariant(misframedWideShots.length === 0,
+        `A wide card framed on a single part films an empty floor with a speck on it: `
+          + `${JSON.stringify(misframedWideShots)}`);
+      invariant(assemblyFramedShots.length >= 2,
+        `The film must open and close on the whole factory or it never shows the scale of what was `
+          + `imported: ${JSON.stringify(assemblyFramedShots)}`);
+      const subjectsWithoutTheirOwnShot = cinematics.cutscenes
+        .filter(({ id, kinds }) => !kinds.some(({ subject }) => subject === id))
+        .map(({ id, name }) => ({ id, name }));
+      invariant(subjectsWithoutTheirOwnShot.length === 0,
+        `Framing the wide cards on the assembly must not cost a subject its own shot: `
+          + `${JSON.stringify(subjectsWithoutTheirOwnShot)}`);
       manifest.cinematics = {
         subjectCount: cinematics.cutscenes.length,
         distinctAnimatedSubjectIds: new Set(cinematics.cutscenes.map(({ id }) => id)).size,
@@ -1457,10 +1812,36 @@ describe("production factory cinematic direction", () => {
       // the complete 208.75-second direction with enough head/tail margin to exceed three minutes.
       await installCleanCaptureStage();
       cleanCaptureStage = true;
+      // Never fatal. Without the pin the run is exactly where it was before the pin existed -- guarded
+      // by the occlusion check below, which is unchanged and still refuses. Losing a fifteen-minute run
+      // to a failure in an optimisation would be the wrong trade, so it is recorded and stepped past.
+      try {
+        manifest.preview.stageTopmost = setStageTopmost(true);
+        stagePinned = true;
+      } catch (error) {
+        manifest.preview.stageTopmost = { pinned: false, error: String(error) };
+      }
       const geometry = await measureViewportCapture();
+      // THE DESKTOP FILM IS BEST-EFFORT; THE VERDICT IS NOT.
+      //
+      // gdigrab records the desktop, so it can only be attempted when the editor is the window on
+      // screen. That condition depends on what else is running on somebody's computer, and making the
+      // run's verdict depend on it cost four production runs. What the direction has to prove is
+      // measured from the window instead (the PrintWindow sample series below), which is why this
+      // whole branch may now be skipped without the run losing its meaning.
+      const desktopClear = geometry.desktopClear;
+      if (!desktopClear) {
+        manifest.preview.desktopFilm = {
+          attempted: false,
+          reason: `The editor was covered by "${geometry.client.occludedBy}" when the recorder would have `
+            + "started. gdigrab records the desktop, so that recording would have been of the covering "
+            + "window. The direction's legibility is measured from the window itself instead.",
+          occludedBy: geometry.client.occludedBy,
+        };
+      }
       const encoderPreflights = [];
       let encoder = null;
-      for (const candidate of ["h264_nvenc", "libx264"]) {
+      for (const candidate of desktopClear ? ["h264_nvenc", "libx264"] : []) {
         const slug = candidate.replace(/[^a-z0-9]+/gi, "-").toLocaleLowerCase();
         const output = exactNamedChild(runDir, `capture-preflight-${slug}.mp4`);
         const handle = startStageRecording(output, geometry, 2, candidate);
@@ -1475,7 +1856,8 @@ describe("production factory cinematic direction", () => {
           break;
         }
       }
-      invariant(encoder, `Neither hardware nor software H.264 capture passed preflight: ${JSON.stringify(encoderPreflights)}`);
+      invariant(encoder || !desktopClear,
+        `Neither hardware nor software H.264 capture passed preflight: ${JSON.stringify(encoderPreflights)}`);
 
       // SIZE THE RECORDING BY THE CLOCK THE FILM ACTUALLY RUNS ON.
       //
@@ -1524,11 +1906,13 @@ describe("production factory cinematic direction", () => {
       playing = true;
       await browser.waitUntil(async () => (await invoke("camera_probe")).cinematic === true,
         { timeout: 60_000, interval: 150, timeoutMsg: "The recorded direction never gave the cinematic camera authority." });
-      recordingHandle = startStageRecording(videoFile, geometry, captureSeconds, encoder);
-      await delay(900);
-      invariant(!recordingHandle.result,
-        `The ${encoder} recorder exited as soon as it was started: ${JSON.stringify(recordingHandle.result)}
+      if (encoder) {
+        recordingHandle = startStageRecording(videoFile, geometry, captureSeconds, encoder);
+        await delay(900);
+        invariant(!recordingHandle.result,
+          `The ${encoder} recorder exited as soon as it was started: ${JSON.stringify(recordingHandle.result)}
 ${recordingHandle.stderr}`);
+      }
       // CUT WHEN THE FILM ENDS, not when the clock runs out.
       //
       // `captureSeconds` is a ceiling derived from a measured play-clock rate, and a ceiling is the wrong
@@ -1536,13 +1920,88 @@ ${recordingHandle.stderr}`);
       // editor after the last shot. The cutscene runtime already announces the end by handing the camera
       // back (`camera_probe().cinematic === false`), which is the real end of the film -- so watch for
       // that and stop there, leaving the ceiling as nothing but a guard against a film that never ends.
+      //
+      // WATCH THE DESKTOP FOR THE WHOLE FILM, not only at the moment the recorder starts.
+      //
+      // `measureViewportCapture` refuses to roll while something covers the editor, and that read is a
+      // single instant. The film takes minutes. A window arriving in minute four produces a recording
+      // that is partly of that window, and every check downstream -- the encoder's, the luminance and
+      // motion gate's, the interdecile-contrast gate's -- is satisfied by a picture of an ordinary
+      // application. So the guard as written asserted "the desktop was clear when we began", filed
+      // under "the film is of the cinematic".
+      //
+      // The loop is already here and already idle between probes, so the sample is nearly free. It is
+      // deliberately NOT thrown from in here: the film is stopped gracefully first, so the evidence
+      // exists on disk and the failure can name which second of it is a picture of what.
+      //
+      // AND SAMPLE THE WINDOW ITSELF, which is where the verdict comes from.
+      //
+      // One playback, two captures. `PrintWindow` returns the app's own composited presentation and does
+      // not care what is on the desktop, so this series survives the covered-editor case that ends the
+      // recording above. `-PreserveWindow` is not optional: without it the capture script raises and
+      // restores the window, which mid-film would fight tauri-driver for the foreground and put the
+      // window movement into the recording it is meant to be measuring.
       let handedBack = false;
-      const filmDeadline = Date.now() + (captureSeconds + 60) * 1_000;
-      while (!recordingHandle.result && Date.now() < filmDeadline) {
-        if ((await invoke("camera_probe")).cinematic === false) { handedBack = true; break; }
-        await delay(1_000);
+      const occlusionSamples = [];
+      const filmSampleDirectory = exactNamedChild(runDir, "film-samples");
+      if (!existsSync(filmSampleDirectory)) mkdirSync(filmSampleDirectory);
+      const filmFrames = [];
+      const filmStartedAt = Date.now();
+      let nextOcclusionSampleAt = filmStartedAt;
+      let nextFilmSampleAt = filmStartedAt;
+      const filmDeadline = filmStartedAt + (captureSeconds + 60) * 1_000;
+      while ((!recordingHandle || !recordingHandle.result) && Date.now() < filmDeadline) {
+        let sampled = null;
+        if (Date.now() >= nextFilmSampleAt) {
+          // The video gate's own cadence, so this fraction is on the same scale as the 74.4% and 75.2%
+          // measured on the two previously delivered films.
+          nextFilmSampleAt = Date.now() + FILM_SAMPLE_INTERVAL_SECONDS * 1_000;
+          const atSeconds = Number(((Date.now() - filmStartedAt) / 1_000).toFixed(2));
+          const file = path.join(filmSampleDirectory, `frame-${String(filmFrames.length).padStart(4, "0")}.png`);
+          captureCompositedTo(file, `film-sample-${filmFrames.length}`, true);
+          sampled = { index: filmFrames.length, atSeconds, file };
+          filmFrames.push(sampled);
+        }
+        if (recordingHandle && Date.now() >= nextOcclusionSampleAt) {
+          // Every five seconds: often enough that no shot of the 30 goes unwatched (the shortest is
+          // 2.5 s authored, several seconds filmed), rare enough that spawning PowerShell does not
+          // compete with the renderer for the frames being recorded.
+          nextOcclusionSampleAt = Date.now() + 5_000;
+          try {
+            const seen = readWindowClientRect();
+            occlusionSamples.push({
+              atSeconds: Number(((Date.now() - filmStartedAt) / 1_000).toFixed(1)),
+              occluded: seen.occluded === true,
+              occludedBy: seen.occludedBy ?? "",
+            });
+          } catch (error) {
+            // A failed read is not evidence that the stage was clear, and must not be recorded as if
+            // it were. Keep it as its own outcome so the assertion below can refuse an unwatched film.
+            occlusionSamples.push({
+              atSeconds: Number(((Date.now() - filmStartedAt) / 1_000).toFixed(1)),
+              occluded: null,
+              occludedBy: `unreadable: ${String(error)}`,
+            });
+          }
+        }
+        const probe = await invoke("camera_probe");
+        // WHICH SHOT THIS FRAME IS OF, asked rather than reconstructed.
+        //
+        // Attribution used to be inferred by stretching the authored shot list by the run's measured
+        // play-clock slowdown, which is an estimate resting on another estimate: a frame near a shot
+        // boundary could land either side of it, and the film's rate is not even constant when the
+        // machine is doing something else. The runtime already knows the answer and is already being
+        // asked once per loop for the handoff, so the frame carries it. Read immediately AFTER the
+        // capture, so a shot change during the capture is attributed to the shot that arrived, not the
+        // one that left.
+        if (sampled) {
+          sampled.shotIndex = probe.shotIndex ?? null;
+          sampled.subjectId = probe.subjectId ?? null;
+        }
+        if (probe.cinematic === false) { handedBack = true; break; }
+        await delay(250);
       }
-      if (handedBack && !recordingHandle.result) {
+      if (handedBack && recordingHandle && !recordingHandle.result) {
         // A tail beat so the final frame of the last shot is genuinely in the file, then a GRACEFUL stop.
         // `q` asks ffmpeg to finish writing the container; killing it instead leaves an mp4 with no moov
         // atom, which no decoder will open. Kill only if it ignores the request.
@@ -1556,11 +2015,32 @@ ${recordingHandle.stderr}`);
           recordingHandle.result = graceful;
         }
       }
-      if (!recordingHandle.result) {
+      if (recordingHandle && !recordingHandle.result) {
         recordingHandle.result = await waitForRecording(recordingHandle, 120_000);
       }
+      const filmDurationSeconds = (Date.now() - filmStartedAt) / 1_000;
       manifest.preview.filmEnded = { handedBack, captureCeilingSeconds: captureSeconds };
-      const recordingLog = persistRecordingLog("factory-cinematic-recording.log", recordingHandle);
+
+      // ── THE VERDICT: how much of the direction is a picture of something ──────────────────────────
+      //
+      // Measured from the window, so it exists whether or not the desktop recording could be made. This
+      // is the number DoD #17 and #26 have been waiting on for two passes.
+      //
+      // The floor on the sample count is not ceremony: a loop that exited early would otherwise report a
+      // confident fraction of a handful of frames, and a fraction is only as good as its denominator.
+      invariant(filmFrames.length >= Math.floor(filmDurationSeconds / (FILM_SAMPLE_INTERVAL_SECONDS * 3)),
+        `The direction was not sampled across its length: ${filmFrames.length} stills over `
+          + `${filmDurationSeconds.toFixed(1)}s at a ${FILM_SAMPLE_INTERVAL_SECONDS}s cadence.`);
+      const legibility = measureSampledLegibility(filmSampleDirectory, filmFrames, geometry.sampleCrop, filmDurationSeconds);
+      legibility.handedBack = handedBack;
+      legibility.filmDurationSeconds = Number(filmDurationSeconds.toFixed(1));
+      legibility.sampleIntervalSeconds = FILM_SAMPLE_INTERVAL_SECONDS;
+      manifest.legibility = legibility;
+      writeJson("directed-film-legibility.json", legibility);
+
+      let recordingLog = null;
+      if (recordingHandle) {
+        recordingLog = persistRecordingLog("factory-cinematic-recording.log", recordingHandle);
       // A recorder WE stopped at the handoff exits non-zero by construction; one that stopped for
       // any other reason still has to have succeeded.
       invariant(!recordingHandle.result.error && !recordingHandle.result.timeout
@@ -1569,6 +2049,29 @@ ${recordingHandle.stderr}`);
       invariant(existsSync(videoFile) && statSync(videoFile).size > 1_000_000,
         `The recorded cinematic is missing or implausibly small: ${videoFile}`);
       recordArtifact(videoFile);
+
+      // The film is on disk and can be looked at whatever the verdict is; now say whether it is a film
+      // of the cinematic. Asserted here rather than mid-recording so that a run which fails this still
+      // leaves the evidence that shows why.
+      const obscuredSamples = occlusionSamples.filter((sample) => sample.occluded !== false);
+      manifest.preview.stageOcclusion = {
+        samples: occlusionSamples.length,
+        intervalSeconds: 5,
+        filmDurationSeconds: Number(filmDurationSeconds.toFixed(1)),
+        clear: obscuredSamples.length === 0,
+        obscured: obscuredSamples,
+      };
+      // A film watched twice is not a watched film. The sampler runs on the same loop that waits for the
+      // camera handoff, so a run whose loop exited immediately would report "0 of 0 samples occluded"
+      // and read as a clean stage.
+      invariant(occlusionSamples.length >= Math.floor(filmDurationSeconds / 10),
+        `The desktop was not watched for the whole film: ${occlusionSamples.length} samples over `
+          + `${filmDurationSeconds.toFixed(1)}s. ${JSON.stringify(manifest.preview.stageOcclusion)}`);
+      invariant(obscuredSamples.length === 0,
+        `The editor was covered during ${obscuredSamples.length} of ${occlusionSamples.length} samples, so `
+          + `part of this recording is a picture of another window, not of the cinematic: `
+          + `${JSON.stringify(obscuredSamples.slice(0, 8))}`);
+      }
       const completedCamera = await invoke("camera_probe");
       const expectedSubjectIds = subjects.map(({ id }) => id).sort();
       const visitedSubjectIds = [...new Set(completedCamera.visitedSubjects ?? [])].sort();
@@ -1607,6 +2110,14 @@ ${recordingHandle.stderr}`);
       await removeCleanCaptureStage();
       cleanCaptureStage = false;
 
+      // THE FILM'S OWN GATE, when there is a film.
+      //
+      // `encoder` is non-null exactly when the desktop was clear enough to record. Everything from here
+      // to `manifest.video` grades that recording, so with no recording there is nothing to grade -- and
+      // running the gate against a path that was never written would report a media failure for a
+      // decision the harness made deliberately. The direction's verdict does not live here; it was
+      // measured from the window above and is asserted whatever happened on the desktop.
+      if (encoder) {
       const qualityDirectory = exactNamedChild(runDir, "video-quality");
       const gateArguments = [
         videoQualityGateScript,
@@ -1668,6 +2179,7 @@ ${recordingHandle.stderr}`);
         completedCamera,
         visitedSubjectIds,
       };
+      }
 
       lifecycleRecording = await readLifecycle();
       // The batch lifecycle and the cancellation proof belong to the drag path. Command-import mode
@@ -1684,6 +2196,22 @@ ${recordingHandle.stderr}`);
         invariant(/CAD import cancelled/i.test(cadLogText) && /no scene changes were committed/i.test(cadLogText),
           `Run-scoped CAD log lacks atomic cancellation proof:\n${cadLogText}`);
       }
+
+      // ── IS THE DELIVERED DIRECTION A FILM OF THE FACTORY? ─────────────────────────────────────────
+      //
+      // Asserted LAST on purpose. It is the criterion most likely to fail and the one whose diagnosis
+      // needs everything else: which shots were re-aimed, which subjects were visited, what the film
+      // cost to play. Failing early would leave a run reporting "not legible enough" with none of the
+      // evidence that says which direction did it.
+      //
+      // The two previously delivered films measured 74.4% and 75.2% against this same 80% floor.
+      invariant(legibility.governingFraction >= QUALITY_THRESHOLDS.minimumLegibleFrameFraction,
+        `Only ${(legibility.governingFraction * 100).toFixed(1)}% of the directed film is a picture of `
+          + `something (${legibility.legibleFrames} of ${legibility.sampledFrames} sampled stills clear BOTH `
+          + `an interdecile luma range of ${legibility.threshold} AND an edge energy of `
+          + `${legibility.edgeThreshold}); the floor is `
+          + `${(QUALITY_THRESHOLDS.minimumLegibleFrameFraction * 100).toFixed(0)}%. The obscured seconds are `
+          + `${JSON.stringify(legibility.obscuredFrames.slice(0, 12))}`);
       manifest.status = "passed";
     } catch (error) {
       failure = error;
@@ -1734,6 +2262,16 @@ ${recordingHandle.stderr}`);
           await removeCleanCaptureStage();
         } catch (error) {
           manifest.cleanupErrors.push(`Clean capture stage cleanup: ${String(error)}`);
+        }
+      }
+      if (stagePinned) {
+        // Leave the desktop as it was found. A window left in the topmost band outlives the run and
+        // sits over everything the machine does afterwards.
+        try {
+          setStageTopmost(false);
+          stagePinned = false;
+        } catch (error) {
+          manifest.cleanupErrors.push(`Stage topmost release: ${String(error)}`);
         }
       }
       try {

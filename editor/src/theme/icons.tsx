@@ -256,6 +256,13 @@ const ICONS = {
       <path d="M6.2 8.4H10M14 8.4h3.8" />
     </>
   ),
+  draw: (
+    <>
+      <path d="M3.8 19.4 9 7.6l6.4 4.2 4.8-8" />
+      <circle cx="3.8" cy="19.4" r="1.6" />
+      <circle cx="9" cy="7.6" r="1.6" />
+    </>
+  ),
   camera: (
     <>
       <rect x="2.6" y="7.4" width="13" height="9.2" rx="2" />

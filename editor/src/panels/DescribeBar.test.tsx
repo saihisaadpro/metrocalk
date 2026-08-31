@@ -196,3 +196,60 @@ test("preview (no match): an unmatched query previews the generate cost from the
   const cost = await screen.findByTestId("previewCost");
   expect(cost.textContent).toContain(`~${GENERATE_COST} tokens`);
 });
+
+// ── The composer's leading `+`: the OTHER half of "get something into my scene" ────────────────────
+// "Describe it", "import it" and "browse for it" are three answers to one question, and before the
+// composer only one of them was on the stage. These assert the doors are real (they call the handler
+// the shell wired) and — the part a render test usually misses — that a door with no handler is not
+// offered at all, rather than offered and inert.
+
+test("the leading + opens the three real doors, and each one calls the shell's handler", async () => {
+  const onImport = vi.fn();
+  const onBrowseAssets = vi.fn();
+  const onDrawShape = vi.fn();
+  render(
+    <DescribeBar
+      client={fakeClient({})}
+      onImport={onImport}
+      onBrowseAssets={onBrowseAssets}
+      onDrawShape={onDrawShape}
+    />,
+  );
+
+  fireEvent.click(screen.getByTestId("describeAddBtn"));
+  fireEvent.click(await screen.findByTestId("describeAddImport"));
+  expect(onImport).toHaveBeenCalledTimes(1);
+
+  fireEvent.click(screen.getByTestId("describeAddBtn"));
+  fireEvent.click(await screen.findByTestId("describeAddBrowse"));
+  expect(onBrowseAssets).toHaveBeenCalledTimes(1);
+
+  fireEvent.click(screen.getByTestId("describeAddBtn"));
+  fireEvent.click(await screen.findByTestId("describeAddDraw"));
+  expect(onDrawShape).toHaveBeenCalledTimes(1);
+});
+
+test("a composer with no doors wired shows no + at all — never an empty menu", () => {
+  render(<DescribeBar client={fakeClient({})} />);
+  expect(screen.queryByTestId("describeAddBtn")).toBeNull();
+  expect(screen.getByTestId("describe")).toBeTruthy(); // the field itself is unconditional
+});
+
+test("the commit refuses with a reason while a generation is running, and the field is not editable", async () => {
+  // `generate` never settles → the composer stays in its progress state, which is the only state where
+  // both the field and the commit are withdrawn. A pending gesture that can be fired twice charges twice.
+  const client = fakeClient({
+    describe: () => Promise.resolve(NO_MATCH),
+    generate: () => new Promise<GenerateResponse>(() => {}),
+  });
+  render(<DescribeBar client={client} />);
+  fireEvent.change(screen.getByTestId("describe"), { target: { value: "a flying dragon" } });
+  fireEvent.click(screen.getByTestId("describeBtn"));
+  fireEvent.click(await screen.findByTestId("genBtn"));
+
+  await screen.findByTestId("genProgress");
+  const submit = screen.getByTestId("describeBtn") as HTMLButtonElement;
+  expect(submit.disabled).toBe(true);
+  expect(submit.title).toBe("A generation is already running"); // the refusal SPEAKS (R9)
+  expect((screen.getByTestId("describe") as HTMLInputElement).disabled).toBe(true);
+});

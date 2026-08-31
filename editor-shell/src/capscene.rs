@@ -1645,12 +1645,51 @@ pub fn duplicate_entity(
     scene: &CapScene,
     src: EntityId,
 ) -> Result<EntityId, PipelineError> {
+    Ok(duplicate_entities(engine, scene, &[src])?[0])
+}
+
+/// **DUPLICATE A SELECTION** — the N-entity form of [`duplicate_entity`], as **ONE** transaction, so
+/// one Ctrl-Z removes the whole batch of clones (see [`delete_deactivate_many`] for the same argument
+/// about a control that counts the selection and acts on one of it).
+///
+/// Each source is cloned independently: a parent and its child both being selected produces two
+/// clones and no nesting, because [`duplicate_entity`] has never recursed into children. Returns the
+/// new ids in the order the sources were given.
+///
+/// # Errors
+/// [`PipelineError`] if any source isn't a live entity, or the create transaction fails. All-or-
+/// nothing: a selection containing one dead id clones none of it rather than most of it.
+pub fn duplicate_entities(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    srcs: &[EntityId],
+) -> Result<Vec<EntityId>, PipelineError> {
+    let mut ops: Vec<Op> = Vec::new();
+    let mut new_ids: Vec<EntityId> = Vec::with_capacity(srcs.len());
+    for &src in srcs {
+        let new_id = engine.alloc_entity_id();
+        duplicate_ops(engine, scene, src, new_id, &mut ops)?;
+        new_ids.push(new_id);
+    }
+    engine.commit("duplicate-entity", ops)?;
+    Ok(new_ids)
+}
+
+/// The ops one duplicate contributes, appended to a batch. Split out of [`duplicate_entity`] so the
+/// single and the N-entity forms cannot drift: the clone's field set, its offset and its capability
+/// pairs are stated once.
+fn duplicate_ops(
+    engine: &Engine<FlecsWorld>,
+    scene: &CapScene,
+    src: EntityId,
+    new_id: EntityId,
+    ops: &mut Vec<Op>,
+) -> Result<(), PipelineError> {
     let src_ecs = engine
         .ecs_entity(src)
         .ok_or(PipelineError::UnknownEntity(src))?;
-    let new_id = engine.alloc_entity_id();
     let parent = engine.parent_of(src);
-    let mut ops = vec![Op::CreateEntity { id: new_id, parent }];
+    ops.push(Op::CreateEntity { id: new_id, parent });
 
     // Clone every component field. Then offset the Transform x so the clone sits beside the source
     // (the later SetField wins). Read the source x first.
@@ -1696,8 +1735,7 @@ pub fn duplicate_entity(
         });
     }
 
-    engine.commit("duplicate-entity", ops)?;
-    Ok(new_id)
+    Ok(())
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1939,19 +1977,90 @@ pub fn ungroup(
     Ok(children)
 }
 
+/// Why a multi-edit was refused, in words a panel can print.
+///
+/// `PipelineError` has three variants and none of them can say "that object has no Light" — because
+/// **the pipeline does not consider that an error**. `Op::SetField` validates only that the entity is
+/// alive (`core/src/pipeline.rs`); component and field are CREATED on write. So writing
+/// `Light.intensity` across a selection that contains a mesh does not fail — it gives the mesh a
+/// one-field `Light` component, silently, in an undoable transaction that looks like a success. The
+/// guard has to live here, above the pipeline, and it has to be able to explain itself.
+#[derive(Debug)]
+pub enum MultiEditError {
+    /// At least one target does not carry `component` — the edit would have INVENTED it there.
+    NotShared {
+        component: String,
+        field: String,
+        /// How many of the targets lack the component.
+        missing: usize,
+        /// How many targets were asked for.
+        total: usize,
+    },
+    /// The transaction itself was refused (an unknown id, a Loro failure).
+    Pipeline(PipelineError),
+}
+
+impl std::fmt::Display for MultiEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotShared {
+                component,
+                field,
+                missing,
+                total,
+            } => write!(
+                f,
+                "{missing} of {total} selected objects have no {component}, so {component}.{field} cannot be set on all of them"
+            ),
+            Self::Pipeline(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for MultiEditError {}
+
+impl From<PipelineError> for MultiEditError {
+    fn from(e: PipelineError) -> Self {
+        Self::Pipeline(e)
+    }
+}
+
 /// **MULTI-EDIT** — apply one field edit to N entities as ONE **batched, atomic, undoable** transaction
 /// (NOT N silent ops). A single undo restores **all N** at once (inv. 3). Unknown ids in the batch fail the
 /// whole transaction (all-or-nothing), so a multi-selection is never half-edited.
 ///
+/// **Refuses a component the whole selection does not carry** — see [`MultiEditError`] for why that
+/// check cannot be left to the pipeline. The field itself is not required to exist: a registered field
+/// that has never been written is absent from `components_of` and setting it on N objects that all
+/// carry the component is exactly what this verb is for.
+///
 /// # Errors
-/// [`PipelineError`] if any entity is unknown, or the commit fails.
+/// [`MultiEditError::NotShared`] when some target lacks `component`; [`MultiEditError::Pipeline`] if
+/// any entity is unknown or the commit fails.
 pub fn multi_edit(
     engine: &mut Engine<FlecsWorld>,
     ids: &[EntityId],
     component: &str,
     field: &str,
     value: &FieldValue,
-) -> Result<(), PipelineError> {
+) -> Result<(), MultiEditError> {
+    let missing = ids
+        .iter()
+        .filter(|&&id| !engine.components_of(id).contains_key(component))
+        .count();
+    // REFUSED WHEN THE SELECTION DISAGREES, NOT WHEN IT CREATES. `missing == ids.len()` is a
+    // deliberate, uniform "give all of these a KillCounter" — the AI/rule-authoring path's normal use,
+    // and what the `.exe` play-rules gate does with one id. The corruption case is the MIXED one:
+    // eleven lights and a mesh, where the same op is a field write on eleven objects and a component
+    // invention on the twelfth.
+    if missing > 0 && missing < ids.len() {
+        return Err(MultiEditError::NotShared {
+            component: component.to_owned(),
+            field: field.to_owned(),
+            missing,
+            total: ids.len(),
+        });
+    }
     let ops = ids
         .iter()
         .map(|&id| Op::SetField {
@@ -1961,7 +2070,109 @@ pub fn multi_edit(
             value: value.clone(),
         })
         .collect();
-    engine.commit("multi-edit", ops)
+    engine.commit("multi-edit", ops)?;
+    Ok(())
+}
+
+/// Why a rotation was refused, in words a panel can print.
+#[derive(Debug)]
+pub enum RotationError {
+    /// The four numbers are not a rotation — non-finite, or of zero length, so no normalisation exists.
+    NotARotation,
+    /// At least one target carries no `Transform`. Writing the quaternion there would INVENT one
+    /// holding a rotation and no position, which `local_transform` would then read as a pose at the
+    /// world origin.
+    NoTransform {
+        /// How many of the targets lack a `Transform`.
+        missing: usize,
+        /// How many targets were asked for.
+        total: usize,
+    },
+    /// The transaction itself was refused (an unknown id, a Loro failure).
+    Pipeline(PipelineError),
+}
+
+impl std::fmt::Display for RotationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotARotation => write!(
+                f,
+                "those four numbers are not a rotation (a quaternion must be finite and non-zero)"
+            ),
+            Self::NoTransform { missing, total } => write!(
+                f,
+                "{missing} of {total} selected objects have no position in the world, so they cannot be rotated"
+            ),
+            Self::Pipeline(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RotationError {}
+
+impl From<PipelineError> for RotationError {
+    fn from(e: PipelineError) -> Self {
+        Self::Pipeline(e)
+    }
+}
+
+/// **SET A ROTATION** (ADR-172) — write a **normalised** quaternion onto N entities as **ONE** undoable
+/// transaction.
+///
+/// A rotation is four stored numbers and **one** property, and until this verb existed the editor had
+/// no way to say so: the Inspector rendered `qx`/`qy`/`qz`/`qw` as four independent number boxes, so
+/// typing in one of them committed a quaternion of length ≠ 1 — not a rotation at all, and four undo
+/// steps to get back from. The normalisation is here rather than in the caller for the reason every
+/// other guard in this file is here: `Op::SetField` will write whatever it is handed, and the AI
+/// layer, an MCP tool and a script all arrive through the same door as the panel.
+///
+/// It refuses a target with **no** `Transform`, which is stricter than [`multi_edit`]'s
+/// disagreement rule, deliberately: seeding a component uniformly across a selection is that verb's
+/// normal use, but a `Transform` holding a rotation and no position is not a pose — `local_transform`
+/// would read it as "rotated, at the world origin", which is a placement nobody asked for.
+///
+/// # Errors
+/// [`RotationError::NotARotation`] for a non-finite or zero-length quaternion;
+/// [`RotationError::NoTransform`] when a target has no `Transform`; [`RotationError::Pipeline`] if the
+/// transaction is refused.
+pub fn set_rotation(
+    engine: &mut Engine<FlecsWorld>,
+    ids: &[EntityId],
+    quat: [f64; 4],
+) -> Result<(), RotationError> {
+    let length = quat.iter().map(|c| c * c).sum::<f64>().sqrt();
+    if !quat.iter().all(|c| c.is_finite()) || !length.is_finite() || length < 1.0e-9 {
+        return Err(RotationError::NotARotation);
+    }
+    let unit = quat.map(|c| c / length);
+
+    let missing = ids
+        .iter()
+        .filter(|&&id| !engine.components_of(id).contains_key("Transform"))
+        .count();
+    if missing > 0 {
+        return Err(RotationError::NoTransform {
+            missing,
+            total: ids.len(),
+        });
+    }
+
+    let ops = ids
+        .iter()
+        .flat_map(|&id| {
+            ["qx", "qy", "qz", "qw"]
+                .into_iter()
+                .zip(unit)
+                .map(move |(field, value)| Op::SetField {
+                    entity: id,
+                    component: "Transform".into(),
+                    field: field.into(),
+                    value: FieldValue::Number(value),
+                })
+        })
+        .collect();
+    engine.commit("set-rotation", ops)?;
+    Ok(())
 }
 
 /// **DELETE** (M10.6) — **deactivate, not destroy** (ADR-026): set `id` inactive (so undo restores it and a
@@ -1977,21 +2188,52 @@ pub fn delete_deactivate(
     scene: &CapScene,
     id: EntityId,
 ) -> Result<(), PipelineError> {
-    let id_ecs = engine.ecs_entity(id);
-    let mut ops = vec![Op::SetActive {
-        entity: id,
-        active: false,
-    }];
-    // Free dependents (the M3.3 rule): drop every binding `id` participates in, and — when `id` is the
-    // requirer — the provider's consumed-marker `(BindsTo, id)` pair, so the freed provider re-enters the
-    // reveal. Undo restores them with the re-activation.
+    delete_deactivate_many(engine, scene, &[id])
+}
+
+/// **DELETE A SELECTION** — the N-entity form of [`delete_deactivate`], as **ONE** transaction, so one
+/// Ctrl-Z restores the whole selection rather than the last object of it.
+///
+/// The editor's Actions menu has counted the multi-selection on its own trigger ("Actions · 12") since
+/// M10.6 while Delete acted on the primary alone; a control that names twelve and does one is the
+/// honest-state failure `<ux_quality>` 6 exists for, and looping the single-entity command twelve times
+/// would fix the count and replace it with twelve undo steps behind a toast promising one.
+///
+/// **The bindings are walked ONCE, not once per target.** Two selected objects bound to each other
+/// share a binding, and emitting its `RemoveBinding` twice in one transaction is an op-set the
+/// pipeline is entitled to reject — the batch would then refuse exactly the selection a user is most
+/// likely to make (a thing and the thing it is plugged into).
+///
+/// # Errors
+/// [`PipelineError`] if the commit fails. All-or-nothing: no partial deactivation.
+pub fn delete_deactivate_many(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    ids: &[EntityId],
+) -> Result<(), PipelineError> {
+    let mut targets: Vec<EntityId> = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if !targets.contains(&id) {
+            targets.push(id);
+        }
+    }
+    let mut ops: Vec<Op> = targets
+        .iter()
+        .map(|&entity| Op::SetActive {
+            entity,
+            active: false,
+        })
+        .collect();
+    // Free dependents (the M3.3 rule): drop every binding a target participates in, and — when the
+    // target is the requirer — the provider's consumed-marker `(BindsTo, id)` pair, so the freed
+    // provider re-enters the reveal. Undo restores them with the re-activation.
     for (from, kind, to) in engine.bindings() {
-        if from != id && to != id {
+        if !targets.contains(&from) && !targets.contains(&to) {
             continue;
         }
         ops.push(Op::RemoveBinding { from, kind, to });
-        if from == id {
-            if let Some(e) = id_ecs {
+        if targets.contains(&from) {
+            if let Some(e) = engine.ecs_entity(from) {
                 ops.push(Op::RemovePair {
                     entity: to,
                     rel: scene.rels.binds_to,

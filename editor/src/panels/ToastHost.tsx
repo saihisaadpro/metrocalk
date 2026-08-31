@@ -59,7 +59,14 @@ function ToastRow({ toast }: { toast: Toast }) {
         fontFamily: font.ui,
         boxShadow: elevation.e2,
         width: "max-content",
-        maxWidth: `calc(100vw - ${space.xxl * 2}px)`,
+        // AGAINST THE HOST, WHICH IS THE STAGE — not against the window. `100vw` is the whole
+        // window, and this host is absolutely positioned INSIDE `#viewport` and centred on it: at
+        // 1296px with two docks open the stage is ~508px, so a long message was capped at 1200px,
+        // centred on 508, and clipped at BOTH edges by the stage's own `overflow: hidden`. Seen on
+        // an `.exe` capture, where a cutscene re-aim toast read "s now a wide shot of Assembly
+        // Hall…". Same class as ADR-163's dock that laid out 601px inside 488px because its
+        // fallback keyed on the window.
+        maxWidth: "100%",
       }}
     >
       <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>{toast.text}</span>
@@ -100,6 +107,9 @@ export function ToastHost({ top = 58 }: { top?: number }) {
         gap: space.sm,
         alignItems: "center",
         pointerEvents: "none",
+        // The percentage resolves against the containing block — `#viewport`, which is
+        // `position: relative` — so the stack can never be wider than the stage it is centred on.
+        maxWidth: `calc(100% - ${space.lg * 2}px)`,
       }}
     >
       {toasts.map((t) => (

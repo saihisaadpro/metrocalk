@@ -160,10 +160,72 @@ export function PanelHeader({ title, right, style }: { title: ReactNode; right?:
   );
 }
 
-/** A lighter in-panel section label (denser than a PanelHeader; for grouping inside a panel). */
-export function SectionHeader({ children, style }: { children: ReactNode; style?: CSSProperties }) {
+/** A lighter in-panel section label (denser than a PanelHeader; for grouping inside a panel).
+ *
+ *  IT USED TO CARRY ITS OWN 12px INLINE PADDING, and every one of its ten call sites is inside a
+ *  container that already insets its content — a `DisclosureSection` body, a padded `ScrollArea`, a
+ *  padded column. So the heading always started 12px to the RIGHT of the rows it labelled, which is
+ *  the arrangement that makes a heading read as belonging to something else. Two things could have
+ *  been done about it: pass `padding: 0` at ten call sites, which is one value invented ten times and
+ *  the constitution's root-cause rule verbatim; or decide it once here. The label now states only its
+ *  own vertical rhythm and takes its indent from whatever it is inside, like every other block does. */
+/**
+ *  TWO WEIGHTS, ONE AUTHORITY. `eyebrow` is the quieter form — the uppercase micro label above a
+ *  block that is already inside a titled surface, where a second `sectionTitle` would compete with
+ *  the title above it rather than subdivide it. It is a variant and not a second component because
+ *  ten sites already spell it inline as `{...text.eyebrow}` plus a margin they each chose, which is
+ *  the same "three vocabularies for one group" the section rule exists to stop, one level down.
+ */
+export function SectionHeader({
+  children,
+  style,
+  className,
+  variant = "section",
+  id,
+}: {
+  children: ReactNode;
+  style?: CSSProperties;
+  className?: string;
+  variant?: "panel" | "section" | "eyebrow";
+  id?: string;
+}) {
+  const type = variant === "panel" ? text.panelTitle : variant === "eyebrow" ? text.eyebrow : text.sectionTitle;
+  // A CALLER THAT BRINGS A CLASS BRINGS ITS OWN BOX. An inline style beats every stylesheet rule, so a
+  // default `paddingBlock` here would silently win against the layout the class was written to state —
+  // and the class would keep looking authoritative while painting nothing. The authority owns the TYPE
+  // (which is the point of it); the surface owns the spacing it already declares.
+  const box = className == null ? { paddingBlock: space.xs } : null;
   return (
-    <div style={{ ...text.sectionTitle, padding: `${space.xs}px ${space.lg}px`, ...style }}>{children}</div>
+    <div id={id} className={className} style={{ ...type, ...box, ...style }}>
+      {children}
+    </div>
+  );
+}
+
+/** A dialog's visible name — the element `Modal`'s `ariaLabelledBy` points at.
+ *
+ *  WHY THIS IS NOT `SectionHeader`. The constitution's rule is that a panel group must not draw its own
+ *  heading, and `SectionHeader` is the answer to it: a styled `div`, because a group label inside a
+ *  panel is not a document landmark. A DIALOG's name is the opposite case — `role="dialog"` takes its
+ *  accessible name from a real heading, and a `div` cannot give it one. So the rule and the requirement
+ *  point in opposite directions, and the resolution is a second shared authority rather than a waiver
+ *  per dialog: one place that says a dialog title is an `h2` at `text.panelTitle`, and every dialog
+ *  after this one inherits it instead of inventing its own font stack again. */
+export function DialogTitle({
+  children,
+  id,
+  style,
+  className,
+}: {
+  children: ReactNode;
+  id?: string;
+  style?: CSSProperties;
+  className?: string;
+}) {
+  return (
+    <h2 id={id} className={className} style={{ ...text.panelTitle, fontSize: fontSize.heading, margin: 0, ...style }}>
+      {children}
+    </h2>
   );
 }
 
@@ -192,6 +254,11 @@ export interface NumericFieldProps {
   disabled?: boolean;
   /** Externally-marked invalid/unbound/default state (a red ring — never colour-alone, paired with a title). */
   invalid?: boolean;
+  /** The field is showing a MULTI-SELECTION whose objects disagree about this value (ADR-169). The box
+   *  reads "Mixed" rather than one object's number dressed up as everyone's; typing a number
+   *  commits it to all of them. Nothing about the commit path changes — only what is displayed
+   *  while the user has not typed. */
+  mixed?: boolean;
   /** Value units per drag pixel (defaults to `step`); Shift = ×10 (coarse), Alt = ×0.1 (fine). */
   scrubSpeed?: number;
   ariaLabel?: string;
@@ -217,6 +284,7 @@ export function NumericField({
   max,
   disabled = false,
   invalid = false,
+  mixed = false,
   scrubSpeed,
   ariaLabel,
   id,
@@ -233,7 +301,7 @@ export function NumericField({
     if (max != null) v = Math.min(max, v);
     return v;
   };
-  const [textVal, setTextVal] = useState(() => fmt(value));
+  const [textVal, setTextVal] = useState(() => (mixed ? "" : fmt(value)));
   const [scrubbing, setScrubbing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const editing = useRef(false); // focused OR scrubbing — don't resync the field out from under the user
@@ -241,9 +309,9 @@ export function NumericField({
   const cleanup = useRef<(() => void) | null>(null);
   // Resync to the authoritative value when not actively editing/scrubbing (an external delta / undo / reselect).
   useEffect(() => {
-    if (!editing.current) setTextVal(fmt(value));
+    if (!editing.current) setTextVal(mixed ? "" : fmt(value));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [value, scrubbing]);
+  }, [value, scrubbing, mixed]);
   // Remove any in-flight drag listeners if we unmount mid-scrub (the inspector swaps on reselect).
   useEffect(() => () => cleanup.current?.(), []);
 
@@ -298,7 +366,10 @@ export function NumericField({
       return; // a scrub already committed this — don't double-commit on the trailing blur
     }
     if (validText && parsed !== null) onCommit(clampSnap(parsed));
-    else setTextVal(fmt(value)); // invalid → revert to the committed value (no silent zeroing)
+    // invalid → revert to the committed value (no silent zeroing). On a MIXED field there is no
+    // committed value to revert to, and printing `fmt(value)` would turn a blurred empty box into a
+    // claim that all N objects are 0 — so it goes back to reading "Mixed".
+    else setTextVal(mixed ? "" : fmt(value));
   }
 
   return (
@@ -309,9 +380,11 @@ export function NumericField({
       inputMode={integer ? "numeric" : "decimal"}
       role="spinbutton"
       aria-label={ariaLabel}
-      aria-valuenow={value}
+      aria-valuenow={mixed ? undefined : value}
       disabled={disabled}
       title={title ?? (textVal.trim() !== "" && !validText ? `Enter a ${integer ? "whole number" : "number"} — not applied` : undefined)}
+      placeholder={mixed ? "Mixed" : undefined}
+      data-mixed={mixed ? "1" : undefined}
       className={"mtk-input mtk-input--mono mtk-numfield" + (invalid || (!validText && textVal.trim() !== "") ? " is-invalid" : "")}
       data-testid={testid}
       data-scrubbing={scrubbing ? "1" : "0"}
@@ -370,20 +443,19 @@ export function TextArea({
 /** A small, neutral pill/badge (for live readouts — view label, counts). Not a button. The `title`
  *  carries the plain-language explanation (a requirer's needed cap, a price) — never colour-alone. */
 /** Search is a first-class editor interaction with one shared focus, density and clearing contract. */
-export function SearchField({
-  className,
-  style,
-  ...rest
-}: Omit<InputHTMLAttributes<HTMLInputElement>, "type">) {
-  return (
-    <input
-      type="search"
-      className={["mtk-input", "mtk-search", className].filter(Boolean).join(" ")}
-      style={style}
-      {...rest}
-    />
-  );
-}
+export const SearchField = forwardRef<HTMLInputElement, Omit<InputHTMLAttributes<HTMLInputElement>, "type">>(
+  function SearchField({ className, style, ...rest }, ref) {
+    return (
+      <input
+        ref={ref}
+        type="search"
+        className={["mtk-input", "mtk-search", className].filter(Boolean).join(" ")}
+        style={style}
+        {...rest}
+      />
+    );
+  },
+);
 
 /** Shared native select styling preserves platform semantics while removing subsystem-specific controls. */
 export function SelectField({
@@ -498,7 +570,7 @@ export function Surface({
   );
 }
 
-export function Badge({ children, tone = "neutral", style, title }: { children: ReactNode; tone?: "neutral" | "accent" | "warn" | "success"; style?: CSSProperties; title?: string }) {
+export function Badge({ children, tone = "neutral", style, title, ...rest }: { children: ReactNode; tone?: "neutral" | "accent" | "warn" | "success"; style?: CSSProperties; title?: string } & DataAttrs) {
   const tones: Record<string, CSSProperties> = {
     neutral: { background: color.bg.inset, color: color.text.secondary, borderColor: color.border.default },
     accent: { background: color.accent.subtle, color: color.accent.base, borderColor: color.accent.border },
@@ -509,6 +581,7 @@ export function Badge({ children, tone = "neutral", style, title }: { children: 
     <span
       className="mtk-badge"
       title={title}
+      {...rest}
       style={{
         display: "inline-flex",
         alignItems: "center",
@@ -597,13 +670,20 @@ export function TypeIcon({ kind, size = 40, style }: { kind: string; size?: numb
 
 /** One card surface — asset/component cards (M14.2 / ADR-058). Real hover/selected/unavailable/warning
  *  states come from the `.mtk-card` classes (global.css); the metadata layout is the caller's. Renders a
- *  `<button>` so it's keyboard-reachable; `disabled`/`tone:"unavailable"` explains *why it can't* via `title`. */
+ *  `<button>` so it's keyboard-reachable; `disabled`/`tone:"unavailable"` explains *why it can't* via `title`.
+ *
+ *  IT HAD NO CALLERS AND A HAND-WRITTEN TWIN. `Requirers` — the quick-pick list this component's own ADR
+ *  was written for — spelt `<button type="button" className="cand mtk-card">` out by hand, because the
+ *  shared version could not carry the `cand` hook the prompt-40 page object keys on. That is the whole
+ *  reason `className` is here: a shared control that cannot take the caller's stable hook is a shared
+ *  control the caller cannot use, and the copy that replaces it is where the states then drift. */
 export function Card({
   selected = false,
   tone = "default",
   disabled = false,
   onClick,
   children,
+  className,
   style,
   ...rest
 }: {
@@ -612,6 +692,8 @@ export function Card({
   disabled?: boolean;
   onClick?: () => void;
   children: ReactNode;
+  /** Caller-owned hooks/modifiers, composed AFTER the state classes so a stable selector survives. */
+  className?: string;
   style?: CSSProperties;
 } & DataAttrs) {
   const cls = [
@@ -619,6 +701,7 @@ export function Card({
     selected && "is-selected",
     tone === "warn" && "is-warn",
     (tone === "unavailable" || disabled) && "is-unavailable",
+    className,
   ]
     .filter(Boolean)
     .join(" ");

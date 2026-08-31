@@ -7,6 +7,7 @@ import { CinemaSection } from "./CinemaSection";
 import { fakeClient } from "../transport/test-client";
 import { projectionStore } from "../store/projection";
 import { playStore } from "../store/play";
+import type { ShotRow } from "../transport/protocol";
 
 function selectSomething() {
   act(() => projectionStore.getState().select("e1"));
@@ -155,6 +156,8 @@ describe("CinemaSection", () => {
         fovDeg: 50,
         cinematic: true,
         distance: 6,
+        frame: [0, 0, 1, 1] as [number, number, number, number],
+        visibleRect: [0, 0, 1, 1] as [number, number, number, number],
       }),
     );
     selectSomething();
@@ -189,12 +192,30 @@ describe("CinemaSection", () => {
   it("authors Calm pacing through the shared control and displays the effective duration", async () => {
     const client = fakeClient();
     let mood: "calm" | "normal" | "tense" = "normal";
+    const shot = (seconds: number): ShotRow => ({
+      id: "shot-1",
+      index: 0,
+      reads: "a full shot of e1, three-quarters on, pushing in",
+      seconds: 2.5,
+      effectiveSeconds: seconds,
+      openSeconds: 0,
+      blendSeconds: 0,
+      startSeconds: 0,
+      size: "full",
+      angle: "three_quarter",
+      motion: "push_in",
+      amount: 0.35,
+      subject: "e1",
+      subjectName: "e1",
+    });
     client.cinemaList = vi.fn((id: string) => Promise.resolve({
       entity: id,
       shots: 1,
       seconds: mood === "calm" ? 6.25 : 2.5,
       mood,
-      reads: ["a full shot of e1, three-quarters on, pushing in"],
+      delivery: "viewport" as const,
+      reads: [shot(2.5).reads],
+      rows: [shot(mood === "calm" ? 6.25 : 2.5)],
       problems: [],
       message: "",
       reason: null,
@@ -205,8 +226,10 @@ describe("CinemaSection", () => {
         entity: id,
         shots: 1,
         seconds: next === "calm" ? 6.25 : 2.5,
+        delivery: "viewport" as const,
         mood: next,
-        reads: ["a full shot of e1, three-quarters on, pushing in"],
+        reads: [shot(2.5).reads],
+        rows: [shot(next === "calm" ? 6.25 : 2.5)],
         problems: [],
         message: `Pacing set to ${next}`,
         reason: null,

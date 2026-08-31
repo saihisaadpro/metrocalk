@@ -23,7 +23,17 @@ import type { EditorClient } from "../transport/session";
 /** The file's display name *with* its extension (so a save names the real file, not a stem). */
 const fileName = (path: string | null): string | null => (path ? (path.split(/[\\/]/).pop() ?? path) : null);
 
-export function FileMenu({ client }: { client: EditorClient }) {
+export interface FileMenuProps {
+  client: EditorClient;
+  /** Open the export task dialog. The dialog is owned by `App` so the command palette can reach the
+   *  same one surface — a second instance behind the menu would be a second answer to one question. */
+  onExport: () => void;
+  /** Open the import task dialog — owned by `App` for the same reason, and reached by four surfaces
+   *  (this menu, the palette, the empty state, "import another" after a drop). */
+  onImport: () => void;
+}
+
+export function FileMenu({ client, onExport, onImport }: FileMenuProps) {
   const { path, dirty, recents } = useProjectInfo();
   const [open, setOpen] = useState(false);
   // A guarded action awaiting "discard unsaved changes?" confirmation, or `null` when none is pending.
@@ -99,39 +109,28 @@ export function FileMenu({ client }: { client: EditorClient }) {
     setOpen(false);
   }
 
-  /** M11.1 (ADR-040) — File→Import: open the native file dialog, import the chosen file through the MAGIC
-   *  router (FBX/glTF/OBJ/PNG), select the placed entity. "Drop any file → a working asset." */
-  async function importFile() {
+  /** ADR-175 — keep the picture currently on the stage as a PNG.
+   *
+   *  Under Export and not under Project, because that is what it is: the scene leaving the engine in a
+   *  form something else can read. It needs no selection and no cutscene — a still of an imported
+   *  assembly is the most ordinary thing an engineer wants out of a viewer, and until this existed the
+   *  answer was the operating system's screenshot key and a crop.
+   *
+   *  WHAT YOU SEE IS WHAT IT SAVES, grid and gizmo included. Nothing is posed and nothing is hidden,
+   *  so the file is the frame — which the first `.exe` capture proved and this menu item's own first
+   *  tooltip denied ("with none of the editor over it"). A cutscene RENDER is clean, because the
+   *  cutscene camera puts the viewport into `ViewportVisibility::Cinematic`; a stage capture is not,
+   *  and saying so is cheaper than a flicker of chrome disappearing under the author's cursor. */
+  async function saveFrame() {
     setOpen(false);
-    const id = await client.importAssetDialog();
-    if (id) {
-      projectionStore.getState().select(id);
-      projectStore.getState().markDirty();
-      setStatus(`imported · ${id}`);
-      pushToast("imported an asset", "success");
-    } else {
-      setStatus("import cancelled or unsupported");
-    }
-  }
-
-  /** Export the authoritative scene without requiring a mesh selection or opening Asset Lab. */
-  async function exportScene(format: "glb" | "usda" | "step") {
-    setOpen(false);
-    setStatus(`Preparing complete-scene ${format.toUpperCase()} export…`);
+    setStatus("Saving the viewport frame…");
     try {
-      const result = await client.sceneExport(format);
+      const result = await client.viewportCapture();
       setStatus(result.message);
-      if (result.ok) {
-        const changed = result.fidelity.filter((entry) => entry.status !== "preserved").length;
-        pushToast(
-          changed > 0 ? `${result.message} · ${changed} fidelity note${changed === 1 ? "" : "s"}` : result.message,
-          changed > 0 ? "info" : "success",
-        );
-      } else if (!/cancel/i.test(result.message)) {
-        pushToast(result.message, "error");
-      }
+      if (result.reason === null) pushToast(result.message, "success");
+      else if (!/cancel/i.test(result.message)) pushToast(result.message, "error");
     } catch (cause) {
-      const message = cause instanceof Error && cause.message ? cause.message : "Complete-scene export failed";
+      const message = cause instanceof Error && cause.message ? cause.message : "Saving the frame failed";
       setStatus(message);
       pushToast(message, "error");
     }
@@ -178,14 +177,36 @@ export function FileMenu({ client }: { client: EditorClient }) {
           <PopupMenuGroup label="Project">
             <MenuItem id="fileNew" label="New project" onClick={() => guarded(() => client.newProject(), "New", "new project")} />
             <MenuItem id="fileOpen" label="Open…" onClick={() => guarded(() => client.openProject(), "Open", "opened")} />
-            <MenuItem id="fileImport" label="Import asset…" onClick={() => void importFile()} />
+            {/* ADR-178 — the mirror of `fileExport`. This used to go straight to the native picker,
+                so the only place the character of a reader could be stated was nowhere, and the only
+                place its outcome could be stated was a status line reading `imported · e-42`. */}
+            <MenuItem
+              id="fileImport"
+              label="Import a file…"
+              title="See what this build can read and what each reader carries, then choose a file"
+              onClick={() => {
+                setOpen(false);
+                onImport();
+              }}
+            />
             <MenuItem id="fileSave" label="Save" onClick={() => void save(false)} />
             <MenuItem id="fileSaveAs" label="Save As…" onClick={() => void save(true)} />
           </PopupMenuGroup>
-          <PopupMenuGroup label="Export complete scene">
-            <MenuItem id="fileExportGlb" label="GLB…" title="Self-contained hierarchy, reusable meshes, materials, textures, skins and standard animation" onClick={() => void exportScene("glb")} />
-            <MenuItem id="fileExportUsda" label="USDA…" title="Readable hierarchy-focused USD with an explicit fidelity report; not binary USDC or packaged USDZ" onClick={() => void exportScene("usda")} />
-            <MenuItem id="fileExportStep" label="STEP AP242…" title="Faceted STEP for CAD, CAM and fabrication — exact tessellated geometry with no materials or animation; trimmed surfaces are not invented" onClick={() => void exportScene("step")} />
+          <PopupMenuGroup label="Export">
+            {/* One item, not three. The format choice used to BE the menu, which meant the character of
+                each writer — what it carries, what it drops — had nowhere to live but a `title`, and the
+                write fired before the user had seen any of it. It is a decision with consequences, so it
+                gets the surface a decision needs (ADR-174). */}
+            <MenuItem
+              id="fileExport"
+              label="Export scene…"
+              title="Choose a format, see what it carries and what this scene would lose, then write it"
+              onClick={() => {
+                setOpen(false);
+                onExport();
+              }}
+            />
+            <MenuItem id="fileSaveFrame" label="Viewport frame (PNG)…" title="Save the picture on the stage right now, exactly as you see it — including the grid and the gizmo, because nothing is posed and nothing is hidden. A cutscene render has neither." onClick={() => void saveFrame()} />
           </PopupMenuGroup>
           <PopupMenuGroup label={<span id="fileRecentHeading">Recent</span>}>
             <div id="fileRecent" data-testid="fileRecent" role="group" aria-labelledby="fileRecentHeading">

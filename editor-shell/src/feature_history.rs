@@ -586,6 +586,13 @@ fn commit_solid(
     commit_solid_with_handle(engine, pos, &handle_of(mesh))
 }
 
+/// ADR-172 — **the position fields here were `px`/`py`/`pz`, and nothing in this engine reads those.**
+/// `capscene::local_transform` — the one reader, behind the renderer, picking, framing, export and the
+/// gizmo — reads `x`/`y`/`z`. So every solid this committed was placed at the world origin whatever
+/// `pos` said, and a `FeatureOp::Pattern` (which is *only* an offset: `spacing * i`) stacked its whole
+/// array on top of the seed. Nothing caught it because `feature_history_spike.rs` asserted the same
+/// wrong name back, and because this sub-engine has no Tauri command — it is reachable from the lib
+/// and from its own tests only, so the mis-placement had no screen to be wrong on.
 fn commit_solid_with_handle(
     engine: &mut Engine<FlecsWorld>,
     pos: [f64; 3],
@@ -599,19 +606,19 @@ fn commit_solid_with_handle(
             Op::SetField {
                 entity: id,
                 component: "Transform".into(),
-                field: "px".into(),
+                field: "x".into(),
                 value: FieldValue::Number(pos[0]),
             },
             Op::SetField {
                 entity: id,
                 component: "Transform".into(),
-                field: "py".into(),
+                field: "y".into(),
                 value: FieldValue::Number(pos[1]),
             },
             Op::SetField {
                 entity: id,
                 component: "Transform".into(),
-                field: "pz".into(),
+                field: "z".into(),
                 value: FieldValue::Number(pos[2]),
             },
             Op::SetField {
@@ -712,6 +719,37 @@ mod tests {
             ],
             suppressed: BTreeSet::new(),
         }
+    }
+
+    /// **ADR-172 — the test this module did not have, and the reason its placement bug survived.**
+    ///
+    /// `rebuild` returns a hash, a feature count and geometry handles; the entities it places are
+    /// created inside an engine it then drops, so WHERE a solid ended up was unobservable through the
+    /// public API and no property here asserted it. `FeatureOp::Pattern` is nothing BUT placement —
+    /// its copies differ from the seed only by `spacing * i` — so a position written to a field the
+    /// reader does not read produced a bit-identical rebuild hash, a green determinism gate, and an
+    /// array stacked on top of itself.
+    ///
+    /// This asserts the two halves against each other: the writer commits, and `local_transform` —
+    /// the one reader behind the renderer, picking, framing and export — is asked what it sees.
+    #[test]
+    fn a_committed_solid_is_where_the_reader_looks_for_it() {
+        let mut engine = Engine::new(FlecsWorld::new(), 1);
+        let seed = commit_solid_with_handle(&mut engine, [0.0, 0.0, 0.0], "h").unwrap();
+        // The second copy of a 3-up pattern at spacing [5, 0, 0].
+        let copy = commit_solid_with_handle(&mut engine, [5.0, 0.0, 0.0], "h").unwrap();
+
+        let read_copy = crate::capscene::local_transform(&engine, copy);
+        assert!(
+            (read_copy.translation[0] - 5.0).abs() < 1e-6,
+            "the reader sees the offset the pattern committed, not 0 — got {:?}",
+            read_copy.translation
+        );
+        let read_seed = crate::capscene::local_transform(&engine, seed);
+        assert!(
+            (read_copy.translation[0] - read_seed.translation[0]).abs() > 1e-6,
+            "a patterned copy is somewhere the seed is not"
+        );
     }
 
     #[test]

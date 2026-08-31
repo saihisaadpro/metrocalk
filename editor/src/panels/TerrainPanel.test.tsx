@@ -65,9 +65,15 @@ function emptyClient(over = {}) {
 test("offers a way in — and no shaping controls — before a terrain exists", async () => {
   render(<TerrainPanel client={emptyClient()} statsIntervalMs={0} />);
   await screen.findByTestId("terrain-preset-flat");
-  expect(screen.getByTestId("terrain-preset-rolling-hills").textContent).toContain("Rolling Hills");
-  // The description is shown, so the choice is informed rather than a name-guessing game.
-  expect(screen.getByTestId("terrain-preset-rolling-hills").textContent).toContain("Gentle warped hills");
+  const hills = screen.getByTestId("terrain-preset-rolling-hills");
+  expect(hills.textContent).toContain("Rolling Hills");
+  // The description is still reachable, so the choice is informed rather than a name-guessing game — but
+  // it is the tile's tooltip now rather than a third line printed under every one of six tiles, which is
+  // what turned this grid back into the column of prose it replaced.
+  expect(hills.getAttribute("title")).toContain("Gentle warped hills");
+  // One tile per preset the engine published, and no others — a picker that drops or invents a choice
+  // is the defect the browser mock had for two milestones (three of the engine's six were missing).
+  expect(screen.getByTestId("terrain-presets").children.length).toBe(PRESETS.length);
   // No shaping controls are rendered at all — a wall of disabled sliders is not an empty state.
   expect(screen.queryByTestId("terrain-world-size")).toBeNull();
   expect(screen.queryByTestId("terrain-layers")).toBeNull();
@@ -103,8 +109,27 @@ test("the description box is offered before any terrain exists, alongside the pr
   expect(screen.getByTestId("terrain-preset-flat")).toBeTruthy();
   // Nothing to build from an empty box.
   expect((screen.getByTestId("terrain-describe-build") as HTMLButtonElement).disabled).toBe(true);
-  // And the examples are there, so the author is not staring at a blank field.
-  expect(screen.getByTestId("terrain-examples").children.length).toBeGreaterThan(2);
+  // And the examples are there, so the author is not staring at a blank field. Counting the PILLS, not
+  // the container's children: the container holds a heading and a row, so `children.length` stopped
+  // being a count of examples the moment the row wrapped — an assertion that would have gone green on
+  // zero examples.
+  const pills = screen.getAllByTestId("terrain-example");
+  expect(pills.length).toBeGreaterThan(1);
+  // The pill's word is short and its tooltip is the sentence it types — the pill is a label for a
+  // description, not the description, and losing the sentence would make it a guess.
+  expect(pills[0].getAttribute("title")).toContain("alpine valley");
+  // And the examples offered here are the ones that APPLY here. "raise this mountain by 150 m" needs a
+  // mountain; on a surface whose whole condition is that no terrain exists, it was an invitation to a
+  // refusal. It moves to the compact box, which is the form shown once a world exists — and which used
+  // to show no examples at all.
+  expect(pills.map((p) => p.textContent)).not.toContain("Raise a mountain");
+  // And pressing one puts the WHOLE sentence in the box, unabbreviated. Shortening the row and
+  // shortening what it types are two different changes, and only the first one was made.
+  fireEvent.click(pills[0]);
+  expect((screen.getByTestId("terrain-describe-text") as HTMLTextAreaElement).value).toBe(
+    pills[0].getAttribute("title"),
+  );
+  expect((screen.getByTestId("terrain-describe-build") as HTMLButtonElement).disabled).toBe(false);
 });
 
 const CREATE_PLAN = {
@@ -648,6 +673,12 @@ test("a terrain that appears in the document takes the panel out of its empty st
     { timeout: 3000 },
   );
   expect(screen.getByTestId("terrain-section-describe")).toBeTruthy();
+  // The describe box here is the one for changing a world, so its examples are the changing ones. This
+  // form used to offer none at all, which made the second half of describe-to-build undiscoverable
+  // exactly where it was the only half that worked.
+  const changes = screen.getAllByTestId("terrain-example").map((p) => p.textContent);
+  expect(changes).toContain("Raise a mountain");
+  expect(changes).not.toContain("Alpine valley");
 
   // And when the terrain goes away again — an undo — the empty state comes back rather than a stale world.
   projectionStore.getState().bulkLoad([]);

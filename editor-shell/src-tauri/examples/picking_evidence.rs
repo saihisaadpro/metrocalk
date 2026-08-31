@@ -30,6 +30,11 @@ use metrocalk_spatial::{Aabb, Camera, Transform};
 // to avoid.
 #[path = "../src/diag.rs"]
 mod diag;
+// `render` sizes and draws the presentation hall through `crate::hall`, so this list has to carry it
+// for the same reason it carries `diag`: an example that omits a module the binary supplies is not
+// compiling the same render.rs the .exe does.
+#[path = "../src/hall.rs"]
+mod hall;
 #[path = "../src/ibl.rs"]
 mod ibl;
 #[path = "../src/moba.rs"]
@@ -161,7 +166,7 @@ fn push(state: &mut SceneState, id: &str, center: [f32; 3], scale: f32, slot: i3
         center,
         scale,
         color: [0.55, 0.6, 0.68],
-        selected: 0.0,
+        highlight: 0.0,
         rotation: [0.0, 0.0, 0.0, 1.0],
         material: [0.0; 4],
     });
@@ -285,7 +290,8 @@ struct Canvas {
 impl Canvas {
     fn new() -> Self {
         let mut px = vec![0u8; IMG_W * IMG_H * 3];
-        for c in px.chunks_exact_mut(3) {
+        // `as_chunks_mut::<3>()`: one RGB pixel is three bytes, and the type now says so.
+        for c in px.as_chunks_mut::<3>().0 {
             c.copy_from_slice(&BG);
         }
         Self { px }
@@ -622,7 +628,7 @@ fn main() {
             scene.state.orbit,
             scene.state.elevation,
             scene.state.distance,
-            scene.state.surface_aspect,
+            render::ViewFrame::new(scene.state.surface_aspect, scene.state.composition_rect()),
             scene.state.cam_target.into(),
             scene.state.projection,
         );

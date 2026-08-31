@@ -21,6 +21,7 @@ import type {
   MatchValidation,
   CatalogSearch,
   CadReport,
+  ImportDialogResponse,
   ReimportReport,
   ContactInfo,
   JointInfo,
@@ -33,6 +34,7 @@ import type {
   GenerateResponse,
   ImportResult,
   Json,
+  MultiEditResult,
   JsonPatch,
   PhysicsWarning,
   ProjectionDelta,
@@ -44,7 +46,13 @@ import type {
   RuleSummary,
   ConditionSpec,
   ShotSpec,
+  CinemaPreviewReply,
+  RenderReply,
   CinemaReply,
+  DeliveryFrame,
+  FramingCatalog,
+  SubjectCatalog,
+  FramingEdit,
   EffectSpec,
   VfxReply,
   VfxProbe,
@@ -73,6 +81,7 @@ import type {
   UserFittingCatalogEntry,
   AssetLabProcessRequest,
   AssetLabResponse,
+  SceneExportFormat,
   SceneExportResponse,
   AnimationWorkspaceInfo,
   AnimationClipInstanceSaveRequest,
@@ -99,6 +108,7 @@ import type {
   TerrainReply,
   TerrainPathResult,
   TerrainStats,
+  GroundSketchState,
   ShapeSpec,
   ShapeReply,
   RoleSpec,
@@ -207,6 +217,9 @@ export interface EditorClient {
   removeEntity(id: string): void;
   /** Duplicate an entity (M3.3) — one undoable transaction; resolves to the clone's id. */
   duplicateEntity(id: string): Promise<string | null>;
+  /** Duplicate a whole SELECTION as ONE undoable transaction (ADR-169) → the clones' ids in source
+   *  order. One Ctrl-Z removes all of them; N calls to `duplicateEntity` would need N. */
+  duplicateEntities(ids: string[]): Promise<string[]>;
   /** Frame the camera on an entity (M3.3) — no mutation. */
   focusEntity(id: string): void;
   /**
@@ -256,6 +269,18 @@ export interface EditorClient {
   /** Turn a drawn outline into a solid: extrude a ground plan up (optionally tapered toward the
    *  centroid), or revolve a side profile around the vertical axis. */
   shapeDraw(mode: "extrude" | "revolve", profile: [number, number][], height?: number, segments?: number, taper?: number): Promise<ShapeReply>;
+  /** Arm/disarm the ground sketch — outline drawing IN the viewport, at world scale. */
+  sketchTool(on: boolean, gridM?: number, angleSnap?: boolean, planeY?: number): Promise<GroundSketchState>;
+  /** Place a corner where the cursor meets the ground (one command per click — invariant 4). */
+  sketchPoint(): Promise<GroundSketchState>;
+  /** Place a corner exactly `lengthM` from the last one, along the aimed direction. */
+  sketchPointExact(lengthM: number): Promise<GroundSketchState>;
+  sketchUndo(): Promise<GroundSketchState>;
+  sketchClear(): Promise<GroundSketchState>;
+  /** The live read-model, polled while the tool is armed. */
+  sketchState(): Promise<GroundSketchState>;
+  /** Raise the drawn outline into a solid standing where it was drawn. */
+  sketchCommit(height: number, taper?: number): Promise<ShapeReply>;
   /** Exact boolean of two objects (union|carve|intersect): result replaces both sources, one undo step. */
   shapeCombine(a: string, b: string, op: "union" | "carve" | "intersect"): Promise<ShapeReply>;
   /** Meld two shapes into one smooth blob (blend radius `k` metres), same replace semantics. */
@@ -300,14 +325,66 @@ export interface EditorClient {
   vfxList(id: string): Promise<VfxReply>;
   /** Every shot card the Cinematics block can offer. */
   cinemaCatalog(): Promise<ShotSpec[]>;
-  /** Append one shot to an object's cutscene (one undoable commit). */
+  /** Append one shot to an object's cutscene (one undoable commit).
+   *
+   *  A new shot always frames its own owner. What it films is then a property of the SHOT, changed
+   *  through `cinemaSetShotSubject` on the shot the add just opened — rather than a sticky choice
+   *  made before the card is clicked, which is the same decision stated in two places and a mode the
+   *  next card would silently inherit. */
   cinemaAddShot(id: string, kind: string): Promise<CinemaReply>;
   /** Remove one shot by index (one undoable commit). */
   cinemaRemoveShot(id: string, index: number): Promise<CinemaReply>;
   /** Set the cutscene's one pacing mood (one undoable commit). */
   cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply>;
+  /** Set the frame the cutscene is composed and delivered in (one undoable commit). */
+  cinemaSetDelivery(id: string, delivery: DeliveryFrame): Promise<CinemaReply>;
   /** The object's cutscene, read back as sentences plus continuity warnings. */
   cinemaList(id: string): Promise<CinemaReply>;
+  /** The framing vocabulary the shot inspector offers + the bounds it must respect (static data). */
+  cinemaFramingCatalog(): Promise<FramingCatalog>;
+  /** Set one shot's AUTHORED length in seconds (one undoable commit). */
+  cinemaSetShotSeconds(id: string, index: number, seconds: number): Promise<CinemaReply>;
+  /** Move one shot to another position in the list (one undoable commit). */
+  cinemaMoveShot(id: string, from: number, to: number): Promise<CinemaReply>;
+  /** Re-frame one shot in place — size, angle, move, strength (one undoable commit). */
+  cinemaSetShotFraming(id: string, index: number, edit: FramingEdit): Promise<CinemaReply>;
+  /** Point one shot at a different object, keeping its place, its length and its framing
+   *  (one undoable commit). */
+  cinemaSetShotSubject(id: string, index: number, subject: string): Promise<CinemaReply>;
+  /** The objects a shot could frame — ranked by the scene's own hierarchy, or searched by name.
+   *  A read. `index` marks the shot being edited so its current subject comes back ticked. */
+  cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog>;
+  /** The object under the cursor and the chain it hangs from — itself, then what it is part of,
+   *  outward — each rung with the drawn-part count the picker's rows carry. A read.
+   *
+   *  Picking is a hit test against drawn triangles, so a click on an imported assembly lands on a
+   *  LEAF: one bolt, of one weld gun, of a line that imports as 15,711 parts. The chain is what lets
+   *  the author take the machine instead, without the editor guessing which rung they meant. */
+  cinemaSubjectChain(id: string): Promise<SubjectCatalog>;
+  /** Pose the viewport camera at one moment of a cutscene, or (`active: false`) hand it back.
+   *  A render projection, never a document edit — moving a playhead is not something to undo. */
+  cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply>;
+  /** ADR-175 — what a render would produce, without producing it: the frame count, the span and the
+   *  rate, computed by the ENGINE from the same `plan_render` the job runs. The dialog's cost
+   *  sentence is this answer rather than a second copy of the arithmetic. */
+  cinemaRenderPlan(id: string, fps: number, shot: number | null): Promise<RenderReply>;
+  /** ADR-175 — start writing a cutscene out as a numbered PNG sequence. Returns as soon as the job
+   *  is accepted, carrying the plan it accepted; progress is read with `cinemaRenderStatus`.
+   *  `shot` is `null` for the whole cut. `folder` is `null` to let the engine ask the author. */
+  cinemaRenderStart(
+    id: string,
+    fps: number,
+    shot: number | null,
+    stem: string,
+    folder?: string | null,
+  ): Promise<RenderReply>;
+  /** How far the running render has got, or the ledger of the last one. */
+  cinemaRenderStatus(): Promise<RenderReply>;
+  /** Stop the running render. Every frame already written stays. */
+  cinemaRenderCancel(): Promise<RenderReply>;
+  /** ADR-175 — save the picture currently on the stage as a PNG. Nothing is posed, so what lands in
+   *  the file is what was on screen, held cutscene preview included. */
+  viewportCapture(path?: string | null): Promise<RenderReply>;
   /** Every "only if" card the Behaviour block can offer. */
   conditionCatalog(): Promise<ConditionSpec[]>;
   /** Add one clause to an object (one undoable commit). */
@@ -323,7 +400,7 @@ export interface EditorClient {
   /** Export a selected canonical mesh as an embedded-texture GLB. `path` is for automation. */
   assetLabExport(id: string, path?: string): Promise<AssetLabResponse>;
   /** Export the authoritative hierarchy, reusable meshes, skins and representable animation. */
-  sceneExport(format: "glb" | "usda" | "step", path?: string): Promise<SceneExportResponse>;
+  sceneExport(format: SceneExportFormat, path?: string): Promise<SceneExportResponse>;
   /** M11.3 — author a Light entity (kind = directional|point|spot) at a position with a linear RGB colour +
    *  intensity → its id. One undoable commit; the lit result is a render projection (not in the doc). */
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null>;
@@ -333,10 +410,19 @@ export interface EditorClient {
   groupEntities(ids: string[], name: string): Promise<string | null>;
   /** Ungroup — dissolve a group (children to its parent, delete the group) → applied. */
   ungroupEntity(id: string): Promise<boolean>;
-  /** Multi-edit — set one numeric field on N entities as ONE batched, atomic, undoable tx → applied. */
-  multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean>;
+  /** Multi-edit — set one field (ANY scalar, ADR-169) on N entities as ONE batched, atomic, undoable
+   *  transaction. Resolves to what it did, or to the sentence explaining why it refused. */
+  multiEdit(ids: string[], component: string, field: string, value: Json): Promise<MultiEditResult>;
+  /** Set a ROTATION on N entities as ONE batched, atomic, undoable transaction (ADR-172). A rotation
+   *  is four stored fields and one property, so `multiEdit` — one field to N entities — cannot express
+   *  it; the engine normalises the quaternion, so no caller can leave a non-rotation in the document.
+   *  Resolves to what it did, or to the sentence explaining why it refused. */
+  setRotation(ids: string[], quat: [number, number, number, number]): Promise<MultiEditResult>;
   /** Delete = deactivate (non-destructive; frees dependents) — undo restores → applied. */
   deleteDeactivate(id: string): Promise<boolean>;
+  /** Delete a whole SELECTION as ONE undoable transaction (ADR-169) → applied. One Ctrl-Z restores
+   *  all of it; N calls to `deleteDeactivate` would need N. */
+  deleteDeactivateMany(ids: string[]): Promise<boolean>;
   /** Copy a sub-tree to the clipboard (cross-project = the serde Composition). */
   copySubtree(id: string): void;
   /** Cut = copy + delete(deactivate) → applied. */
@@ -425,6 +511,23 @@ export interface EditorClient {
    *  (or null). Computed synchronously in the command from the camera ray (no per-frame race, no OS-cursor
    *  dependency — so a synthetic click works too). */
   viewportPick(x: number, y: number): Promise<string | null>;
+  /** Identify the entity under NORMALIZED viewport coords **without changing the selection** — the same
+   *  ray, the same BVH and the same filter a click uses, so what this names is what a click would take.
+   *
+   *  The non-mutating half of picking, and the reason aiming a shot at an object can be a click on the
+   *  stage at all: the Cutscene panel is bound to the editor selection, so a gesture that SELECTED the
+   *  object it is naming would switch which cutscene is on screen and throw away the shot being aimed.
+   *  Called on hover-settle and on the aiming click — never per frame (invariant 4). */
+  viewportPeek(x: number, y: number): Promise<string | null>;
+  /** Say what the cursor is over, so the STAGE answers as well as the badge. Every DRAWN part under one
+   *  of `ids` lights up — so pointing at an assembly lights the assembly, which is what turns the aim
+   *  badge's `Assembly Hall · 7 parts` from a number into something you can see before you commit a shot
+   *  to it. `[]` clears it. Resolves with how many instances are lit: `0` on a subject with no geometry
+   *  is a real answer, not a failure.
+   *
+   *  A render projection — no transaction, no undo entry, nothing saved. Called only when the hovered
+   *  SUBJECT changes, never per frame (invariant 4). */
+  viewportHover(ids: string[]): Promise<number>;
   /** Begin a right-drag orbit — the native render loop then polls the OS cursor and orbits with **0 IPC per
    *  frame** (invariant 4); only this call + `dragEnd` cross the boundary, once per gesture. */
   dragStart(): void;
@@ -451,8 +554,14 @@ export interface EditorClient {
   // ── M11.1 File→Import (ADR-040): drop any file → a working asset (FBX/glTF/OBJ/PNG via the MAGIC router) ─
   /** Import an asset file from a known path → the new entity id (the e2e path). */
   importAsset(path: string): Promise<string | null>;
-  /** File→Import: open the native file dialog + import the chosen file → the new entity id. */
-  importAssetDialog(): Promise<string | null>;
+  /** File→Import: open the native file dialog + import the chosen file.
+   *
+   *  `extensions` (ADR-178) narrows the native dialog's filter to one format the import dialog
+   *  offered. Omitted, it is every extension this build can read — the historical behaviour.
+   *
+   *  The reply NAMES the outcome. It used to be `string | null`, and `null` meant a dismissed dialog
+   *  and an unreadable file equally, so no caller could say which had happened. */
+  importAssetDialog(extensions?: readonly string[]): Promise<ImportDialogResponse>;
 
   // ── project lifecycle (M10.3 / ADR-033): New / Open / Save / Save As over the `.mtk` document ──────
   /** The current project state — path, unsaved-changes flag, recent projects. The File menu refreshes
@@ -816,6 +925,9 @@ export class TauriClient implements EditorClient {
   duplicateEntity(id: string): Promise<string | null> {
     return this.core.invoke<string | null>("duplicate_entity", { id }).catch((e: unknown) => { console.error("duplicate_entity failed", e); throw e; });
   }
+  duplicateEntities(ids: string[]): Promise<string[]> {
+    return this.core.invoke<string[]>("duplicate_entities", { ids }).catch((e: unknown) => { console.error("duplicate_entities failed", e); throw e; });
+  }
   focusEntity(id: string): void {
     void this.core.invoke("focus_entity", { id }).catch((e: unknown) => console.error("focus_entity failed", e));
   }
@@ -891,6 +1003,27 @@ export class TauriClient implements EditorClient {
   shapeDraw(mode: "extrude" | "revolve", profile: [number, number][], height?: number, segments?: number, taper?: number): Promise<ShapeReply> {
     return this.core.invoke<ShapeReply>("shape_draw", { mode, profile, height: height ?? null, segments: segments ?? null, taper: taper ?? null }).catch((e: unknown) => { console.error("shape_draw failed", e); throw e; });
   }
+  sketchTool(on: boolean, gridM?: number, angleSnap?: boolean, planeY?: number): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_tool", { on, gridM: gridM ?? null, angleSnap: angleSnap ?? null, planeY: planeY ?? null }).catch((e: unknown) => { console.error("sketch_tool failed", e); throw e; });
+  }
+  sketchPoint(): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_point").catch((e: unknown) => { console.error("sketch_point failed", e); throw e; });
+  }
+  sketchPointExact(lengthM: number): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_point_exact", { lengthM }).catch((e: unknown) => { console.error("sketch_point_exact failed", e); throw e; });
+  }
+  sketchUndo(): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_undo").catch((e: unknown) => { console.error("sketch_undo failed", e); throw e; });
+  }
+  sketchClear(): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_clear").catch((e: unknown) => { console.error("sketch_clear failed", e); throw e; });
+  }
+  sketchState(): Promise<GroundSketchState> {
+    return this.core.invoke<GroundSketchState>("sketch_state").catch((e: unknown) => { console.error("sketch_state failed", e); throw e; });
+  }
+  sketchCommit(height: number, taper?: number): Promise<ShapeReply> {
+    return this.core.invoke<ShapeReply>("sketch_commit", { height, taper: taper ?? null }).catch((e: unknown) => { console.error("sketch_commit failed", e); throw e; });
+  }
   shapeCombine(a: string, b: string, op: "union" | "carve" | "intersect"): Promise<ShapeReply> {
     return this.core.invoke<ShapeReply>("shape_combine", { a, b, op }).catch((e: unknown) => { console.error("shape_combine failed", e); throw e; });
   }
@@ -928,7 +1061,7 @@ export class TauriClient implements EditorClient {
     return this.core.invoke<VfxProbe>("vfx_probe").catch(() => ({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 }));
   }
   cameraProbe(): Promise<CameraProbe> {
-    return this.core.invoke<CameraProbe>("camera_probe").catch(() => ({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0 }));
+    return this.core.invoke<CameraProbe>("camera_probe").catch(() => ({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0, frame: [0, 0, 1, 1] as [number, number, number, number], visibleRect: [0, 0, 1, 1] as [number, number, number, number] }));
   }
   vfxCatalog(): Promise<EffectSpec[]> {
     return this.core.invoke<EffectSpec[]>("vfx_catalog").catch((e: unknown) => { console.error("vfx_catalog failed", e); throw e; });
@@ -946,7 +1079,7 @@ export class TauriClient implements EditorClient {
     return this.core.invoke<ShotSpec[]>("cinema_catalog").catch((e: unknown) => { console.error("cinema_catalog failed", e); throw e; });
   }
   cinemaAddShot(id: string, kind: string): Promise<CinemaReply> {
-    return this.core.invoke<CinemaReply>("cinema_add_shot", { id, kind }).catch((e: unknown) => { console.error("cinema_add_shot failed", e); throw e; });
+    return this.core.invoke<CinemaReply>("cinema_add_shot", { id, kind, subject: null }).catch((e: unknown) => { console.error("cinema_add_shot failed", e); throw e; });
   }
   cinemaRemoveShot(id: string, index: number): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_remove_shot", { id, index }).catch((e: unknown) => { console.error("cinema_remove_shot failed", e); throw e; });
@@ -954,8 +1087,50 @@ export class TauriClient implements EditorClient {
   cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_set_mood", { id, mood }).catch((e: unknown) => { console.error("cinema_set_mood failed", e); throw e; });
   }
+  cinemaSetDelivery(id: string, delivery: DeliveryFrame): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_delivery", { id, delivery }).catch((e: unknown) => { console.error("cinema_set_delivery failed", e); throw e; });
+  }
   cinemaList(id: string): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_list", { id }).catch((e: unknown) => { console.error("cinema_list failed", e); throw e; });
+  }
+  cinemaFramingCatalog(): Promise<FramingCatalog> {
+    return this.core.invoke<FramingCatalog>("cinema_framing_catalog").catch((e: unknown) => { console.error("cinema_framing_catalog failed", e); throw e; });
+  }
+  cinemaSetShotSeconds(id: string, index: number, seconds: number): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_seconds", { id, index, seconds }).catch((e: unknown) => { console.error("cinema_set_shot_seconds failed", e); throw e; });
+  }
+  cinemaMoveShot(id: string, from: number, to: number): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_move_shot", { id, from, to }).catch((e: unknown) => { console.error("cinema_move_shot failed", e); throw e; });
+  }
+  cinemaSetShotFraming(id: string, index: number, edit: FramingEdit): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_framing", { id, index, edit }).catch((e: unknown) => { console.error("cinema_set_shot_framing failed", e); throw e; });
+  }
+  cinemaSetShotSubject(id: string, index: number, subject: string): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_subject", { id, index, subject }).catch((e: unknown) => { console.error("cinema_set_shot_subject failed", e); throw e; });
+  }
+  cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog> {
+    return this.core.invoke<SubjectCatalog>("cinema_subject_catalog", { id, index, query }).catch((e: unknown) => { console.error("cinema_subject_catalog failed", e); throw e; });
+  }
+  cinemaSubjectChain(id: string): Promise<SubjectCatalog> {
+    return this.core.invoke<SubjectCatalog>("cinema_subject_chain", { id }).catch((e: unknown) => { console.error("cinema_subject_chain failed", e); throw e; });
+  }
+  cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply> {
+    return this.core.invoke<CinemaPreviewReply>("cinema_preview", { id, seconds, active }).catch((e: unknown) => { console.error("cinema_preview failed", e); throw e; });
+  }
+  cinemaRenderPlan(id: string, fps: number, shot: number | null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_plan", { id, fps, shot }).catch((e: unknown) => { console.error("cinema_render_plan failed", e); throw e; });
+  }
+  cinemaRenderStart(id: string, fps: number, shot: number | null, stem: string, folder: string | null = null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_start", { id, fps, shot, stem, folder }).catch((e: unknown) => { console.error("cinema_render_start failed", e); throw e; });
+  }
+  cinemaRenderStatus(): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_status").catch((e: unknown) => { console.error("cinema_render_status failed", e); throw e; });
+  }
+  cinemaRenderCancel(): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_cancel").catch((e: unknown) => { console.error("cinema_render_cancel failed", e); throw e; });
+  }
+  viewportCapture(path: string | null = null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("viewport_capture", { path }).catch((e: unknown) => { console.error("viewport_capture failed", e); throw e; });
   }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return this.core.invoke<ConditionSpec[]>("condition_catalog").catch((e: unknown) => { console.error("condition_catalog failed", e); throw e; });
@@ -978,7 +1153,7 @@ export class TauriClient implements EditorClient {
   assetLabExport(id: string, path?: string): Promise<AssetLabResponse> {
     return this.core.invoke<AssetLabResponse>("asset_lab_export", { id, path: path ?? null }).catch((e: unknown) => { console.error("asset_lab_export failed", e); throw e; });
   }
-  sceneExport(format: "glb" | "usda" | "step", path?: string): Promise<SceneExportResponse> {
+  sceneExport(format: SceneExportFormat, path?: string): Promise<SceneExportResponse> {
     return this.core.invoke<SceneExportResponse>("scene_export", { format, path: path ?? null }).catch((e: unknown) => { console.error("scene_export failed", e); throw e; });
   }
   addLight(kind: string, x: number, y: number, z: number, r: number, g: number, b: number, intensity: number): Promise<string | null> {
@@ -993,11 +1168,17 @@ export class TauriClient implements EditorClient {
   ungroupEntity(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("ungroup_entity", { id }).catch((e: unknown) => { console.error("ungroup_entity failed", e); throw e; });
   }
-  multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean> {
-    return this.core.invoke<boolean>("multi_edit", { ids, component, field, value }).catch((e: unknown) => { console.error("multi_edit failed", e); throw e; });
+  multiEdit(ids: string[], component: string, field: string, value: Json): Promise<MultiEditResult> {
+    return this.core.invoke<MultiEditResult>("multi_edit", { ids, component, field, value }).catch((e: unknown) => { console.error("multi_edit failed", e); throw e; });
+  }
+  setRotation(ids: string[], quat: [number, number, number, number]): Promise<MultiEditResult> {
+    return this.core.invoke<MultiEditResult>("set_rotation", { ids, quat }).catch((e: unknown) => { console.error("set_rotation failed", e); throw e; });
   }
   deleteDeactivate(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("delete_deactivate", { id }).catch((e: unknown) => { console.error("delete_deactivate failed", e); throw e; });
+  }
+  deleteDeactivateMany(ids: string[]): Promise<boolean> {
+    return this.core.invoke<boolean>("delete_deactivate_many", { ids }).catch((e: unknown) => { console.error("delete_deactivate_many failed", e); throw e; });
   }
   copySubtree(id: string): void {
     void this.core.invoke("copy_subtree", { id }).catch((e: unknown) => console.error("copy_subtree failed", e));
@@ -1127,6 +1308,14 @@ export class TauriClient implements EditorClient {
   viewportPick(x: number, y: number): Promise<string | null> {
     return this.core.invoke<string | null>("viewport_pick", { x, y }).catch((e: unknown) => { console.error("viewport_pick failed", e); throw e; });
   }
+  viewportPeek(x: number, y: number): Promise<string | null> {
+    return this.core.invoke<string | null>("viewport_peek", { x, y }).catch((e: unknown) => { console.error("viewport_peek failed", e); throw e; });
+  }
+  viewportHover(ids: string[]): Promise<number> {
+    // Resolves 0 rather than rejecting: a hover cue that throws would take the gesture down with it, and
+    // a stage that failed to light is a missing cue, not a failed edit.
+    return this.core.invoke<number>("viewport_hover", { ids }).catch((e: unknown) => { console.error("viewport_hover failed", e); return 0; });
+  }
   dragStart(): void {
     void this.core.invoke("drag_start").catch((e: unknown) => console.error("drag_start failed", e));
   }
@@ -1165,11 +1354,13 @@ export class TauriClient implements EditorClient {
       throw e;
     }
   }
-  async importAssetDialog(): Promise<string | null> {
+  async importAssetDialog(extensions?: readonly string[]): Promise<ImportDialogResponse> {
     try {
-      const id = await this.core.invoke<string | null>("import_asset_dialog");
-      await this.hintNearDuplicate(id);
-      return id;
+      const reply = await this.core.invoke<ImportDialogResponse>("import_asset_dialog", {
+        extensions: extensions == null ? null : [...extensions],
+      });
+      await this.hintNearDuplicate(reply.entityId);
+      return reply;
     } catch (e: unknown) {
       console.error("import_asset_dialog failed", e);
       throw e;
@@ -1387,10 +1578,15 @@ export class TauriClient implements EditorClient {
 
 /** A believable recipe for the dev shell and the panel tests — the same shape the engine emits. */
 function mockRecipe(preset: string): TerrainRecipe {
+  // Same six ids and the same display names as `terrain/src/preset.rs::all()`, so a preset created in
+  // the dev build is named what the engine would have named it rather than falling to "Terrain".
   const named: Record<string, string> = {
     flat: "Flat Ground",
     "rolling-hills": "Rolling Hills",
     alpine: "Alpine Peaks",
+    dunes: "Desert Dunes",
+    archipelago: "Archipelago",
+    canyon: "Canyon Mesa",
   };
   return {
     version: 1,
@@ -1478,6 +1674,27 @@ function mockTerrainStats(active: boolean): TerrainStats {
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
+/** The zero row every browser-shell render answer is built from. Written once so the four refusals
+ *  cannot disagree about what "nothing was rendered" looks like. */
+const MOCK_RENDER_IDLE: RenderReply = {
+  running: false,
+  done: false,
+  entity: null,
+  frames: 0,
+  written: 0,
+  width: 0,
+  height: 0,
+  fps: 0,
+  seconds: 0,
+  folder: "",
+  stem: "",
+  bytes: 0,
+  elapsedMs: 0,
+  failures: [],
+  message: "",
+  reason: null,
+};
+
 const CAPS = ["Health", "Shield", "Click", "Damage", "Light"];
 
 /** The dev/test **first-run** scene (M10.10 / C10) — a small, *named*, meaningful starter scene (NOT the
@@ -1527,6 +1744,129 @@ export function buildWorld(n: number): EntityProjection[] {
   }
   return out;
 }
+
+/**
+ * The dev-mock mirror of `editor-shell/src/formats.rs::format_catalog()` — the one list the engine has
+ * an opinion about, so the Formats panel and the Export dialog render the same rows under
+ * `npm run dev`/Vitest as they do in the `.exe` (which serves the authoritative list from Rust).
+ *
+ * It was `[]` before, and an empty catalogue is not a neutral placeholder: every surface built on it
+ * looks finished and says the engine can read and write nothing. `available` mirrors the PACKAGED
+ * build's feature set (`editor-shell/src-tauri/Cargo.toml` forwards `assets-fbx`, `assets-ktx2` and
+ * `interchange-3dxml`), because that is the build this mock stands in for.
+ */
+const MOCK_FORMATS: FormatSpec[] = [
+  {
+    id: "gltf",
+    label: "glTF 2.0 / GLB",
+    extensions: ["glb", "gltf"],
+    domain: "Real-time",
+    direction: "both",
+    fidelity: "full",
+    carries: { geometry: true, hierarchy: true, materials: true, textures: true, skinning: true, animation: true, cameras: false, metadata: false, physics: false },
+    note: "The engine's best-supported path, both directions. Metallic-roughness PBR with embedded textures on export.",
+    available: true,
+  },
+  {
+    id: "obj",
+    label: "Wavefront OBJ",
+    extensions: ["obj"],
+    domain: "Real-time",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: false, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "Geometry only. OBJ has no hierarchy, no animation and no PBR; a companion .mtl is not read.",
+    available: true,
+  },
+  {
+    id: "fbx",
+    label: "Autodesk FBX",
+    extensions: ["fbx"],
+    domain: "Real-time",
+    direction: "import",
+    fidelity: "seam",
+    carries: { geometry: true, hierarchy: true, materials: true, textures: false, skinning: true, animation: true, cameras: false, metadata: false, physics: false },
+    note: "Read through the native ufbx reader.",
+    available: true,
+  },
+  {
+    id: "image",
+    label: "PNG / JPEG",
+    extensions: ["png", "jpg", "jpeg"],
+    domain: "Textures",
+    direction: "import",
+    fidelity: "full",
+    carries: { geometry: true, hierarchy: false, materials: false, textures: true, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "Placed as a textured quad. Treated as sRGB colour data.",
+    available: true,
+  },
+  {
+    id: "ktx2",
+    label: "KTX2 / Basis Universal",
+    extensions: ["ktx2"],
+    domain: "Textures",
+    direction: "import",
+    fidelity: "seam",
+    carries: { geometry: false, hierarchy: false, materials: false, textures: true, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "Supercompressed GPU texture, transcoded on import.",
+    available: true,
+  },
+  {
+    id: "hdr",
+    label: "Radiance HDR (equirectangular)",
+    extensions: ["hdr"],
+    domain: "Textures",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: false, hierarchy: false, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: false },
+    note: "An environment map for image-based lighting. Equirectangular layout only.",
+    available: true,
+  },
+  {
+    id: "step",
+    label: "STEP AP242",
+    extensions: ["stp", "step"],
+    domain: "CAD",
+    direction: "both",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: true, materials: true, textures: false, skinning: false, animation: false, cameras: false, metadata: true, physics: false },
+    note: "Pure-Rust reader and writer. Planar faces plus analytic cylinders, cones, spheres and tori tessellate exactly; trimmed NURBS and freeform faces are reported per face and left to a licensed kernel. Semantic PMI (GD&T) round-trips machine-readable, never downgraded to a graphical annotation.",
+    available: true,
+  },
+  {
+    id: "3dxml",
+    label: "CATIA 3DXML",
+    extensions: ["3dxml"],
+    domain: "CAD",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: true, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: true, physics: false },
+    note: "Product structure, assembly tree and instance transforms are read in full. CATIA's proprietary .3DRep tessellation is not decodable here — if a sibling STEP file is present it is used automatically for the geometry, otherwise each affected part is reported as a placed proxy.",
+    available: true,
+  },
+  {
+    id: "urdf",
+    label: "URDF",
+    extensions: ["urdf", "xml"],
+    domain: "Simulation",
+    direction: "import",
+    fidelity: "subset",
+    carries: { geometry: false, hierarchy: true, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: true },
+    note: "Links, joints and collision shapes with forward kinematics resolved to world poses. Visual geometry, inertia tensors and actuation are not read. Prismatic, floating and planar joints are declined with a reason rather than approximated.",
+    available: true,
+  },
+  {
+    id: "usd",
+    label: "OpenUSD (USD-Physics)",
+    extensions: ["usda", "usd"],
+    domain: "Simulation",
+    direction: "both",
+    fidelity: "subset",
+    carries: { geometry: true, hierarchy: true, materials: false, textures: false, skinning: false, animation: false, cameras: false, metadata: false, physics: true },
+    note: "Export writes a USDA scene. Import reads ASCII .usda only, and only the USD-Physics subset: units, rigid bodies and primitive colliders. Binary .usdc, zipped .usdz and USD's composition system (references, payloads, variants, layers) are a declared seam — and composition, not geometry, is what USD is actually for, so this is an interop path and not a claim to speak USD.",
+    available: true,
+  },
+];
 
 /** The dev-mock mirror of the shell's shape catalog (same kinds/params, so the Build panel renders
  *  identically under `npm run dev`/Vitest; the .exe serves the authoritative list from Rust). */
@@ -2408,6 +2748,9 @@ class MockClient implements EditorClient {
   duplicateEntity(_id: string): Promise<string | null> {
     return Promise.resolve(null);
   }
+  duplicateEntities(_ids: string[]): Promise<string[]> {
+    return Promise.resolve([]);
+  }
   focusEntity(_id: string): void {}
   reportViewportRect(_rect: { x: number; y: number; width: number; height: number }): void {}
   makeDynamic(_id: string): Promise<boolean> {
@@ -2654,6 +2997,154 @@ class MockClient implements EditorClient {
     });
     return Promise.resolve({ created: id, handle: `mtkasset:mock-shape-${kind}`, triangles: profile.length * 4, ms: 3, message: mode === "extrude" ? `Raised your drawing into a solid · ${profile.length * 4} triangles` : `Spun your drawing into a solid · ${profile.length * 4} triangles`, reason: null });
   }
+  // ── Ground sketch ─────────────────────────────────────────────────────────────────────────────
+  // The real tool aims from the render thread's cursor ray; there is no render thread here, so the
+  // mock walks a FIXED 12 x 8 m rectangle — four corners and then the first one again. That makes the
+  // whole workflow (draw · close · raise) reachable in the browser dev build and in the screenshot
+  // scenes, and it makes the panel's numbers deterministic instead of absent.
+  private sketchPath: [number, number, number][] = [
+    [0, 0, 0],
+    [12, 0, 0],
+    [12, 0, 8],
+    [0, 0, 8],
+  ];
+  private sketchPoints: [number, number, number][] = [];
+  private sketchClosed = false;
+  private sketchGridM = 0.25;
+  private sketchAngle = true;
+  private sketchArmed = false;
+
+  /** Where the mock's next corner would land: along the rectangle, then back onto the first corner. */
+  private sketchCursor(): [number, number, number] {
+    return this.sketchPoints.length >= this.sketchPath.length
+      ? this.sketchPath[0]
+      : this.sketchPath[this.sketchPoints.length];
+  }
+
+  private sketchRead(message?: string): GroundSketchState {
+    const pts = this.sketchPoints;
+    const cursor = this.sketchArmed ? this.sketchCursor() : null;
+    const closes = this.sketchArmed && pts.length >= 3 && cursor !== null
+      && Math.hypot(cursor[0] - pts[0][0], cursor[2] - pts[0][2]) < 1e-6;
+    const xs = pts.map((q) => q[0]);
+    const zs = pts.map((q) => q[2]);
+    const widthM = pts.length ? Math.max(...xs) - Math.min(...xs) : 0;
+    const depthM = pts.length ? Math.max(...zs) - Math.min(...zs) : 0;
+    let perimeterM = 0;
+    for (let i = 1; i < pts.length; i++) perimeterM += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][2] - pts[i - 1][2]);
+    let areaM2 = 0;
+    if (pts.length >= 3) {
+      perimeterM += Math.hypot(pts[pts.length - 1][0] - pts[0][0], pts[pts.length - 1][2] - pts[0][2]);
+      let twice = 0;
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i];
+        const b = pts[(i + 1) % pts.length];
+        twice += a[0] * b[2] - b[0] * a[2];
+      }
+      areaM2 = Math.abs(twice) * 0.5;
+    }
+    const canBuild = pts.length >= 3 && areaM2 > 1e-4;
+    const why =
+      pts.length === 0 ? "nothing is drawn yet — click on the ground to place the first corner"
+      : pts.length === 1 ? "one corner is a point, not a shape — place at least two more"
+      : pts.length === 2 ? "two corners are a line, not a shape — place at least one more"
+      : !canBuild ? "the corners are all on one line, so the outline encloses nothing"
+      : null;
+    return {
+      active: this.sketchArmed,
+      points: pts.map((q) => [...q] as [number, number, number]),
+      cursor: cursor === null ? null : ([...cursor] as [number, number, number]),
+      snap: cursor === null ? "" : closes ? "closes the shape" : this.sketchGridM > 0 ? "grid" : "free",
+      closes,
+      closed: this.sketchClosed,
+      segmentM: pts.length && cursor ? Math.hypot(cursor[0] - pts[pts.length - 1][0], cursor[2] - pts[pts.length - 1][2]) : 0,
+      perimeterM,
+      areaM2,
+      widthM,
+      depthM,
+      planeY: 0,
+      gridM: this.sketchGridM,
+      angleSnap: this.sketchAngle,
+      canBuild,
+      message:
+        message ??
+        (this.sketchClosed && canBuild
+          ? `Outline closed — ${widthM.toFixed(2)} × ${depthM.toFixed(2)} m, ${areaM2.toFixed(1)} m². Set a height and raise it.`
+          : why ??
+            `${pts.length} corners · ${widthM.toFixed(2)} × ${depthM.toFixed(2)} m · ${areaM2.toFixed(1)} m² — click the first corner again to finish, or raise it now`),
+    };
+  }
+
+  sketchTool(on: boolean, gridM?: number, angleSnap?: boolean): Promise<GroundSketchState> {
+    this.sketchArmed = on;
+    if (gridM !== undefined && gridM !== null) this.sketchGridM = gridM <= 0 ? 0 : gridM;
+    if (angleSnap !== undefined && angleSnap !== null) this.sketchAngle = angleSnap;
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchPoint(): Promise<GroundSketchState> {
+    if (!this.sketchArmed) return Promise.resolve(this.sketchRead());
+    const read = this.sketchRead();
+    if (read.closes) {
+      this.sketchClosed = true;
+      return Promise.resolve(this.sketchRead());
+    }
+    if (this.sketchClosed) {
+      return Promise.resolve(this.sketchRead("this outline is finished — raise it, or undo the last corner to keep drawing"));
+    }
+    this.sketchPoints.push(this.sketchCursor());
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchPointExact(lengthM: number): Promise<GroundSketchState> {
+    if (!this.sketchArmed || this.sketchClosed || this.sketchPoints.length === 0 || !(lengthM > 0)) {
+      return Promise.resolve(this.sketchRead(
+        this.sketchPoints.length === 0
+          ? "place the first corner by clicking, then a typed length measures from it"
+          : "aim at the ground and give a length greater than zero",
+      ));
+    }
+    const last = this.sketchPoints[this.sketchPoints.length - 1];
+    const c = this.sketchCursor();
+    const dx = c[0] - last[0];
+    const dz = c[2] - last[2];
+    const len = Math.hypot(dx, dz) || 1;
+    this.sketchPoints.push([last[0] + (dx / len) * lengthM, last[1], last[2] + (dz / len) * lengthM]);
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchUndo(): Promise<GroundSketchState> {
+    if (this.sketchClosed) this.sketchClosed = false;
+    else this.sketchPoints.pop();
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchClear(): Promise<GroundSketchState> {
+    this.sketchPoints = [];
+    this.sketchClosed = false;
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchState(): Promise<GroundSketchState> {
+    return Promise.resolve(this.sketchRead());
+  }
+  sketchCommit(height: number, taper?: number): Promise<ShapeReply> {
+    const read = this.sketchRead();
+    if (!read.canBuild) return Promise.resolve(shapeRefusal(read.message));
+    const cx = (Math.min(...this.sketchPoints.map((q) => q[0])) + Math.max(...this.sketchPoints.map((q) => q[0]))) / 2;
+    const cz = (Math.min(...this.sketchPoints.map((q) => q[2])) + Math.max(...this.sketchPoints.map((q) => q[2]))) / 2;
+    const profile = this.sketchPoints.map((q) => [q[0] - cx, q[2] - cz] as [number, number]);
+    const triangles = profile.length * 4;
+    const id = this.place("Drawn shape", {
+      Transform: { x: cx, y: this.sketchPoints[0][1], z: cz, scale: 1 },
+      MeshRenderer: { mesh: "mtkasset:mock-shape-extrude" },
+      ShapeRecipe: {
+        source: JSON.stringify({ v: 1, kind: "extrude", params: { height, taper: taper ?? 1 }, profile }),
+        version: 1,
+        kind: "extrude",
+        triangles,
+      },
+    });
+    this.sketchPoints = [];
+    this.sketchClosed = false;
+    return Promise.resolve({ created: id, handle: "mtkasset:mock-shape-extrude", triangles, ms: 3, message: `Raised your drawing into a solid · ${triangles} triangles`, reason: null });
+  }
+
   shapeCombine(a: string, b: string, op: "union" | "carve" | "intersect"): Promise<ShapeReply> {
     if (a === b) return Promise.resolve(shapeRefusal("pick two different objects"));
     if (!this.core.entity(a) || !this.core.entity(b)) return Promise.resolve(shapeRefusal("one of the two objects is no longer in the scene"));
@@ -2717,7 +3208,7 @@ class MockClient implements EditorClient {
     return Promise.resolve();
   }
   formatCatalog(): Promise<FormatSpec[]> {
-    return Promise.resolve([]);
+    return Promise.resolve(MOCK_FORMATS.map((spec) => ({ ...spec, carries: { ...spec.carries } })));
   }
   colourStatus(): Promise<ColourStatus> {
     return Promise.resolve({
@@ -2775,7 +3266,7 @@ class MockClient implements EditorClient {
     return Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 });
   }
   cameraProbe(): Promise<CameraProbe> {
-    return Promise.resolve({ eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 45, cinematic: false, distance: 0 });
+    return Promise.resolve({ eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 45, cinematic: false, distance: 0, frame: [0, 0, 1, 1] as [number, number, number, number], visibleRect: [0, 0, 1, 1] as [number, number, number, number] });
   }
   vfxCatalog(): Promise<EffectSpec[]> {
     return Promise.resolve([]);
@@ -2793,16 +3284,77 @@ class MockClient implements EditorClient {
     return Promise.resolve([]);
   }
   cinemaAddShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaRemoveShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetMood(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetDelivery(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaList(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: null });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: null });
+  }
+  /** Empty, like every other cinematics reply here. The vocabulary lives in ONE place — the Rust
+   *  catalogue that also validates it — and a copy of it in this file would be the same
+   *  one-contract-stated-twice the catalogue exists to remove. The dev build refuses every cinematics
+   *  command anyway, so there is no inspector here for the options to fill. */
+  cinemaFramingCatalog(): Promise<FramingCatalog> {
+    return Promise.resolve({ sizes: [], angles: [], motions: [], minSeconds: 0.2, maxSeconds: 20, maxShots: 12, stillMotions: [], deliveries: [] });
+  }
+  cinemaSetShotSeconds(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaMoveShot(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetShotFraming(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetShotSubject(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  /** An EMPTY list, not an invented one. The picker's whole value is the two facts only the native
+   *  scene can answer — what each object is called and how many drawn parts are under it — and a
+   *  browser stub offering plausible rows would be a picker that aims shots at nothing. */
+  cinemaSubjectCatalog(id: string): Promise<SubjectCatalog> {
+    return Promise.resolve({ owner: id, ownerName: "", current: null, candidates: [], query: "", matches: 0, truncated: false });
+  }
+  /** Empty for the same reason: there is no native scene to have clicked on. */
+  cinemaSubjectChain(id: string): Promise<SubjectCatalog> {
+    return Promise.resolve({ owner: id, ownerName: "", current: null, candidates: [], query: "", matches: 0, truncated: false });
+  }
+  /** Refused rather than faked. A preview's whole content is a camera pose solved against real mesh
+   *  bounds in the native scene; a browser-shell stub could only invent three numbers, and a picture
+   *  of a shot nothing filmed is worse than the refusal that says where to get one. */
+  cinemaPreview(): Promise<CinemaPreviewReply> {
+    return Promise.resolve({ active: false, entity: null, seconds: 0, shotIndex: null, shots: 0, reads: "", subjectName: "", progress: 0, blending: false, eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 50, message: "", reason: "Shot preview is available in the packaged desktop editor." });
+  }
+  /** Refused, for the same reason the preview is: a render reads back the native wgpu swapchain, and
+   *  there is no swapchain in a browser tab. The dialog still opens, still counts the frames the cut
+   *  would produce and still names the frame it is composed for — every one of which is arithmetic
+   *  over the document — so what the browser build cannot do is exactly the one step that writes. */
+  /** Refused, like every other cinematics call here — and deliberately NOT re-implemented. The frame
+   *  count is `plan_render`'s answer, stated once, in Rust; a browser copy of that multiplication is
+   *  exactly the one-contract-twice this command exists to remove. The dev build has no cutscene to
+   *  plan a render of anyway: `cinemaList` above answers with an empty cut. */
+  cinemaRenderPlan(id: string, fps: number): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, entity: id, fps, reason: "Rendering to files is available in the packaged desktop editor.", message: "Rendering to files is available in the packaged desktop editor." });
+  }
+  cinemaRenderStart(id: string, fps: number, _shot: number | null, stem: string): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, entity: id, fps, stem, reason: "Rendering to files is available in the packaged desktop editor.", message: "Rendering to files is available in the packaged desktop editor." });
+  }
+  cinemaRenderStatus(): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, message: "No render is running." });
+  }
+  cinemaRenderCancel(): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, message: "No render is running." });
+  }
+  viewportCapture(): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, reason: "Saving a frame is available in the packaged desktop editor.", message: "Saving a frame is available in the packaged desktop editor." });
   }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return Promise.resolve([]);
@@ -2837,7 +3389,7 @@ class MockClient implements EditorClient {
   assetLabExport(id: string): Promise<AssetLabResponse> {
     return this.assetLabAudit(id);
   }
-  sceneExport(format: "glb" | "usda" | "step"): Promise<SceneExportResponse> {
+  sceneExport(format: SceneExportFormat): Promise<SceneExportResponse> {
     return Promise.resolve({
       ok: false,
       message: "Complete-scene export is available in the packaged desktop editor.",
@@ -2862,10 +3414,39 @@ class MockClient implements EditorClient {
   ungroupEntity(): Promise<boolean> {
     return Promise.resolve(true);
   }
-  multiEdit(): Promise<boolean> {
-    return Promise.resolve(true);
+  multiEdit(ids: string[]): Promise<MultiEditResult> {
+    return Promise.resolve({ ok: true, changed: ids.length, reason: null });
+  }
+  /** UNLIKE the scene-authoring stubs around it, this one really writes. `set_rotation` is the only
+   *  path a rotation can be typed through, so an inert stub would leave the dev build (and every
+   *  `shots` scene over it) unable to demonstrate the one gesture ADR-172 exists for. It pushes the
+   *  four fields down the SAME `MockCore.push` delta path the real core's re-projection uses, so the
+   *  Inspector's degree rows resolve from the committed quaternion exactly as they do under Tauri.
+   *  The engine's normalisation is mirrored here for the same reason it exists there: a projection
+   *  the panel reads back must be a rotation. */
+  setRotation(ids: string[], quat: [number, number, number, number]): Promise<MultiEditResult> {
+    const length = Math.hypot(...quat);
+    if (!Number.isFinite(length) || length < 1e-9) {
+      return Promise.resolve({
+        ok: false,
+        changed: 0,
+        reason: "those four numbers are not a rotation (a quaternion must be finite and non-zero)",
+      });
+    }
+    const unit = quat.map((c) => c / length);
+    const ops: ProjectionOp[] = [];
+    for (const id of ids) {
+      (["qx", "qy", "qz", "qw"] as const).forEach((field, i) => {
+        ops.push({ op: "setField", id, component: "Transform", field, value: unit[i] });
+      });
+    }
+    this.core.push(ops);
+    return Promise.resolve({ ok: true, changed: ids.length, reason: null });
   }
   deleteDeactivate(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+  deleteDeactivateMany(): Promise<boolean> {
     return Promise.resolve(true);
   }
   copySubtree(): void {}
@@ -2965,6 +3546,12 @@ class MockClient implements EditorClient {
   // The dev MockCore has no native viewport — these are inert (the real wgpu input is Tauri-only).
   viewportPick(_x: number, _y: number): Promise<string | null> {
     return Promise.resolve(null);
+  }
+  viewportPeek(_x: number, _y: number): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  viewportHover(_ids: string[]): Promise<number> {
+    return Promise.resolve(0);
   }
   dragStart(): void {}
   dragEnd(): void {}
@@ -3075,8 +3662,14 @@ class MockClient implements EditorClient {
   importAsset(): Promise<string | null> {
     return Promise.resolve(null);
   }
-  importAssetDialog(): Promise<string | null> {
-    return Promise.resolve(null);
+  importAssetDialog(): Promise<ImportDialogResponse> {
+    return Promise.resolve({
+      entityId: null,
+      outcome: "failed",
+      // The dev MockCore has no native dialog and no MAGIC router. It says so, rather than replying
+      // "cancelled" — which would be a surface reporting a user gesture that never happened.
+      message: "Importing a file needs the packaged desktop editor — the native file dialog and the format readers are not in the browser build.",
+    });
   }
 
   // The dev MockCore has no real document; track a plausible in-memory project so the File menu renders.
@@ -3346,11 +3939,45 @@ class MockClient implements EditorClient {
   matchCooked(): Promise<CookedMatch | null> {
     return Promise.resolve(null);
   }
+  /** The SIX presets the engine publishes, in `terrain/src/preset.rs::all()`'s order and its words.
+   *
+   *  It answered with three, each carrying a shortened description, and every dev session and every
+   *  screenshot of this panel therefore photographed a catalogue the product does not have — half of
+   *  it missing and the rest paraphrased. That is the C6 failure reached through a mock: a grid that
+   *  looks balanced at three tiles and wraps at six, and prose reviewed here that no user ever reads.
+   *  The mock's job is to mirror what the engine sends, not to stand in for it. */
   terrainPresets(): Promise<TerrainPreset[]> {
     return Promise.resolve([
-      { id: "flat", name: "Flat Ground", description: "A level plate with one material." },
-      { id: "rolling-hills", name: "Rolling Hills", description: "Gentle warped hills." },
-      { id: "alpine", name: "Alpine Peaks", description: "Eroded ridged mountains." },
+      {
+        id: "flat",
+        name: "Flat Ground",
+        description: "A level plate with one material — the fastest thing to sculpt on, and the cheapest to render.",
+      },
+      {
+        id: "rolling-hills",
+        name: "Rolling Hills",
+        description: "Gentle warped hills with grass, dry slopes and rock, plus scattered trees and clutter.",
+      },
+      {
+        id: "alpine",
+        name: "Alpine Peaks",
+        description: "Eroded ridged mountains with scree, exposed rock and a snow line. The heaviest preset.",
+      },
+      {
+        id: "dunes",
+        name: "Desert Dunes",
+        description: "Billowed dune fields over a broad basin, with rock outcrops where the sand thins.",
+      },
+      {
+        id: "archipelago",
+        name: "Archipelago",
+        description: "Islands in a shallow sea with beaches and lagoons — flattened lowlands, steep interiors.",
+      },
+      {
+        id: "canyon",
+        name: "Canyon Mesa",
+        description: "A high plateau cut by terraced canyons, eroded so the benches read as sedimentary.",
+      },
     ]);
   }
 
