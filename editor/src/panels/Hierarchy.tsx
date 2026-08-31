@@ -79,7 +79,7 @@ const Row = memo(function Row({
   position: number;
   setSize: number;
   client: EditorClient;
-  onContextMenu?: (id: string, x: number, y: number) => void;
+  onContextMenu?: (ids: string[], x: number, y: number) => void;
 }) {
   const s = useSummary(id);
   const primary = useSelectedId() === id;
@@ -130,11 +130,24 @@ const Row = memo(function Row({
       onClick={click}
       onContextMenu={(e) => {
         // Right-click an entity in the LIST opens the same registry-driven context menu the viewport offers.
+        //
+        // RIGHT-CLICKING A SELECTED ROW MUST NOT DESTROY THE SELECTION. This called `select(id)`
+        // unconditionally: ctrl-click forty rows, right-click one of them, and the other thirty-nine
+        // were gone before the menu had opened — over a set the user had just spent forty gestures
+        // building. Every direct-manipulation surface a person has used (a file manager, Blender,
+        // Unity, Figma) draws the same line: a member of the selection acts on the selection; a
+        // NON-member replaces it, because right-clicking somewhere else is a statement about where
+        // you are pointing.
         if (!onContextMenu) return;
         e.preventDefault();
-        projectionStore.getState().select(id);
-        void client.gizmoSelect(id).catch(() => {});
-        onContextMenu(id, e.clientX, e.clientY);
+        const st = projectionStore.getState();
+        const ids = st.multiSelect.includes(id)
+          ? st.multiSelect
+          : (st.select(id), projectionStore.getState().multiSelect);
+        // The whole set goes to the engine, for the same reason the left-click handler above sends it:
+        // a list that highlights forty and a stage that outlines one are two selections.
+        void client.selectEntities(ids.length ? ids : [id]).catch(() => {});
+        onContextMenu(ids.length ? ids : [id], e.clientX, e.clientY);
       }}
       onDragStart={(e) => {
         e.dataTransfer.setData(DRAG_MIME, id);
@@ -207,7 +220,7 @@ export function Hierarchy({
   onContextMenu,
 }: {
   client: EditorClient;
-  onContextMenu?: (id: string, x: number, y: number) => void;
+  onContextMenu?: (ids: string[], x: number, y: number) => void;
 }) {
   const order = useEntityOrder();
   const selectedId = useSelectedId();

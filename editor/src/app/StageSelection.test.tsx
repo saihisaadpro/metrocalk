@@ -28,6 +28,8 @@ interface Spies {
   /** The seam every selection made AWAY from the stage goes through. Watched, not replaced: what
    *  matters is that the engine is told the WHOLE set, which is the half the front end owns. */
   select: ReturnType<typeof vi.fn>;
+  /** The one batched delete all three routes go through (ADR-183). */
+  del: ReturnType<typeof vi.fn>;
 }
 const sessions: Spies[] = [];
 
@@ -42,12 +44,14 @@ vi.mock("../transport/session", async (importOriginal) => {
       const selectionIds = vi.fn(() => Promise.resolve(["a", "b"]));
       const undo = vi.fn(() => Promise.resolve(true));
       const select = vi.fn(client.selectEntities.bind(client));
+      const del = vi.fn(client.deleteDeactivateMany.bind(client));
       client.selectEntities = select as unknown as typeof client.selectEntities;
+      client.deleteDeactivateMany = del as unknown as typeof client.deleteDeactivateMany;
       client.undo = undo as unknown as typeof client.undo;
       client.viewportPick = pick as unknown as typeof client.viewportPick;
       client.viewportPickRegion = region as unknown as typeof client.viewportPickRegion;
       client.selectionIds = selectionIds as unknown as typeof client.selectionIds;
-      sessions.push({ pick, region, selectionIds, undo, select });
+      sessions.push({ pick, region, selectionIds, undo, select, del });
       return client;
     },
   };
@@ -386,5 +390,53 @@ describe("selecting without a gesture", () => {
 
     expect(projectionStore.getState().multiSelect).toEqual(["beam"]);
     expect(status()).toContain("inverted");
+  });
+});
+
+describe("the key every editor binds", () => {
+  // ONE MOUNT for all three assertions, for the reason the block above states in full: this file
+  // renders the whole shell per case, and six of them turned a green suite into one where unrelated
+  // files timed out.
+  it("Delete removes the WHOLE selection in one transaction — but inside a text field it belongs to the field", async () => {
+    render(<App />);
+    await waitFor(() => expect(projectionStore.getState().order.length).toBeGreaterThan(0));
+    act(() => {
+      projectionStore.getState().bulkLoad([
+        { id: "d1", name: "Bolt", parentId: null, components: {} },
+        { id: "d2", name: "Bolt", parentId: null, components: {} },
+        { id: "d3", name: "Beam", parentId: null, components: {} },
+      ]);
+      projectionStore.getState().setSelection(["d1", "d2"]);
+    });
+
+    // (a) A text field owns Delete over its own characters. Same line Ctrl+A and Ctrl-Z draw.
+    const field = document.createElement("input");
+    document.body.appendChild(field);
+    await act(async () => {
+      fireEvent.keyDown(field, { key: "Delete" });
+    });
+    expect(spies().del).not.toHaveBeenCalled();
+    field.remove();
+
+    // (b) Everywhere else it is the scene's, and it takes the whole selection — not the primary.
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: "Delete" });
+    });
+    expect(spies().del).toHaveBeenCalledTimes(1);
+    expect(spies().del).toHaveBeenCalledWith(["d1", "d2"]);
+    await waitFor(() => expect(status()).toBe("deleted 2 objects — recoverable with Ctrl-Z"));
+
+    // (c) Both halves of the selection are cleared: the store the inspector reads AND the engine the
+    //     picture is outlined from. A store-only clear leaves the renderer outlining what is gone.
+    expect(projectionStore.getState().multiSelect).toEqual([]);
+    expect(spies().select).toHaveBeenLastCalledWith([]);
+    expect(projectionStore.getState().deactivated.d1).toBe(true);
+
+    // (d) With nothing selected the key is silent rather than refusing loudly — there is no gesture
+    //     to explain, and a toast per stray keypress is noise.
+    await act(async () => {
+      fireEvent.keyDown(document.body, { key: "Delete" });
+    });
+    expect(spies().del).toHaveBeenCalledTimes(1);
   });
 });

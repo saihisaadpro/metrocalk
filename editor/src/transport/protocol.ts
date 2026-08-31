@@ -154,15 +154,31 @@ export interface GenerateResponse {
  *  authoritative on the shell; this is only the legible estimate the Generate button shows up-front. */
 export const GENERATE_COST = 10;
 
-/** `entity_actions(id)` — one context-menu action's availability (M3.3). `action` is the lowercase tag
- *  ("bind"|"remove"|"duplicate"|"focus"|"inspect"|"makedynamic"); when `!available`, `reason` explains why
- *  (every "no" explained, ADR-016); `mutates` ⇒ it's an undoable transaction. */
+/** `entity_actions_selection(ids)` — one context-menu action's availability (M3.3). `action` is the
+ *  lowercase tag ("bind"|"remove"|"duplicate"|"focus"|"inspect"|"makedynamic"); when `!available`,
+ *  `reason` explains why (every "no" explained, ADR-016); `mutates` ⇒ it's an undoable transaction.
+ *
+ *  `appliesTo` is how many of the SELECTED objects the verb acts on (ADR-183), and it is `0` exactly
+ *  when `available` is false. A row over 378 selected bolts that does not say its scope is the same
+ *  lie the authoring toolbar's `Delete` told while its trigger read `Actions · 14`. */
 export interface ActionItem {
   action: string;
   label: string;
   available: boolean;
   reason?: string;
   mutates: boolean;
+  appliesTo: number;
+}
+
+/** The action model's answer about a whole selection (ADR-183).
+ *
+ *  `count` is how many of the ids asked about are live — what every `appliesTo` is measured against —
+ *  and `missing` is how many have gone (a stale right-click after a Remove/Undo race). The two are
+ *  separate because a person can act on the first and only be told about the second. */
+export interface SelectionActions {
+  count: number;
+  missing: number;
+  items: ActionItem[];
 }
 
 /** `entity_details(id)` — the hover tooltip read (M3.3): name + component names + provided/required caps

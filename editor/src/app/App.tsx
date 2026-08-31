@@ -42,6 +42,7 @@ import { normalizeSurfacePoint } from "./viewportCoordinates";
 import { isMarqueeDrag, marqueeBox, marqueeMode, marqueeResult } from "./marquee";
 import { StageMarquee } from "./StageMarquee";
 import { selectionSentence, entityLabel } from "../store/selectionText";
+import { deleteSelection } from "./deleteSelection";
 import { selectAllWith, selectionCommands } from "./selectionCommands";
 
 // WHAT MAY BE DEFERRED, AND WHY THE LIST IS SHORT. A chunk that loads on demand is absent until the
@@ -156,7 +157,9 @@ export function App() {
   usePlayerDrive(client); // arrows / WASD move the Player role while Play runs
   const native = isTauri(); // inside the packaged .exe the viewport is the real wgpu region (composite)
   // The M3.3 right-click context menu, opened for an entity at a cursor position.
-  const [ctx, setCtx] = useState<{ id: string; x: number; y: number } | null>(null);
+  // The right-click menu acts on the SELECTION (ADR-183), so what is stored here is the set, not the
+  // one id under the cursor. The primary is the last element, matching the projection store.
+  const [ctx, setCtx] = useState<{ ids: string[]; x: number; y: number } | null>(null);
   // M3.3 focus mode — the framed entity + its camera distance (read from `focus_debug`); drives the banner.
   const [focused, setFocused] = useState<{ id: string; dist: number } | null>(null);
   // Tracks a right-press for the orbit-vs-context-menu movement threshold (the scaffold's disambiguation).
@@ -449,6 +452,24 @@ export function App() {
         selectAll();
         return;
       }
+      // **DELETE / BACKSPACE — the most-pressed key in any editor, and it was not bound at all**
+      // (ADR-183). The only two routes to deleting anything were a row inside a popup menu in the left
+      // dock and a right-click row that destroyed one object; a person who selected 378 bolts and
+      // pressed Delete got silence. Guarded on `editingText` rather than the wider `editing`, for the
+      // same reason Ctrl-Z is: a text field owns Delete over its own characters, and nothing else does
+      // — including a focused BUTTON, which is exactly where focus lands after the Actions menu runs.
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (editingText) return;
+        if (playing || pipeActive) return;
+        const ids = projectionStore.getState().multiSelect;
+        if (!ids.length) return;
+        e.preventDefault();
+        void deleteSelection(client, ids).then((outcome) => {
+          setStatus(outcome.sentence);
+          pushToast(outcome.ok ? outcome.sentence : "couldn't delete the selection", outcome.ok ? "info" : "error");
+        });
+        return;
+      }
       const redoGesture =
         (e.ctrlKey || e.metaKey) &&
         (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"));
@@ -657,8 +678,8 @@ export function App() {
         setDockFlyout(null);
       }}
       onImport={importAsset}
-      onContextMenu={(id, x, y) => {
-        if (!playing) setCtx({ id, x, y });
+      onContextMenu={(ids, x, y) => {
+        if (!playing) setCtx({ ids, x, y });
       }}
       onCollapse={!layout.collapsed && !leftDockCollapsed ? () => {
         setLeftDockCollapsed(true);
@@ -974,8 +995,11 @@ export function App() {
             const orbited = rightDrag.current?.moved;
             rightDrag.current = null;
             if (orbited) return;
-            const sel = projectionStore.getState().selectedId;
-            if (sel) setCtx({ id: sel, x: e.clientX, y: e.clientY });
+            // THE WHOLE SELECTION, not the primary. `selectedId` is one of what may be 378 outlined
+            // objects; a menu built from it offered `Delete` over a picture of 378 and removed one.
+            const { multiSelect, selectedId } = projectionStore.getState();
+            const sel = multiSelect.length ? multiSelect : selectedId ? [selectedId] : [];
+            if (sel.length) setCtx({ ids: sel, x: e.clientX, y: e.clientY });
           }}
           style={{
             position: "relative",
@@ -1215,7 +1239,7 @@ export function App() {
           <Popover open anchorPoint={{ x: ctx.x, y: ctx.y }} onClose={() => setCtx(null)}>
             <ContextMenu
               client={client}
-              id={ctx.id}
+              ids={ctx.ids}
               onClose={() => setCtx(null)}
               onFocus={(id, dist) => setFocused({ id, dist })}
             />

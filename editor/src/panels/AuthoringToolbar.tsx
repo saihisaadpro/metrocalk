@@ -5,6 +5,7 @@
 import { useRef, useState } from "react";
 import { projectionStore, useMultiSelect, useSelectedId } from "../store/projection";
 import { setStatus, setClipboard, useClipboardHasContent } from "../store/ui";
+import { deleteSelection } from "../app/deleteSelection";
 import { entityLabel } from "../store/selectionText";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
@@ -205,21 +206,17 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
                   "Delete",
                   async () => {
                     if (!ids.length) return;
-                    // THE WHOLE SELECTION, IN ONE TRANSACTION. This called `deleteDeactivate(primary)`
-                    // under a trigger that reads `Actions · 14` — it deleted one of the fourteen and
-                    // said "deactivated". The engine reports which ids actually went, so the rows that
-                    // dim are the rows that changed rather than the list we happened to send.
-                    const gone = await client.deleteDeactivateMany(ids);
-                    if (!gone.length) {
-                      setStatus("couldn't delete the selection");
-                      pushToast("couldn't delete the selection", "error");
-                      return;
-                    }
-                    projectionStore.getState().markDeactivated(gone);
-                    projectionStore.getState().setSelection([]);
-                    const what = gone.length === 1 ? entityLabel(gone[0]) : `${gone.length} objects`;
-                    setStatus(`deleted ${what} — recoverable with Ctrl-Z`);
-                    pushToast(`deleted ${what} · Ctrl-Z`, "info");
+                    // THE WHOLE SELECTION, IN ONE TRANSACTION — through `deleteSelection`, which is
+                    // also what the right-click menu and the Delete key call (ADR-183). This row, that
+                    // menu and that key are one request said three ways, and written three times they
+                    // drifted: this one deactivated the set, the menu destroyed one object, and the key
+                    // did not exist.
+                    const outcome = await deleteSelection(client, ids);
+                    setStatus(outcome.sentence);
+                    pushToast(
+                      outcome.ok ? `deleted ${outcome.gone.length === 1 ? entityLabel(outcome.gone[0]) : `${outcome.gone.length} objects`} · Ctrl-Z` : outcome.sentence,
+                      outcome.ok ? "info" : "error",
+                    );
                   },
                   close,
                   hasSelection,

@@ -94,3 +94,36 @@ test("empty hierarchy explains how to add the first object", () => {
   expect(screen.getByText("No objects in this scene")).toBeTruthy();
   expect(screen.getByText(/add an entity above/i)).toBeTruthy();
 });
+
+test("right-clicking a SELECTED row keeps the selection; right-clicking elsewhere replaces it", () => {
+  // THE DEFECT THIS PINS (ADR-183): this handler called `select(id)` unconditionally, so ctrl-clicking
+  // three rows and then right-clicking one of them threw the other two away before the menu had
+  // opened — over a set the user had just spent three gestures building. Every direct-manipulation
+  // surface a person has used draws the same line: a member of the selection acts on the selection, a
+  // non-member replaces it.
+  const selectEntities = vi.fn((ids: string[]) => Promise.resolve(ids));
+  const onContextMenu = vi.fn();
+  projectionStore.getState().bulkLoad([
+    { id: "a", name: "A", parentId: null, components: {} },
+    { id: "b", name: "B", parentId: null, components: {} },
+    { id: "c", name: "C", parentId: null, components: {} },
+  ]);
+  render(<Hierarchy client={fakeClient({ selectEntities })} onContextMenu={onContextMenu} />);
+  const rows = Object.fromEntries(screen.getAllByTestId("hrow").map((r) => [r.getAttribute("data-id"), r]));
+
+  fireEvent.click(rows.a!);
+  fireEvent.click(rows.b!, { ctrlKey: true });
+  expect(projectionStore.getState().multiSelect).toEqual(["a", "b"]);
+
+  // (a) a MEMBER: the set survives, and the menu is told the whole set — not the row under the cursor.
+  fireEvent.contextMenu(rows.a!, { clientX: 10, clientY: 20 });
+  expect(projectionStore.getState().multiSelect).toEqual(["a", "b"]);
+  expect(onContextMenu).toHaveBeenLastCalledWith(["a", "b"], 10, 20);
+  expect(selectEntities).toHaveBeenLastCalledWith(["a", "b"]);
+
+  // (b) a NON-member: pointing somewhere else IS a statement about where you are pointing.
+  fireEvent.contextMenu(rows.c!, { clientX: 30, clientY: 40 });
+  expect(projectionStore.getState().multiSelect).toEqual(["c"]);
+  expect(onContextMenu).toHaveBeenLastCalledWith(["c"], 30, 40);
+  expect(selectEntities).toHaveBeenLastCalledWith(["c"]);
+});

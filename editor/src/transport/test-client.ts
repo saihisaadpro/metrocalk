@@ -76,7 +76,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     generate: () => Promise.resolve({ created: "gen-1", cost: 10, available: true, seam: null, balance: 90 }),
     undo: vi.fn(() => Promise.resolve(false)),
     redo: vi.fn(() => Promise.resolve(false)),
-    entityActions: () => Promise.resolve([]),
+    entityActionsFor: (ids: string[]) => Promise.resolve({ count: ids.length, missing: 0, items: [] }),
     entityDetails: () => Promise.resolve(null),
     cadReport: () =>
       Promise.resolve({

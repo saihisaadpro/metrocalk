@@ -50,7 +50,7 @@ export type InspectorWorkspace = "properties" | "relations";
 export interface LeftDockProps {
   client: EditorClient;
   active: LeftWorkspace;
-  onContextMenu: (id: string, x: number, y: number) => void;
+  onContextMenu: (ids: string[], x: number, y: number) => void;
   onStartPipe: () => void;
   onImport: () => void;
   onCollapse?: () => void;

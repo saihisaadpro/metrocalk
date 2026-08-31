@@ -11,7 +11,7 @@ import { pushToast } from "../store/toasts";
 import type { ProjectInfo } from "../store/project";
 import type { PlayInfo } from "../store/play";
 import type {
-  ActionItem,
+  SelectionActions,
   AddResponse,
   AuthoredMatch,
   CatalogItem,
@@ -155,8 +155,10 @@ export interface EditorClient {
   undo(): Promise<boolean>;
   /** Reapply the most recently undone committed transaction. */
   redo(): Promise<boolean>;
-  /** The context-menu actions for an entity (M3.3) — each available-or-explained. */
-  entityActions(id: string): Promise<ActionItem[]>;
+  /** **The context-menu actions for the SELECTION** (M3.3 + ADR-183) — each available-or-explained,
+   *  each carrying the number of selected objects it acts on. Asked about the whole set because
+   *  right-click opens over the whole set; the single-object case is `[id]`. */
+  entityActionsFor(ids: string[]): Promise<SelectionActions>;
   /** The hover-tooltip details for an entity (M3.3) — name + components + caps + bound. */
   entityDetails(id: string): Promise<EntityDetails | null>;
   /** The per-part CAD import report (M15.7) — the fidelity breakdown + a capped part list, off the ECS. */
@@ -738,8 +740,8 @@ export class TauriClient implements EditorClient {
     });
   }
 
-  entityActions(id: string): Promise<ActionItem[]> {
-    return this.core.invoke<ActionItem[]>("entity_actions", { id }).catch((e: unknown) => { console.error("entity_actions failed", e); throw e; });
+  entityActionsFor(ids: string[]): Promise<SelectionActions> {
+    return this.core.invoke<SelectionActions>("entity_actions_selection", { ids }).catch((e: unknown) => { console.error("entity_actions_selection failed", e); throw e; });
   }
   cadReimportReport(): Promise<ReimportReport> {
     return this.core.invoke<ReimportReport>("cad_reimport_report").catch((e: unknown) => { console.error("cad_reimport_report failed", e); throw e; });
@@ -1830,16 +1832,45 @@ class MockClient implements EditorClient {
   redo(): Promise<boolean> {
     return Promise.resolve(false);
   }
-  entityActions(id: string): Promise<ActionItem[]> {
-    const e = projectionStore.getState().displayed[id];
-    const canBind = !!e?.components.HealthBar; // a requirer (HealthBar) has an unmet requirement to bind
-    return Promise.resolve([
-      { action: "bind", label: "Bind…", available: canBind, reason: canBind ? undefined : "no unmet requirement to bind", mutates: false },
-      { action: "remove", label: "Remove", available: true, mutates: true },
-      { action: "duplicate", label: "Duplicate", available: true, mutates: true },
-      { action: "focus", label: "Focus", available: true, mutates: false },
-      { action: "inspect", label: "Inspect", available: true, mutates: false },
-    ]);
+  entityActionsFor(ids: string[]): Promise<SelectionActions> {
+    // The dev mock answers with the SAME scope policy the shell's `actions_for_selection` states, so a
+    // menu that looks right here is not a menu that agrees with a fixture. Bind… and Duplicate are
+    // primary-only (the last id); Remove/Focus/Inspect take the whole set; Make dynamic takes the
+    // members that draw a mesh and have no body yet.
+    const displayed = projectionStore.getState().displayed;
+    const live = ids.filter((id, i) => ids.indexOf(id) === i && !!displayed[id]);
+    const count = live.length;
+    const primary = live[live.length - 1];
+    const canBind = !!displayed[primary]?.components.HealthBar; // a requirer with an unmet requirement
+    const dynamicReady = live.filter(
+      (id) => !!displayed[id]?.components.MeshRenderer && !displayed[id]?.components.RigidBody,
+    ).length;
+    const item = (action: string, label: string, appliesTo: number, mutates: boolean, reason?: string) => ({
+      action,
+      label,
+      available: appliesTo > 0,
+      reason: appliesTo > 0 ? undefined : reason,
+      mutates,
+      appliesTo,
+    });
+    return Promise.resolve({
+      count,
+      missing: ids.length - count,
+      items: [
+        item("bind", "Bind…", count && canBind ? 1 : 0, false, "no unmet requirement to bind"),
+        item("remove", "Delete", count, true, "nothing is selected"),
+        item("duplicate", "Duplicate", count ? 1 : 0, true, "nothing is selected"),
+        item("focus", "Focus", count, false, "nothing is selected"),
+        item("inspect", "Inspect", count, false, "nothing is selected"),
+        item(
+          "makedynamic",
+          "Make dynamic",
+          dynamicReady,
+          true,
+          count ? "only a mesh model can be made dynamic" : "nothing is selected",
+        ),
+      ],
+    });
   }
   entityDetails(id: string): Promise<EntityDetails | null> {
     const e = projectionStore.getState().displayed[id];
