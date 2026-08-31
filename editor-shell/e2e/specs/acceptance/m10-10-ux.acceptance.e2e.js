@@ -23,9 +23,12 @@ import { browser, $, $$, expect } from "@wdio/globals";
 import { invoke, consoleErrors, clearConsole, ipcPerFrame } from "../../lib/acceptance.js";
 
 const text = (sel) => $(sel).then((e) => e.getText());
+const attr = (sel, name) => $(sel).then((e) => e.getAttribute(name));
+// The STRUCTURED count, not the panel's prose: `#count` publishes `data-entities` precisely so a
+// correction to user-facing copy is not a blind edit to a local-only suite.
 const countEntities = async () => {
-  const m = (await text("#count")).match(/(\d+)\s+entities/);
-  return m ? Number(m[1]) : NaN;
+  const raw = await attr("#count", "data-entities");
+  return raw == null ? NaN : Number(raw);
 };
 
 // React is the production UI now (the vanilla scaffold is retired), so this always runs. Kept as a named
@@ -34,7 +37,7 @@ const reactOnly = describe;
 
 reactOnly("acceptance / M10.10 editor UX hardening + viewport closeout (live, React UI on the .exe)", () => {
   before(async () => {
-    await browser.waitUntil(async () => /\d+ entities/.test(await text("#count")), {
+    await browser.waitUntil(async () => Number.isFinite(await countEntities()), {
       timeout: 60000,
       timeoutMsg: "the React editor never connected to /core (#count empty)",
     });

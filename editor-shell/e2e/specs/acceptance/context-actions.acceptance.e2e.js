@@ -23,12 +23,9 @@ import {
 const ui = page();
 const baseline = loadBaseline();
 
-// The projection entity-count, read from the page-object's #count ("N entities") — a STABLE structured
-// signal for "the world grew/shrank", not cosmetic copy. (store.size is mirrored into #count on every delta.)
-const entityCount = async () => {
-  const m = (await ui.count()).match(/(\d+)\s+entities/);
-  return m ? Number(m[1]) : NaN;
-};
+// The projection entity-count, off `#count`'s `data-entities` — a STABLE structured signal for "the
+// world grew/shrank", not cosmetic copy. (store.size is mirrored into the attribute on every delta.)
+const entityCount = () => ui.entityCount();
 
 // Open the context menu on the centre entity and wait until it's actually populated (≥1 ctxitem). The
 // menu is fed by viewport_peek → entity_actions, so a populated menu == a real target was found.

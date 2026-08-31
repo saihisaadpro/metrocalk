@@ -11,8 +11,8 @@ import { page } from "../../pages/scaffold.js";
 
 const ui = page();
 const countEntities = async () => {
-  const m = (await $("#count").getText()).match(/(\d+)\s+entities/);
-  return m ? Number(m[1]) : NaN;
+  const raw = await $("#count").getAttribute("data-entities");
+  return raw == null ? NaN : Number(raw);
 };
 
 describe("acceptance / M11.3 — lighting: an authored directional light is the shadow caster (live)", () => {
