@@ -14,6 +14,7 @@ import { projectionStore, useDisplayedEntity, useEntityOrder, useSelectedId } fr
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { cinemaPreviewStore, useCinemaPreview } from "../store/cinemaPreview";
+import { frameGuideStore, useFrameGuide } from "../store/frameGuide";
 import { subjectAimStore, useSubjectAim, type AimRung } from "../store/subjectAim";
 import { highlightKey, stageHighlightStore, useStageHighlight } from "../store/stageHighlight";
 import { setStatus } from "../store/ui";
@@ -214,6 +215,55 @@ function PreviewBadge({
   );
 }
 
+/** ADR-193 — the "⬚ FRAME GUIDE" badge, on the stage while the stage is the shape of the film.
+ *
+ *  The same rule the other two badges exist for: a mode that changes what the viewport MEANS has to
+ *  say so where the user is looking, and the way out has to be one click from there. A guide is
+ *  MORE exposed to that failure than a preview, not less — the picture is the author's own camera,
+ *  it moves when they orbit, and the only thing that has changed is that two thirds of the stage went
+ *  dim. Without this, the one control that turns it off lives in the bottom dock, which the author
+ *  may have closed; with it, "letterboxed with no way out" is unreachable rather than avoided.
+ *
+ *  Bottom-centre, unlike Play and Preview: a letterbox guide's own bar is the natural place for it,
+ *  and it must not fight the preview badge for the top of the stage. */
+function FrameGuideBadge({ label, onHide }: { label: string; onHide: () => void }) {
+  return (
+    <div
+      id="frameGuideBadge"
+      data-testid="frameGuideBadge"
+      // No `stopPropagation`: `stageInput.ts`'s `onStageSurface` decides once, for every overlay,
+      // whether an event belongs to the stage or to a control on it — see `PreviewBadge`.
+      style={{
+        position: "absolute",
+        bottom: space.lg,
+        left: "50%",
+        transform: "translateX(-50%)",
+        zIndex: z.badge,
+        display: "flex",
+        alignItems: "center",
+        gap: space.md,
+        padding: `${space.xs}px ${space.lg}px`,
+        borderRadius: radius.pill,
+        background: color.bg.raised,
+        border: `1px solid ${color.border.strong}`,
+        color: color.text.secondary,
+        font: font.mono,
+        fontSize: fontSize.meta,
+        boxShadow: elevation.e2,
+      }}
+    >
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 6, color: color.text.primary }}>
+        <Icon name="frame" size={12} />
+        FRAME GUIDE
+      </span>
+      <span data-testid="frameGuideBadgeFrame">{label}</span>
+      <Button data-testid="stageHideFrameGuide" variant="secondary" compact onClick={onHide}>
+        Hide
+      </Button>
+    </div>
+  );
+}
+
 function effectiveViewportWidth(): number {
   if (typeof window === "undefined" || typeof document === "undefined") return 1440;
   const cssZoom = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("zoom"));
@@ -227,6 +277,9 @@ export function App() {
   // Read here rather than inside the badge so the badge stays a pure presentation component that a
   // test can render with any state, including the ones the store cannot reach on its own.
   const cinemaPreview = useCinemaPreview();
+  // Read here, not inside the badge, for the reason the preview state is: the badge stays a pure
+  // presentation component a test can render with any state, including states the store cannot reach.
+  const frameGuide = useFrameGuide();
   // The M3.3 right-click context menu, opened for an entity at a cursor position.
   const [ctx, setCtx] = useState<{ id: string; x: number; y: number } | null>(null);
   // M3.3 focus mode — the framed entity + its camera distance (read from `focus_debug`); drives the banner.
@@ -1158,6 +1211,19 @@ export function App() {
                 const target = cinemaPreview.entity;
                 cinemaPreviewStore.getState().reset();
                 if (target) void client.cinemaPreview(target, 0, false);
+              }}
+            />
+          )}
+          {/* ADR-193 — the stage is drawing a delivery frame. `drawn` and not `wanted`: the preference
+              is the author's standing answer, this is what the stage is ACTUALLY showing, and a badge
+              driven by the preference would claim a guide on a stage with no cutscene selected. Never
+              while Play holds the camera — the guide is not drawn then either. */}
+          {!playing && frameGuide.drawn && (
+            <FrameGuideBadge
+              label={frameGuide.drawn.label}
+              onHide={() => {
+                frameGuideStore.getState().setWanted(false);
+                setStatus("Frame guide hidden — turn it back on beside the delivery frame in Cinematics");
               }}
             />
           )}

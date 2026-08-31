@@ -37,6 +37,10 @@ struct Camera {
     env_to_working: mat3x3<f32>,
     from_working: mat3x3<f32>,
     luma: vec4<f32>,
+    // ADR-193 - THE FRAME GUIDE, in framebuffer pixels: `[x0, y0, x1, y1]`. An empty rectangle
+    // (`z <= x`) means no guide. Declared HERE and in no other shader, because the guide is applied
+    // exactly once, in the one pass that writes the display.
+    guide: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 
@@ -172,6 +176,33 @@ fn dither(pos: vec2<f32>) -> f32 {
     return (m - 0.5) / 255.0;
 }
 
+// How much of the picture survives outside the frame guide. Low enough that the frame reads as the
+// frame at a glance, high enough that a part about to enter it is still legible - which is the entire
+// reason the guide dims instead of cropping.
+const GUIDE_DIM: f32 = 0.32;
+// The hairline on the frame's edge, in pixels, drawn just OUTSIDE it, and how far it lifts the dimmed
+// picture towards white. Two pixels rather than one so it survives a fractional-scaling display.
+const GUIDE_EDGE_PX: f32 = 2.0;
+const GUIDE_EDGE_LIFT: f32 = 0.55;
+
+// The frame guide, applied to a tone-mapped picture at framebuffer position `p`. Identity when the
+// guide rectangle is empty, which is every frame nobody is composing against a delivery frame.
+fn apply_frame_guide(mapped: vec3<f32>, p: vec2<f32>) -> vec3<f32> {
+    if (cam.guide.z <= cam.guide.x || cam.guide.w <= cam.guide.y) {
+        return mapped;
+    }
+    let inside = p.x >= cam.guide.x && p.y >= cam.guide.y && p.x < cam.guide.z && p.y < cam.guide.w;
+    if (inside) {
+        return mapped;
+    }
+    let on_edge = p.x >= cam.guide.x - GUIDE_EDGE_PX && p.x < cam.guide.z + GUIDE_EDGE_PX
+        && p.y >= cam.guide.y - GUIDE_EDGE_PX && p.y < cam.guide.w + GUIDE_EDGE_PX;
+    if (on_edge) {
+        return mix(mapped * GUIDE_DIM, vec3<f32>(1.0), GUIDE_EDGE_LIFT);
+    }
+    return mapped * GUIDE_DIM;
+}
+
 // THE final resolve. Every routing combination — SSAO on/off × bloom on/off, MSAA on/off, perspective or
 // orthographic — terminates here and nowhere else.
 @fragment
@@ -197,11 +228,24 @@ fn fs_resolve(in: VsOut) -> @location(0) vec4<f32> {
     } else {
         mapped = tonemap_aces(view_input);
     }
-    // 5. The display transfer function — but only when the swapchain is not doing it for us.
-    var display = mapped;
+    // 5. ADR-193 - THE FRAME GUIDE: what is OUTSIDE the frame the author is composing for.
+    //
+    // Applied to the tone-mapped picture and BEFORE the transfer function, so the dim is the same
+    // fraction of the same signal whichever kind of swapchain this build got - a guide that looked
+    // one way on a linear-store surface and another on an sRGB one would be a second thing to
+    // check every time either changes.
+    //
+    // A DIM AND NOT A CROP. `letterbox` cuts a delivery down to its frame because everything outside
+    // it is genuinely not in the film; a guide is the opposite gesture - the author is still flying
+    // the camera, and what is about to walk into the frame is exactly what they need to see. The
+    // hairline sits OUTSIDE the rectangle, never on its edge pixels, so the region a capture keeps
+    // is bit-for-bit the region it would have kept with no guide at all.
+    let mapped_guided = apply_frame_guide(mapped, in.pos.xy);
+    // 6. The display transfer function - but only when the swapchain is not doing it for us.
+    var display = mapped_guided;
     if (cam.grid.w > 0.5) {
-        display = to_srgb(mapped);
+        display = to_srgb(mapped_guided);
     }
-    // 6. Break up 8-bit quantisation contours.
+    // 7. Break up 8-bit quantisation contours.
     return vec4<f32>(display + vec3<f32>(dither(in.pos.xy)), 1.0);
 }

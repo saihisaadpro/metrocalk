@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::diag_log;
 use glam::{Mat4, Quat, Vec3, Vec4};
+use metrocalk_animation::shot::Delivery;
 use metrocalk_assets::colour::TextureRole as Role;
 use metrocalk_assets::{MeshGpu, MeshVertex, Texture};
 use metrocalk_editor_shell::reveal::intent_order;
@@ -1342,6 +1343,20 @@ pub struct SceneState {
     /// this is render state: it lives and dies with `cam_override`, is never undoable, and is written
     /// by the same tick that poses the camera.
     pub delivery_aspect: Option<f32>,
+    /// ADR-193 -- the delivery frame the author is FRAMING against right now, or `None` when the stage
+    /// is its own frame.
+    ///
+    /// The other half of [`Self::delivery_aspect`], and deliberately a separate field rather than a
+    /// second writer of that one. `delivery_aspect` answers *what shape is the film that is playing*;
+    /// this answers *what shape is the film I am about to shoot*, which is a question only anybody can
+    /// ask while NOTHING is holding the camera. Storing the [`Delivery`] itself and not a bare ratio so
+    /// the probe and the read-outs name the frame in the author's own vocabulary -- one list of frames,
+    /// no second table of ratios to drift from it.
+    ///
+    /// Render state: never undoable, never in the document. What IS in the document is the cutscene's
+    /// `delivery`, which is where the shape comes from -- so the guide survives save/open because the
+    /// thing it is a guide TO does.
+    pub frame_guide: Option<Delivery>,
     /// Per-slot local mesh bounds, memoised against `meshes_revision` -- see
     /// [`Self::local_bounds_for_slot`] for why walking them per instance was ruinous.
     /// DERIVED: write it only through [`Self::sync_mesh_bounds`], which keeps it and the revision
@@ -1968,19 +1983,46 @@ impl SceneState {
     #[must_use]
     pub fn composition_rect(&self) -> [f32; 4] {
         let rect = self.adopted_visible_rect();
-        // A delivery frame only insets while something is ACTUALLY holding the camera. Gated on
-        // `cam_override` rather than on every teardown path remembering to clear the aspect: there are
-        // five of those, and a missed one would letterbox the author's own viewport with no cutscene
-        // on screen and no control anywhere to turn it off.
-        if self.cam_override.is_none() {
-            return rect;
-        }
-        match self.delivery_aspect {
+        match self.composed_aspect() {
             Some(want) if want.is_finite() && want > 0.05 => {
                 inset_to_aspect(rect, self.surface_aspect, want)
             }
             _ => rect,
         }
+    }
+
+    /// ADR-193 -- the aspect ratio the picture is composed for, or `None` for "the stage's own shape".
+    ///
+    /// TWO SOURCES, AND THEY ARE NOT THE SAME PROMISE.
+    ///
+    /// While something holds the camera the frame belongs to the CUTSCENE: [`Self::delivery_aspect`],
+    /// published by the same tick that poses the shot. A delivery frame only insets while something is
+    /// ACTUALLY holding the camera -- gated on `cam_override` rather than on every teardown path
+    /// remembering to clear the aspect, because there are five of those and a missed one would
+    /// letterbox the author's own viewport with no cutscene on screen.
+    ///
+    /// While NOTHING holds it, the author is flying the camera themselves, and the frame is the guide
+    /// they asked the stage to draw: [`Self::frame_guide`]. Before it existed there was no answer here
+    /// at all -- a view composed against a 16:9 stage was handed to a 2.39:1 delivery, and "shoot from
+    /// this view" filmed a frame the author had never seen.
+    ///
+    /// A delivery WINS, and not by accident: a preview that also honoured a guide would inset twice.
+    /// The guide is what you compose in; the delivery is what you composed FOR, and once it is playing
+    /// the guide has nothing left to say.
+    #[must_use]
+    fn composed_aspect(&self) -> Option<f32> {
+        if self.cam_override.is_some() {
+            self.delivery_aspect
+        } else {
+            self.frame_guide.and_then(Delivery::ratio)
+        }
+    }
+
+    /// Whether a cutscene is composing this frame for a delivery of its own -- the condition the HARD
+    /// bars exist under, as opposed to a guide's dimmed ones.
+    #[must_use]
+    fn delivering(&self) -> bool {
+        self.cam_override.is_some() && self.delivery_aspect.is_some()
     }
 
     /// The composed rectangle together with the surface it sits on -- what every projection, ray and fit
@@ -2023,7 +2065,36 @@ impl SceneState {
         if offscreen {
             return None;
         }
-        self.delivery_aspect
+        // ADR-193 -- A DELIVERY, NEVER A GUIDE. Both inset the composition, and there the resemblance
+        // stops: a delivery is the film, so everything outside it is not in the picture at all, while a
+        // guide is what the author is composing INSIDE and cropping to it would take away exactly the
+        // context it exists to show. The guide's bars are drawn by the resolve
+        // ([`Self::drawn_frame_guide`]) as a dim rather than cut here as a scissor.
+        self.delivering().then(|| frame_pixels(frame.rect(), w, h))
+    }
+
+    /// ADR-193 -- the rectangle a FRAME GUIDE is drawn around, in pixels, or `None` when none is.
+    ///
+    /// The same rectangle [`Self::composition_rect`] composed for, so the picture inside the guide is
+    /// the picture the delivery will contain -- one inset rule, read twice, never restated. The final
+    /// resolve dims outside it instead of scissoring to it, which is the whole difference between a
+    /// guide and a delivery: an author framing a shot needs to see what is about to enter the frame.
+    ///
+    /// `None` offscreen, for the same reason [`Self::drawn_letterbox`] is: a target built AT the
+    /// delivery shape has no outside, and a guide baked into a rendered file would be a defect in it.
+    #[must_use]
+    pub fn drawn_frame_guide(
+        &self,
+        offscreen: bool,
+        frame: &ViewFrame,
+        w: u32,
+        h: u32,
+    ) -> Option<[u32; 4]> {
+        if offscreen || self.cam_override.is_some() {
+            return None;
+        }
+        self.frame_guide
+            .and_then(Delivery::ratio)
             .map(|_| frame_pixels(frame.rect(), w, h))
     }
 
@@ -3127,7 +3198,11 @@ struct Camera {
     /// shaders dim every instance whose `selected < 0.5` when this is set, so only the focused (=
     /// selected) entity stays lit — "gray out the rest." A `vec4` (not a bare `f32` + pad) so the WGSL
     /// uniform layout matches byte-for-byte: a `vec3` tail would round the std140 struct to 96 bytes
-    /// while this struct is 80, and wgpu would reject the undersized buffer at draw. `[1..4]` unused.
+    /// while this struct is 80, and wgpu would reject the undersized buffer at draw. `[1..4]` is the
+    /// WORLD-SPACE CAMERA EYE -- `fs_mesh` takes its PBR view direction from it and `ssao.wgsl` names
+    /// the same three floats `focus.yzw`. (This said "unused" for three shader generations after they
+    /// started reading it, which is the cheapest kind of wrong comment to leave and the easiest to act
+    /// on: it invites the next author to reuse the slot.)
     focus: [f32; 4],
     /// M11.3 inc.3 — `shadow[0]` is the index (into the lights buffer) of the shadow-casting directional
     /// light, or `-1.0` when nothing casts. `fs_mesh` applies the single shadow map to ONLY that light, so
@@ -3140,12 +3215,23 @@ struct Camera {
     /// leading fields, and WGSL allows a uniform struct smaller than its buffer — so a pass that has no
     /// opinion about colour does not have to restate the block, and cannot restate it wrongly.
     colour: ColourUniform,
+    /// ADR-193 — THE FRAME GUIDE, in framebuffer pixels: `[x0, y0, x1, y1]`. An empty rectangle
+    /// (`x1 <= x0`) means no guide, which is the state every frame that is not being composed against a
+    /// delivery frame is in.
+    ///
+    /// After the colour block for the same reason the colour block is last: `scene.wgsl` and
+    /// `ssao.wgsl` declare a PREFIX of this struct, and a field they cannot name is a rule they cannot
+    /// break. Only `post.wgsl` declares it, because the guide is applied exactly once, in the one pass
+    /// that writes the display — dimming it in the scene pass would dim it again per overlapping
+    /// surface, and dimming it in the swapchain afterwards would need a second display-format pipeline
+    /// that `only_the_final_resolve_writes_the_display_format` correctly forbids.
+    guide: [f32; 4],
 }
 // The WGSL `Camera` is 3×mat4 (192) + 3×vec4 (48) + the colour block — 3×mat3x3 (48 each: WGSL pads a
-// mat3 column to 16 bytes) + 1×vec4 (16) = 160 — so 400 bytes. Keep this struct byte-identical or wgpu
-// rejects the uniform at draw. A compile-time tripwire so a future field can't silently desync the
-// layout; it caught exactly that when the colour block was added.
-const _: () = assert!(std::mem::size_of::<Camera>() == 400);
+// mat3 column to 16 bytes) + 1×vec4 (16) = 160 — plus the guide's vec4 (16), so 416 bytes. Keep this
+// struct byte-identical or wgpu rejects the uniform at draw. A compile-time tripwire so a future field
+// can't silently desync the layout; it caught exactly that when the colour block was added.
+const _: () = assert!(std::mem::size_of::<Camera>() == 416);
 // And the colour block on its own, because a mat3 that is padded wrongly does not fail loudly — it
 // transposes or shears the primaries conversion, which looks like a colour bug somewhere else entirely.
 const _: () = assert!(std::mem::size_of::<ColourUniform>() == 160);
@@ -4249,6 +4335,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             env_source_space,
             working_space,
             letterbox,
+            frame_guide_px,
             capture_rect,
             preview_rect,
             want_out,
@@ -4938,6 +5025,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // None offscreen: bars exist because a stage is the wrong shape for the delivery, and a
             // target built AT the delivery shape cannot be.
             let letterbox = st.drawn_letterbox(offscreen_on, &frame, w, h);
+            // ADR-193 — THE FRAME GUIDE the author is composing inside, in the SAME pixels the bars
+            // above would have used. `letterbox` and this are mutually exclusive by construction —
+            // one asks `delivering()`, the other asks that nothing holds the camera — so a frame can
+            // never be both cut to a delivery and dimmed to a guide.
+            let frame_guide_px = st.drawn_frame_guide(offscreen_on, &frame, w, h);
             // WHAT A CAPTURE WOULD KEEP: the composed frame, in pixels, whether or not there are bars.
             // Not `letterbox`, which is `None` when nothing is delivering — and the whole window is the
             // wrong answer there, because the window includes the strips behind the docks that the
@@ -5168,6 +5260,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 // the mixed-state frame the atomicity requirement exists to forbid.
                 st.working_space,
                 letterbox,
+                frame_guide_px,
                 capture_rect,
                 preview_rect,
                 want_out,
@@ -5227,6 +5320,13 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 ],
                 grid: grid_meta,
                 colour: ColourUniform::new(working_space, env_source_space),
+                // ADR-193 — the guide rectangle as `[x0, y0, x1, y1]` in framebuffer pixels, or an
+                // empty rectangle when there is none. `frame_pixels` hands back `[x, y, w, h]`; the
+                // shader wants corners, and converting HERE keeps the one comparison it does to two
+                // `<` per axis rather than an add per pixel.
+                guide: frame_guide_px.map_or([0.0; 4], |[x, y, gw, gh]| {
+                    [x as f32, y as f32, (x + gw) as f32, (y + gh) as f32]
+                }),
             }),
         );
         // M9.1: upload the gizmo handle geometry (tiny — regenerated each frame at the selection).
@@ -6866,6 +6966,10 @@ fn render_thumbnail(
             // shared: an asset-browser thumbnail graded in a different colour space from the stage is a
             // picture of a scene that does not exist.
             colour: ColourUniform::new(thumb.working, thumb.env_source),
+            // NO FRAME GUIDE, ever. A thumbnail IS its own frame - there is no author composing in
+            // it and no delivery it is a rehearsal for - so an empty rectangle here is not a default,
+            // it is the answer.
+            guide: [0.0; 4],
         }),
     );
     let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -7932,8 +8036,12 @@ mod tests {
         for (name, src, expect) in [
             // 3 mat4 (192) + 3 vec4 (48) + the two ingress mat3s, column-padded (48 each).
             ("scene.wgsl", SHADER, 336),
-            // ...the same, plus the egress mat3 (48) and the luma vec4 (16) — the whole block.
-            ("post.wgsl", POST, 400),
+            // ...the same, plus the egress mat3 (48), the luma vec4 (16) — the whole colour block —
+            // and ADR-193's frame-guide vec4 (16). `post.wgsl` is the only shader that names the
+            // guide, for the same reason it is the only one that names the egress matrix: it is the
+            // one pass that writes the display, and a field a shader cannot name is a rule it cannot
+            // break.
+            ("post.wgsl", POST, 416),
             // No colour block at all.
             ("ssao.wgsl", SSAO_SRC, 240),
         ] {
@@ -9737,6 +9845,157 @@ mod tests {
         assert!(h < 0.836, "and the bars are real: {h}");
         st.delivery_aspect = None;
         assert_eq!(st.composition_rect(), st.adopted_visible_rect());
+    }
+
+    // ── ADR-193: the frame guide — the delivery frame while the AUTHOR holds the camera ─────────
+
+    /// A stage with both docks open, its shots delivered to scope, and nothing holding the camera:
+    /// exactly the state an author is in while they fly the viewport looking for a shot.
+    fn framing_a_scope_shot() -> SceneState {
+        let mut st = docked_scene();
+        st.visible_rect = [0.369, 0.104, 0.395, 0.836];
+        st.surface_aspect = 1296.0 / 839.0;
+        st.frame_guide = Some(Delivery::Scope);
+        st
+    }
+
+    #[test]
+    fn a_frame_guide_composes_the_stage_for_the_delivery_with_nobody_holding_the_camera() {
+        // THE WHOLE CLAIM, and it is the exact negative of the line
+        // `the_delivery_frame_is_what_a_shot_is_composed_for` asserts three tests above: a DELIVERY
+        // with nothing holding the camera letterboxes nothing, because it belongs to a cutscene that
+        // is not playing. A GUIDE with nothing holding the camera is the only time it means anything.
+        let mut st = framing_a_scope_shot();
+        let stage = 1296.0 / 839.0 * 0.395 / 0.836;
+
+        // NEGATIVE CONTROL FIRST, so "composed for scope" cannot be a stage that happened to be scope.
+        st.frame_guide = None;
+        assert!(
+            (st.composition_aspect() - stage).abs() < 1.0e-3,
+            "with no guide the stage is its own frame: {}",
+            st.composition_aspect()
+        );
+        assert_eq!(st.composition_rect(), st.adopted_visible_rect());
+
+        st.frame_guide = Some(Delivery::Scope);
+        assert!(
+            (st.composition_aspect() - 2.39).abs() < 1.0e-3,
+            "a guide composes the stage for the frame it guides to: {}",
+            st.composition_aspect()
+        );
+        // And the inset is the same one a delivery makes — read from the same rectangle, not restated.
+        let [x, y, w, h] = st.composition_rect();
+        let [vx, vy, vw, vh] = st.adopted_visible_rect();
+        assert!(
+            (w - vw).abs() < 1.0e-4 && (x - vx).abs() < 1.0e-4,
+            "scope on a 1.55 stage letterboxes, never pillarboxes"
+        );
+        assert!(h < vh && y > vy, "and the bars are real: {h} inside {vh}");
+    }
+
+    #[test]
+    fn a_guide_is_dimmed_and_never_cut() {
+        // The difference between a guide and a delivery, in the two values the frame loop reads.
+        // A delivery scissors the resolve to its frame because everything outside it is not in the
+        // film; a guide must NOT, because what is about to walk into the frame is exactly what an
+        // author framing a shot needs to see.
+        let st = framing_a_scope_shot();
+        let frame = st.drawn_frame(false, st.known_surface_aspect());
+        assert_eq!(
+            st.drawn_letterbox(false, &frame, 1296, 839),
+            None,
+            "a guide draws no hard bars"
+        );
+        let guide = st
+            .drawn_frame_guide(false, &frame, 1296, 839)
+            .expect("a scope guide on a 1.55 stage has a rectangle");
+        assert_eq!(guide, frame_pixels(frame.rect(), 1296, 839));
+        assert!(
+            guide[1] > 0 && guide[1] + guide[3] < 839,
+            "and it is inset: {guide:?}"
+        );
+
+        // NEGATIVE CONTROL: the same stage with a real delivery still cuts, so the assertion above is
+        // about the guide and not about a `drawn_letterbox` that quietly stopped working.
+        let delivering = cutscene_on_a_docked_stage();
+        let dframe = delivering.drawn_frame(false, delivering.known_surface_aspect());
+        assert!(delivering
+            .drawn_letterbox(false, &dframe, 1296, 839)
+            .is_some());
+        assert_eq!(
+            delivering.drawn_frame_guide(false, &dframe, 1296, 839),
+            None
+        );
+    }
+
+    #[test]
+    fn a_delivery_wins_over_a_guide_while_the_camera_is_held() {
+        // Both would inset, and honouring both would inset TWICE — a scope guide inside a vertical
+        // delivery, which is a frame nothing composed for. The guide is what you compose IN; once
+        // the shot is playing it has nothing left to say.
+        let mut st = framing_a_scope_shot();
+        st.frame_guide = Some(Delivery::Vertical);
+        st.delivery_aspect = Some(2.39);
+        st.cam_override = Some(CamView {
+            pos: [0.0, 2.0, 8.0],
+            look_at: Some([0.0, 1.0, 0.0]),
+            fov_deg: 50.0,
+            near: 0.1,
+            far: 400.0,
+        });
+        assert!(
+            (st.composition_aspect() - 2.39).abs() < 1.0e-3,
+            "the shot on screen decides the frame, not the guide behind it: {}",
+            st.composition_aspect()
+        );
+        // And the guide draws nothing at all while the picture is not the author's.
+        let frame = st.drawn_frame(false, st.known_surface_aspect());
+        assert_eq!(st.drawn_frame_guide(false, &frame, 1296, 839), None);
+    }
+
+    #[test]
+    fn a_guide_is_never_rendered_into_a_file() {
+        // A guide baked into a rendered frame would be a defect IN the deliverable, and the file is
+        // the one place the author cannot paint it out. `None` offscreen for the same reason
+        // `drawn_letterbox` is: a target built AT the delivery shape has no outside.
+        let st = framing_a_scope_shot();
+        let frame = st.drawn_frame(true, 2582.0 / 1080.0);
+        assert_eq!(st.drawn_frame_guide(true, &frame, 2582, 1080), None);
+        // And the render is still composed for its own whole target — the guide changed nothing there.
+        assert_eq!(frame.rect(), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn match_viewport_is_the_absence_of_a_guide() {
+        // `Delivery::Viewport` is a real answer to "what frame is this cutscene delivered in" — it
+        // just has no ratio, so a guide for it would be bars around the whole stage. Held rather than
+        // refused at this layer, and inert here, which is what makes the panel's disabled control
+        // honest rather than merely tidy.
+        let mut st = framing_a_scope_shot();
+        st.frame_guide = Some(Delivery::Viewport);
+        assert_eq!(st.composition_rect(), st.adopted_visible_rect());
+        let frame = st.drawn_frame(false, st.known_surface_aspect());
+        assert_eq!(st.drawn_frame_guide(false, &frame, 1296, 839), None);
+    }
+
+    #[test]
+    fn every_delivery_frame_the_engine_offers_can_be_guided_to() {
+        // The two lists cannot drift, because there is only one: the guide stores a `Delivery`. This
+        // asserts the CONSEQUENCE — every frame the picker offers produces a composition of its own
+        // ratio — so a frame added to the vocabulary is covered the day it is added.
+        for delivery in Delivery::all() {
+            let mut st = framing_a_scope_shot();
+            st.frame_guide = Some(delivery);
+            match delivery.ratio() {
+                Some(want) => assert!(
+                    (st.composition_aspect() - want).abs() < 1.0e-3,
+                    "{} guided to {} instead of {want}",
+                    delivery.key(),
+                    st.composition_aspect()
+                ),
+                None => assert_eq!(st.composition_rect(), st.adopted_visible_rect()),
+            }
+        }
     }
 
     // ── ADR-177: a render at a size the window is not ────────────────────────────────────────────

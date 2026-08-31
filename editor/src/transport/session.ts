@@ -320,6 +320,13 @@ export interface EditorClient {
   cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply>;
   /** Set the frame the cutscene is composed and delivered in (one undoable commit). */
   cinemaSetDelivery(id: string, delivery: DeliveryFrame): Promise<CinemaReply>;
+  /** ADR-193 — draw the delivery frame on the stage while the author frames against it, or stop.
+   *
+   *  Render-only: no commit, no undo entry. `null` (or `"viewport"`, which is the absence of a
+   *  delivery frame) clears it. Replies the key now being drawn, `"off"`, or `"unknown: …"` — it
+   *  never falls back to a default, because a guide silently drawn for the wrong frame is precisely
+   *  the bug it exists to remove. */
+  setFrameGuide(delivery: DeliveryFrame | null): Promise<string>;
   /** ADR-190 — set how this cutscene renders: format, rate, size and name (one undoable commit).
    *
    *  THE WHOLE BLOCK, never one field. The four answers move together, they are validated together,
@@ -1069,6 +1076,9 @@ export class TauriClient implements EditorClient {
   }
   cinemaSetDelivery(id: string, delivery: DeliveryFrame): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_set_delivery", { id, delivery }).catch((e: unknown) => { console.error("cinema_set_delivery failed", e); throw e; });
+  }
+  setFrameGuide(delivery: DeliveryFrame | null): Promise<string> {
+    return this.core.invoke<string>("stage_frame_guide", { delivery }).catch((e: unknown) => { console.error("stage_frame_guide failed", e); throw e; });
   }
   cinemaSetRender(id: string, format: RenderFormat, fps: number, height: number | null, name: string, folder: string): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_set_render", { id, format, fps, height, name, folder }).catch((e: unknown) => { console.error("cinema_set_render failed", e); throw e; });
@@ -3002,6 +3012,12 @@ class MockClient implements EditorClient {
   }
   cinemaSetDelivery(): Promise<CinemaReply> {
     return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  // The browser build has no wgpu surface, so there is no stage to draw a guide on. Answers "off"
+  // rather than throwing: the panel's effect runs in the dev build too, and a rejected promise there
+  // would be a console error on every delivery change for a capability the mock cannot have.
+  setFrameGuide(): Promise<string> {
+    return Promise.resolve("off");
   }
   cinemaSetRender(): Promise<CinemaReply> {
     return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });

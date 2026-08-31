@@ -24295,6 +24295,17 @@ fn camera_probe(state: State<AppState>) -> serde_json::Value {
         // from the same probe, without either being a claim about a screenshot.
         "frame": st.composition_rect(),
         "visibleRect": st.adopted_visible_rect(),
+        // ADR-193 - the delivery frame the stage is drawing a guide for, or `null`. Reported beside
+        // the two rectangles because it is the REASON they differ while nothing holds the camera:
+        // without it a reader sees an inset frame and cannot tell a guide from a stale delivery.
+        "frameGuide": st.frame_guide.map(|d| d.key()),
+        // The two rectangles above AS RATIOS, which is the form the claim is actually made in: what
+        // the author composed for, and what shape their stage happens to be. Computed here rather
+        // than by a reader dividing `frame` by `visibleRect`, because neither rectangle has an aspect
+        // ratio without the surface it sits on - and a caller that guessed the surface would be
+        // measuring a different frame from the one the projection was sheared to.
+        "frameAspect": st.composition_aspect(),
+        "stageAspect": render::frame_aspect(st.known_surface_aspect(), st.adopted_visible_rect()),
         "subjectId": st.cinematic_subject_id.clone(),
         "shotIndex": st.cinematic_shot_index,
         "visitedSubjects": st.cinematic_visited_subjects.clone(),
@@ -24435,6 +24446,46 @@ fn cinema_set_delivery(
     recv_reply(&rx).unwrap_or_else(|_| {
         metrocalk_editor_shell::CinemaReply::refusal("The delivery frame did not finish in time")
     })
+}
+
+/// ADR-193 - draw the delivery frame on the stage while the author FRAMES against it, or stop.
+///
+/// The gap this closes, in one sentence: `cinema_set_shot_camera` films "exactly the view on the
+/// stage", and until now the view on the stage was composed for whatever shape the docks had left --
+/// so an author framing a 2.39:1 shot on a 1.55 stage was composing a picture nothing would ever
+/// deliver. The guide makes the stage the shape of the film before the button is pressed.
+///
+/// Takes a [`Delivery`] key, the SAME vocabulary `cinema_set_delivery` takes, so the guide can only
+/// ever be drawn for a frame the engine can actually deliver. `None` and `"viewport"` both clear it:
+/// "match viewport" is the ABSENCE of a delivery frame, and drawing bars for it would be bars around
+/// the whole stage.
+///
+/// Render-only state: no commit, no undo entry, no dirty flag. What persists is the cutscene's own
+/// `delivery`, which is where the shape comes from -- so reopening a project restores the frame the
+/// guide is a guide to, and the panel asks for it again.
+///
+/// Replies the key that is now being drawn, `"off"` when none is, or `"unknown: <what you sent>"` for
+/// a name the engine does not have. It does NOT fall back to a default: a typo that silently drew a
+/// 16:9 guide while the author believed they were composing for scope is exactly the class of bug
+/// this whole feature exists to remove.
+#[tauri::command]
+fn stage_frame_guide(state: State<AppState>, delivery: Option<String>) -> String {
+    ipc();
+    use metrocalk_animation::shot::Delivery;
+    let want = match delivery.as_deref() {
+        None | Some("off") => None,
+        Some(key) => match Delivery::from_key(key) {
+            // A frame with no ratio is not a guide. Accepted rather than refused, because "match
+            // viewport" is a real answer to "what frame is this cutscene delivered in" -- it just
+            // has no bars to draw.
+            Some(d) if d.ratio().is_some() => Some(d),
+            Some(_) => None,
+            None => return format!("unknown: {key}"),
+        },
+    };
+    let mut st = state.shared.lock().unwrap();
+    st.frame_guide = want;
+    want.map_or_else(|| "off".to_string(), |d| d.key().to_string())
 }
 
 /// ADR-190 - set how this cutscene renders: format, rate, size and name (one undoable commit).
@@ -28042,6 +28093,7 @@ fn main() {
             cinema_subject_chain,
             cinema_set_mood,
             cinema_set_delivery,
+            stage_frame_guide,
             cinema_set_render,
             cinema_pick_render_folder,
             cinema_list,

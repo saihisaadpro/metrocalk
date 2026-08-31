@@ -49,6 +49,7 @@ import {
   TimelineTrackHead,
   timelineTicks,
 } from "../theme/timeline";
+import { frameGuideStore, useFrameGuide } from "../store/frameGuide";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import { DEFAULT_RENDER_SETTINGS } from "../transport/protocol";
 import type { CinemaPreviewReply, CinemaReply, DeliveryFrame, FramingCatalog, FramingEdit, ShotRow, ShotSpec } from "../transport/protocol";
@@ -84,6 +85,12 @@ const EMPTY_PACING = "Pacing scales shot lengths, and this object has no shots y
 /** Why the delivery frame refuses on an object with no cutscene. Same sentence as the engine's. */
 const EMPTY_DELIVERY =
   "A delivery frame is what the shots are composed for, and this object has no shots yet — add one first.";
+
+/** Why the frame guide refuses on a cutscene delivered to the stage's own shape. "Match viewport" is
+ *  the ABSENCE of a delivery frame, so its guide would be bars around the whole stage — a control
+ *  that is enabled and draws nothing is the inert-control failure, so it says why instead. */
+const VIEWPORT_GUIDE =
+  "\"Match viewport\" already is the stage's shape — pick a delivery frame and the guide will show it.";
 
 /** Why Preview refuses on an object with no cutscene. Same shape as `EMPTY_PACING`, and the same
  *  reason: a control that is enabled and does nothing is worse than one that says why not. */
@@ -292,6 +299,39 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
   // ends it, because the alternative is a viewport locked into a shot of something the author is no
   // longer editing, with the control that would release it now unmounted.
   useEffect(() => () => void endPreview(null), [selected, endPreview]);
+
+  // ADR-193 — THE FRAME GUIDE, kept in step with what would actually be delivered.
+  //
+  // The narrowing is the whole content-awareness of the feature: the author says once that they want
+  // to see the frame, and the stage works out whether there IS one — a cutscene with shots, delivered
+  // to something other than the stage's own shape, with nothing already holding the camera. So the
+  // guide appears when it means something and stays out of the way when it does not, with no second
+  // control to remember.
+  const guideWanted = useFrameGuide().wanted;
+  const guideDelivery: DeliveryFrame | null =
+    guideWanted && !previewing && rows.length > 0 && cut.delivery !== "viewport" ? cut.delivery : null;
+  // The badge's label is the ENGINE's name for the frame, read out of the framing catalog the picker
+  // above is populated from — never a second table in the front end, which would drift silently
+  // (a badge reading "16:9" over a scope guide is wrong in a way nothing fails on).
+  const guideLabel = labelOf(catalog?.deliveries ?? [], guideDelivery ?? "viewport");
+  useEffect(() => {
+    frameGuideStore.getState().setDrawn(guideDelivery ? { key: guideDelivery, label: guideLabel } : null);
+    void client.setFrameGuide(guideDelivery).catch((e: unknown) => {
+      console.error("stage_frame_guide failed", e);
+    });
+  }, [client, guideDelivery, guideLabel]);
+
+  // Unmount ONLY — deliberately not the cleanup of the effect above, which would clear the guide and
+  // re-ask for it on every delivery change and flash the stage between the two. Closing the panel
+  // does have to clear it: the toggle would be gone, and the way out would then be the stage badge
+  // alone. (It is there, and it works — but a guide with no owner is not a state to leave behind.)
+  useEffect(
+    () => () => {
+      frameGuideStore.getState().setDrawn(null);
+      void client.setFrameGuide(null).catch(() => undefined);
+    },
+    [client],
+  );
 
   const run = useCallback(
     async (
@@ -511,6 +551,35 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
               </option>
             ))}
           </SelectField>
+          {/* ADR-193 — SEE THE FRAME YOU ARE COMPOSING FOR, while you are composing for it. Beside the
+              picker because it is the same fact seen from the stage: the select says what the film
+              is, this draws it. Without it the author frames a 2.39:1 shot inside whatever shape the
+              docks have left, presses "Shoot from this view", and meets the real frame for the first
+              time in the render. */}
+          <Button
+            data-testid="cutscene-frame-guide"
+            variant={guideDelivery ? "primary" : "secondary"}
+            compact
+            aria-pressed={guideWanted}
+            disabled={locked || rows.length === 0 || cut.delivery === "viewport"}
+            disabledReason={
+              rows.length === 0 ? EMPTY_DELIVERY : cut.delivery === "viewport" ? VIEWPORT_GUIDE : lockReason
+            }
+            title={
+              rows.length === 0
+                ? EMPTY_DELIVERY
+                : cut.delivery === "viewport"
+                  ? VIEWPORT_GUIDE
+                  : locked
+                    ? lockReason
+                    : guideWanted
+                      ? "Stop drawing the delivery frame on the stage"
+                      : "Draw the delivery frame on the stage, so what you frame is what gets filmed"
+            }
+            onClick={() => frameGuideStore.getState().setWanted(!guideWanted)}
+          >
+            <Icon name="frame" size="md" /> Frame guide
+          </Button>
         </ToolbarGroup>
         {live && (
           <>

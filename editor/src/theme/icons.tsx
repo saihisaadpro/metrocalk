@@ -269,6 +269,14 @@ const ICONS = {
     </>
   ),
   grid: <path d="M3.6 9.2h16.8M3.6 14.8h16.8M9.2 3.6v16.8M14.8 3.6v16.8" />,
+  // ADR-193 — a delivery frame inside the stage that is the wrong shape for it. The outer rectangle
+  // is the viewport, the inner one is the film: the icon IS the thing the control draws.
+  frame: (
+    <>
+      <rect x="2.6" y="4.2" width="18.8" height="15.6" rx="2" />
+      <path d="M2.6 8.6h18.8M2.6 15.4h18.8" />
+    </>
+  ),
 
   // Asset Lab stages — one mark per stage of the repair/optimise pipeline (they were the LETTERS
   // `I R O UV B V E`, which is a legend, not an icon set).

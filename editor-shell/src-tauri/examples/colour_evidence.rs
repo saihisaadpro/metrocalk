@@ -144,9 +144,16 @@ struct Camera {
     env_to_working: [[f32; 4]; 3],
     from_working: [[f32; 4]; 3],
     luma: [f32; 4],
+    /// ADR-193 - the frame guide, in framebuffer pixels. Empty here, and it has to be DECLARED here:
+    /// `post.wgsl` names it, and wgpu refuses a uniform buffer smaller than the struct the shader
+    /// declares. This example writes the same `post.wgsl` the renderer does, so every field the
+    /// renderer adds to the block is a field this evidence run must add too - which is the whole
+    /// reason `gpu-contract-audit` compares the two: it caught this one at rest, in milliseconds,
+    /// on a box with no GPU, where the alternative was a pipeline failure on a machine that has one.
+    guide: [f32; 4],
 }
 // Must match `render.rs`'s `Camera`, which post.wgsl declares in full.
-const _: () = assert!(std::mem::size_of::<Camera>() == 400);
+const _: () = assert!(std::mem::size_of::<Camera>() == 416);
 
 impl Camera {
     /// A camera carrying nothing but the colour block — `fs_resolve` reads no matrix, only
@@ -166,6 +173,9 @@ impl Camera {
             env_to_working: colour::wgsl_mat3(working.from_rec709()),
             from_working: colour::wgsl_mat3(working.to_rec709()),
             luma: [w[0], w[1], w[2], id[0][0]],
+            // An EMPTY rectangle - no guide. A colour-evidence frame is a swatch sheet, and a
+            // letterbox drawn across it would darken two thirds of the very pixels being measured.
+            guide: [0.0; 4],
         }
     }
 }
