@@ -495,6 +495,27 @@ describe("the stage can select more than one thing", () => {
       throw new Error(`the probe and the pointer name different points: fraction says ${peekAtFraction}, the pixel a click carries says ${peekAtPixel}`);
     }
 
+    // THE CLICK IS TAKEN FROM A CLEAN SLATE, AND THAT IS A FINDING, NOT HOUSEKEEPING.
+    //
+    // The tests above this one leave a selection standing, and a left-PRESS with something selected
+    // fires an async `gizmo_pick_drag` probe whose `true` makes the release a DRAG rather than a pick
+    // — the click handler returns before `viewport_pick`. A suppressed click is indistinguishable
+    // from a mis-aimed one at this level: `selection_ids` simply still holds the previous test's
+    // answer. Measured on the packaged `.exe`: with a selection standing, a click on a pixel the
+    // probe said was `1_16` left `1_1` selected, and re-reading the same fraction afterwards still
+    // said `1_16` — the scene had not moved, so nothing had picked at all.
+    //
+    // Clearing first makes this test test its own claim. The suppression itself is a real defect and
+    // it is tracked in ADR-191, not routed around here: `gizmo_pick_drag` builds its own ray from
+    // `render::cursor_ray` with the aspect read from the WINDOW, a second "what is under the cursor"
+    // that the picker was rebuilt to eliminate.
+    await stageClick(2, 2);
+    await sleep(300);
+    const cleared = await engineSelection();
+    if (cleared.length) {
+      throw new Error(`the corner of the stage did not clear the selection — ${JSON.stringify(cleared)} is still selected`);
+    }
+
     await stageClick(cx, cy);
     await sleep(400);
     const first = (await engineSelection())[0];
@@ -524,7 +545,11 @@ describe("the stage can select more than one thing", () => {
           `selected ${first}, and re-reading the same fraction now says ${peekAfter} — ` +
           (peekAfter === first
             ? "so the scene changed between the probe and the click"
-            : "so the front end sent a different point than the probe looked at"),
+            : peekAfter === peekAtFraction
+              ? "so nothing picked at all: the point is unchanged and still answers what the probe " +
+                "said, which is what a SUPPRESSED click looks like (a gizmo-handle probe claiming " +
+                "the press) rather than a mis-aimed one"
+              : "so the front end sent a different point than the probe looked at"),
       );
     }
 

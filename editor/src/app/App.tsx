@@ -887,7 +887,22 @@ export function App() {
               // press is withdrawn below, because dragging a handle and dragging a box are the same
               // gesture until the engine answers which one it was.
               if (!playing) marqueePress.current = { x: e.clientX, y: e.clientY };
-              if (projectionStore.getState().selectedId) {
+              // ALT AND SHIFT SAY THIS IS A SELECTION GESTURE, AND THE GIZMO HAS NO MEANING FOR EITHER.
+              //
+              // The probe used to fire on every left press with something selected, whatever the
+              // keyboard was doing — and a HIT suppresses the click entirely. The gizmo is drawn AT the
+              // selection, so alt-clicking the very object you just selected, to reach the one behind
+              // it, lands on the gizmo and the cycle never runs. Measured on the packaged `.exe`: with
+              // two objects along the ray, alt-click "stayed on 1_16" — not a wrong pick, no pick at
+              // all, because `viewport_pick` was never called.
+              //
+              // Ctrl is deliberately NOT in this list. It is the gizmo's own snap modifier
+              // (`gizmoPickDrag(..., ctrl)`), so a ctrl-press on a handle is a snapped drag and a
+              // ctrl-press elsewhere is a toggle — an ambiguity that has to be resolved by whether the
+              // pointer MOVES, not by the modifier. Tracked in ADR-191; alt and shift are unambiguous
+              // and are the two the documented gestures need.
+              const selectionModifier = e.altKey || e.shiftKey;
+              if (!selectionModifier && projectionStore.getState().selectedId) {
                 const { x: nx, y: ny } = normalizeSurfacePoint(e.clientX, e.clientY);
                 void client
                   .gizmoPickDrag(nx, ny, e.ctrlKey || e.metaKey)

@@ -34,6 +34,8 @@ interface Spies {
   candidates: ReturnType<typeof vi.fn>;
   /** The hover read (ADR-191). Watched because the CADENCE is the design: it must not fire per move. */
   peek: ReturnType<typeof vi.fn>;
+  /** The gizmo-handle probe. A HIT suppresses the click, so WHEN it is armed is a selection question. */
+  gizmoPickDrag: ReturnType<typeof vi.fn>;
 }
 const sessions: Spies[] = [];
 
@@ -58,13 +60,15 @@ vi.mock("../transport/session", async (importOriginal) => {
       client.pickCandidates = candidates as unknown as typeof client.pickCandidates;
       const peek = vi.fn(() => Promise.resolve("hit-1" as string | null));
       client.viewportPeek = peek as unknown as typeof client.viewportPeek;
+      const gizmoPickDrag = vi.fn(() => Promise.resolve(false));
+      client.gizmoPickDrag = gizmoPickDrag as unknown as typeof client.gizmoPickDrag;
       client.selectEntities = select as unknown as typeof client.selectEntities;
       client.deleteDeactivateMany = del as unknown as typeof client.deleteDeactivateMany;
       client.undo = undo as unknown as typeof client.undo;
       client.viewportPick = pick as unknown as typeof client.viewportPick;
       client.viewportPickRegion = region as unknown as typeof client.viewportPickRegion;
       client.selectionIds = selectionIds as unknown as typeof client.selectionIds;
-      sessions.push({ pick, region, selectionIds, undo, select, del, candidates, peek });
+      sessions.push({ pick, region, selectionIds, undo, select, del, candidates, peek, gizmoPickDrag });
       return client;
     },
   };
@@ -322,6 +326,30 @@ describe("modified clicks on the stage", () => {
     expect(spies().pick.mock.calls[1]?.[2]).toMatchObject({ cycle: true, extend: false, toggle: false });
     // Alt is not a selection MODE: it moves the HIT, so it must NOT re-read the whole set.
     expect(spies().selectionIds.mock.calls.length).toBe(afterToggle);
+  });
+
+  it("alt and shift do NOT start a gizmo drag — they say the gesture is a selection", async () => {
+    render(<App />);
+    const viewport = screen.getByTestId("viewport");
+    // Something is selected, which is the condition that arms the gizmo-handle probe.
+    await act(async () => {
+      fireEvent.click(viewport, { clientX: 500, clientY: 400 });
+    });
+    expect(projectionStore.getState().selectedId).toBe("hit-1");
+
+    const gizmo = spies().gizmoPickDrag;
+    gizmo.mockClear();
+    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400, altKey: true });
+    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400, shiftKey: true });
+    // The gizmo is drawn AT the selection, so alt-clicking the object you just selected — to reach the
+    // one BEHIND it — lands on the gizmo. A hit suppresses the click, and the cycle never runs:
+    // measured on the packaged `.exe` as "alt-click stayed on 1_16" with two objects along the ray.
+    expect(gizmo).not.toHaveBeenCalled();
+
+    // Ctrl still arms it, deliberately: ctrl is the gizmo's own SNAP modifier, and that ambiguity is
+    // resolved by whether the pointer moves, not by the key.
+    pointer(viewport, "pointerdown", { button: 0, clientX: 500, clientY: 400, ctrlKey: true });
+    expect(gizmo).toHaveBeenCalledTimes(1);
   });
 
   it("alt-click says WHERE IN THE STACK it landed, instead of nothing at all", async () => {
