@@ -10,6 +10,7 @@
 import { useEffect, useState } from "react";
 import type { EditorClient } from "../transport/session";
 import type { EntityDetails } from "../transport/protocol";
+import { entityLabel } from "../store/selectionText";
 import { PopoverSurface } from "../theme/Popover";
 import { color, fontSize, space } from "../theme/tokens";
 
@@ -50,8 +51,16 @@ export function HoverTooltip({ client, id }: { client: EditorClient; id: string 
         pointerEvents: "none",
       }}
     >
+      {/* ONE NAMER. `selectionText` is where the editor decides what to call something, "because it is
+          said in four" places and they drift. This surface was the fifth, and it disagreed with the
+          rest the moment it became reachable: measured on the packaged `.exe`, hovering the object the
+          outliner calls `Empty 6` and the object menu calls `Empty 6` printed **`1_14`** here — the
+          engine's own `entity_details.name`, which for an unnamed entity is its Loro key. A raw key in
+          user copy is exactly `<ux_quality>` 4. The engine's name is kept as the fallback for the case
+          the projection cannot answer (an entity not in the current projection at all), where it is
+          strictly better than nothing. */}
       <div data-testid="tooltip-name" style={{ color: color.text.primary, fontWeight: 650, marginBottom: space.xs }}>
-        {details.name}
+        {entityLabel(id) === id ? details.name : entityLabel(id)}
       </div>
       {details.components.length > 0 && (
         <Section label="components" items={details.components} testid="tooltip-components" />

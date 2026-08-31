@@ -955,6 +955,15 @@ export function App() {
                   projectionStore.getState().select(picked);
                   setStatus(entityLabel(picked));
                 } else {
+                  // THE ENGINE JUST DESELECTED, AND THE UI HAS TO SAY SO. `apply_click` with no hit
+                  // clears the canonical selection — click-to-deselect is the whole reason picking was
+                  // rebuilt around a real ray — and the front end used to answer that by writing a
+                  // status line and leaving its own projection standing. Measured on the packaged
+                  // `.exe` while capturing ADR-191's evidence: `selection_ids` returned `[]` while the
+                  // Inspector still showed `Character 4`, the outliner still had its row lit and the
+                  // toolbar still read `Actions · 1`. Three surfaces claiming a selection the engine
+                  // does not have — `<ux_quality>` 6, honest state.
+                  projectionStore.getState().setSelection([]);
                   setStatus("nothing here");
                 }
                 // ALT-CLICK STOPS BEING BLIND (ADR-191). The gesture reaches the object behind the one

@@ -241,22 +241,42 @@ test("the menu opens on the first row a person can USE, not on a refusal", async
   expect(document.activeElement).toBe(items[0]);
 });
 
-test("with nothing usable the menu still opens on row 0, whose reason is the answer", async () => {
-  const client = fakeClient({
-    entityActionsFor: () =>
-      Promise.resolve(
-        answer(0, [
-          act("bind", "Bind…", 0, false, "nothing is selected"),
-          act("remove", "Delete", 0, true, "nothing is selected"),
-        ]),
-      ),
-  });
-  render(<ContextMenu client={client} ids={[]} onClose={vi.fn()} />);
-  const items = await screen.findAllByRole("menuitem");
-  expect(document.activeElement).toBe(items[0]);
-  expect(items[0].textContent).toContain("nothing is selected");
-  // A selection of nothing has no subject to state — the rows' own reasons say it instead.
+test("with nothing selected there are no verbs — SUPERSEDES the seven-fold refusal (ADR-191)", async () => {
+  // ADR-183's version of this test asserted the opposite: that a menu opened over an empty selection
+  // renders the engine's refusal rows and opens focus on the first of them, "whose reason is the
+  // answer". That state was unreachable in the product — the stage refused to open a menu with
+  // nothing selected at all — and the first time ADR-191 made it reachable, the `.exe` capture showed
+  // what it actually looks like: two live rows above SEVEN greyed ones, each carrying the identical
+  // six-word reason, taking two thirds of the surface, with the focus ring on the first refusal.
+  //
+  // Every "no" is still explained. It is explained ONCE, by the empty selection the user can see in
+  // the Inspector beside it, instead of seven times by controls that do nothing — which is
+  // `<ux_quality>` 6's inert controls rather than ADR-016's explained refusals.
+  const entityActionsFor = vi.fn(() =>
+    Promise.resolve(
+      answer(0, [
+        act("bind", "Bind…", 0, false, "nothing is selected"),
+        act("remove", "Delete", 0, true, "nothing is selected"),
+      ]),
+    ),
+  );
+  loadScene([{ id: "e2", name: "Weld Gun" }]);
+  render(<ContextMenu client={fakeClient({ entityActionsFor })} ids={[]} candidates={[under("e2", 12)]} onClose={vi.fn()} />);
+
+  const rows = await screen.findAllByTestId("ctxcandidate");
+  expect(rows).toHaveLength(1);
+  expect(screen.queryAllByTestId("ctxitem")).toHaveLength(0);
+  expect(screen.queryByText("nothing is selected")).toBeNull();
+  expect(entityActionsFor).not.toHaveBeenCalled();
+  // Focus opens on the only row that does anything.
+  await waitFor(() => expect(document.activeElement).toBe(rows[0]));
+  // A selection of nothing still has no subject to state.
   expect(screen.queryByTestId("ctxmenu-subject")).toBeNull();
+});
+
+test("a menu with nothing in it says so rather than rendering an empty box", async () => {
+  render(<ContextMenu client={fakeClient({})} ids={[]} candidates={[]} onClose={vi.fn()} />);
+  expect(await screen.findByText("Nothing here, and nothing selected.")).toBeTruthy();
 });
 
 test("loading and failed action queries expose explicit live feedback", async () => {
@@ -334,19 +354,25 @@ test("choosing the one BEHIND selects it — the whole point of the section", as
   expect(onClose).toHaveBeenCalled();
 });
 
-test("with NOTHING selected the list is the menu — no verbs, no 'No actions available'", async () => {
+test("with NOTHING selected the list is the menu — no verbs, and the engine is not asked", async () => {
   loadScene([{ id: "e2", name: "Weld Gun" }]);
+  // The engine answers an empty selection with a list of REFUSALS — six rows all reading "nothing is
+  // selected". The `.exe` capture showed two live rows above seven of them, taking two thirds of the
+  // menu, with the focus ring on the first. Every "no" is explained here: once, by the empty selection
+  // the user can see beside it.
+  const entityActionsFor = vi.fn(() =>
+    Promise.resolve(answer(0, [act("bind", "Bind…", 0, false, "nothing is selected"), act("remove", "Delete", 0, true, "nothing is selected")])),
+  );
   render(
-    <ContextMenu
-      client={fakeClient({ entityActionsFor: () => Promise.resolve(answer(0, [])) })}
-      ids={[]}
-      candidates={[under("e2", 12)]}
-      onClose={vi.fn()}
-    />,
+    <ContextMenu client={fakeClient({ entityActionsFor })} ids={[]} candidates={[under("e2", 12)]} onClose={vi.fn()} />,
   );
 
   const rows = await screen.findAllByTestId("ctxcandidate");
   expect(rows).toHaveLength(1);
+  expect(screen.queryAllByTestId("ctxitem")).toHaveLength(0);
+  expect(screen.queryByText("nothing is selected")).toBeNull();
+  // Not a question worth asking, either.
+  expect(entityActionsFor).not.toHaveBeenCalled();
   // "No actions available." under a live list of objects reads as a failure OF THE LIST.
   expect(screen.queryByText("No actions available.")).toBeNull();
   expect(screen.getByRole("menu").getAttribute("aria-label")).toBe("What is under the pointer");

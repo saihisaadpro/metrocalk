@@ -262,6 +262,28 @@ describe("the way out the editor promises out loud", () => {
 });
 
 describe("modified clicks on the stage", () => {
+  it("a click that hits NOTHING clears the UI too, because the engine just did", async () => {
+    render(<App />);
+    const viewport = screen.getByTestId("viewport");
+    await act(async () => {
+      fireEvent.click(viewport, { clientX: 500, clientY: 400 });
+    });
+    expect(projectionStore.getState().multiSelect).toEqual(["hit-1"]);
+
+    spies().pick.mockResolvedValueOnce(null);
+    await act(async () => {
+      fireEvent.click(viewport, { clientX: 20, clientY: 20 });
+    });
+    // `apply_click` with no hit CLEARS the canonical selection — click-to-deselect is the whole reason
+    // picking was rebuilt around a real ray. The front end used to answer that with a status line and
+    // leave its own projection standing: measured on the packaged `.exe`, `selection_ids` returned []
+    // while the Inspector still showed `Character 4`, the outliner row was still lit and the toolbar
+    // still read `Actions · 1`.
+    expect(projectionStore.getState().multiSelect).toEqual([]);
+    expect(projectionStore.getState().selectedId).toBeNull();
+    expect(uiStore.getState().status).toBe("nothing here");
+  });
+
   it("a plain click sends no modifiers and selects the one object it hit", async () => {
     render(<App />);
     await act(async () => {

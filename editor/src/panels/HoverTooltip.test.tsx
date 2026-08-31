@@ -45,3 +45,28 @@ test("no target (id=null) → nothing renders AND entityDetails is never fetched
   expect(screen.queryByTestId("tooltip")).toBeNull();
   expect(entityDetails).not.toHaveBeenCalled(); // a null hover must not even hit the core
 });
+
+test("names the object the way every other surface names it, not by its Loro key", async () => {
+  // Measured on the packaged `.exe`: hovering the object the outliner and the object menu both call
+  // `Empty 6` printed `1_14` here — `entity_details.name`, which for an unnamed entity is its key.
+  projectionStore.getState().bulkLoad([
+    { id: "1_14", name: "Empty 6", parentId: null, components: {} },
+  ] as never);
+  render(
+    <HoverTooltip
+      client={fakeClient({ entityDetails: () => Promise.resolve({ ...DETAILS, id: "1_14", name: "1_14" }) })}
+      id="1_14"
+    />,
+  );
+  expect((await screen.findByTestId("tooltip-name")).textContent).toBe("Empty 6");
+});
+
+test("falls back to the engine's name when the projection cannot answer", async () => {
+  render(
+    <HoverTooltip
+      client={fakeClient({ entityDetails: () => Promise.resolve({ ...DETAILS, id: "gone", name: "Weld Gun" }) })}
+      id="gone"
+    />,
+  );
+  expect((await screen.findByTestId("tooltip-name")).textContent).toBe("Weld Gun");
+});

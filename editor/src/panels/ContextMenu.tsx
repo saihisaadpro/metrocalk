@@ -126,10 +126,17 @@ export function ContextMenu({
 
   useEffect(() => {
     let live = true;
+    // Nothing selected is not a question worth asking: the reply is a list of refusals this surface
+    // no longer renders, and the menu is ready the moment it opens.
+    if (!key.length) {
+      setAnswer(EMPTY);
+      setLoadState("ready");
+      return;
+    }
     setLoadState("loading");
     setAnswer(EMPTY);
     client
-      .entityActionsFor(key.length ? key.split(",") : [])
+      .entityActionsFor(key.split(","))
       .then((next) => {
         if (!live) return;
         setAnswer(next);
@@ -145,7 +152,16 @@ export function ContextMenu({
     };
   }, [key, client]);
 
-  const actions = answer.items;
+  // WITH NOTHING SELECTED THERE ARE NO VERBS, AND SEVEN REFUSALS ARE NOT AN EXPLANATION.
+  //
+  // The `.exe` capture of this menu opened on an unselected object showed two live rows above
+  // **seven** greyed ones, each carrying the identical six-word reason `nothing is selected`, taking
+  // two thirds of the surface — and the focus ring on the first of them. Every "no" IS explained
+  // here: it is explained once, by the empty selection the user can see in the Inspector beside it,
+  // and repeating it seven times is `<ux_quality>` 6's inert controls rather than ADR-016's
+  // explained refusals. The verbs are about the selection; with no selection the pointer's list is
+  // the menu.
+  const actions = ids.length ? answer.items : [];
 
   // `Select similar` is a SELECTION verb, not a mutation, so it is answered here rather than by the
   // engine's action model: the fact it matches on (the content-addressed mesh handle, else the
@@ -193,7 +209,10 @@ export function ContextMenu({
     // something — but with nothing selected there are no verbs, and then the pointer's own list is
     // the menu, so focus has to reach it rather than stopping at an empty action list.
     const available = actions.findIndex((item) => item.available);
-    const start = available >= 0 ? shownCandidates.length + available : actions.length > 0 ? shownCandidates.length : 0;
+    // A verb outranks a candidate — the menu was opened to DO something — but a REFUSED verb outranks
+    // nothing. With no available action the focus goes to the first candidate, which is the only row
+    // in the menu that does anything; row 0 is the last resort, as before.
+    const start = available >= 0 ? shownCandidates.length + available : 0;
     setActiveIndex(start);
     itemRefs.current[start]?.focus();
     // `candidates` is a fresh array identity per open; its LENGTH is what the arithmetic reads.
@@ -455,6 +474,15 @@ export function ContextMenu({
           style={{ padding: `${space.md}px ${space.lg}px`, color: color.danger.text }}
         >
           Actions could not be loaded. Close the menu and try again.
+        </div>
+      )}
+      {/* The menu with nothing in it. The stage refuses to open one (it asks `pick_candidates` first
+          and opens only if there is a selection or something under the pointer), so this is the
+          component's own floor rather than a state a gesture produces — and a `PopoverSurface`
+          rendering an empty box is worse than any sentence. */}
+      {ids.length === 0 && candidates.length === 0 && (
+        <div role="status" style={{ padding: `${space.md}px ${space.lg}px`, color: color.text.muted }}>
+          Nothing here, and nothing selected.
         </div>
       )}
       {/* Only when there IS a selection. With nothing selected the verbs are absent for a reason the
