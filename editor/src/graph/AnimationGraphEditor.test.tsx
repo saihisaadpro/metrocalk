@@ -11,6 +11,23 @@ import type {
 import { AnimationGraphEditor } from "./AnimationGraphEditor";
 import { animationGraphPorts, cloneAnimationGraph, createLocomotionGraphPreset } from "./animation-graph-model";
 
+// **QUARANTINED, NOT SUPPRESSED — this file runs over vitest's 5 s default on ordinary hardware.**
+//
+// Measured 2026-09-01 on the dev box, this file alone with one worker and nothing else running:
+// **77.4 s of test time across 11 tests — ~7 s each** — against a 5000 ms default that was never
+// chosen for it. It is not a flake in the "sometimes" sense: it is reliably over budget here and only
+// passes on a faster machine or a warmer transform cache, which is why the same 11 tests were green on
+// one checkout and red on another with `AnimationGraphEditor.tsx`, its test and `theme/graph.tsx`
+// byte-identical between the two. Raised to 30 s so a slow box reports the truth instead of eleven
+// `Unable to find role="button"` errors that read exactly like the panel being broken.
+//
+// **This number is a machine-speed accommodation, not a licence for the panel to get slower.** Every
+// test here mounts React Flow, which does no useful work under jsdom (it renders no nodes at all —
+// ADR-135) and costs the mount anyway. **Closing gate:** the ADR-135 third-graph migration
+// (`claude/happy-sutherland-39be13`, "the last graph that drew its own node") lands this editor on the
+// shared `theme/graph.tsx` framework; re-measure then and take the timeout back down if it fits.
+vi.setConfig({ testTimeout: 30_000 });
+
 const workspaceKey = animationWorkspaceKey({ projectId: "test-project", scope: { kind: "sequence", id: "main" } });
 const pendingDebug = () => new Promise<AnimationGraphDebugInfo>(() => {});
 let queuedResponses: Array<() => void> = [];
