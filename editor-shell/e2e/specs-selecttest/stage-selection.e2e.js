@@ -401,13 +401,95 @@ describe("the stage can select more than one thing", () => {
   });
 
   it("alt-click reaches the object BEHIND the one under the cursor", async () => {
-    const p = await objectPixel();
-    const cx = p.x;
-    const cy = p.y;
+    // THE PIXEL HAS TO HAVE SOMETHING BEHIND SOMETHING. The first version of this test used
+    // `objectPixel()` — any pixel with an object under it — and then said, of a pixel with exactly one
+    // hit, "the cycle returned to it, which is correct and proves nothing". That is a test that can
+    // PASS VACUOUSLY, and it is why the one run where it failed could not be diagnosed and the one
+    // where it passed could not be trusted. `pick_diagnostics` answers the full ORDERED hit list for a
+    // ray without touching the selection, so the pixel is now chosen for the property under test.
+    const deep = await browser.execute(async () => {
+      // A 7x7 grid found NOTHING on the seeded scene: 24 separated cubes, and no ray anywhere on it
+      // met two of them. That is why this test flipped between runs without a line of code changing —
+      // it was never exercising the cycle. 24x24 over the middle of the stage is ~576 rays at well
+      // under a millisecond each, and it early-exits as soon as it finds a deep enough one.
+      let best = null;
+      let scanned = 0;
+      for (let gy = 4; gy <= 76 && (!best || best.hits.length < 3); gy += 3) {
+        for (let gx = 4; gx <= 76 && (!best || best.hits.length < 3); gx += 3) {
+          const fx = gx / 80;
+          const fy = gy / 80;
+          scanned += 1;
+          // eslint-disable-next-line no-await-in-loop
+          const d = await window.__TAURI__.core.invoke("pick_diagnostics", { x: fx, y: fy });
+          const hits = d?.hits ?? [];
+          if (hits.length >= 2 && (!best || hits.length > best.hits.length)) {
+            best = { fx, fy, scanned, hits: hits.map((h) => ({ entity: h.entity, distance: h.distance, kind: h.kind })) };
+          }
+        }
+      }
+      return best ? { ...best, scanned } : { scanned, hits: null };
+    });
+    console.log(`  scanned ${deep.scanned} rays for one that meets two objects`);
+
+    if (!deep.hits) {
+      // Not a silent skip: a scene where no ray meets two objects cannot exercise the cycle, and a
+      // run that says nothing about that is indistinguishable from a run that verified it.
+      throw new Error(`none of ${deep.scanned} rays across the stage meets two objects — the cycle is untestable on this scene`);
+    }
+    const size = await browser.execute(() => ({ w: window.innerWidth, h: window.innerHeight }));
+    const cx = Math.round(deep.fx * size.w);
+    const cy = Math.round(deep.fy * size.h);
+    console.log(`  ${deep.hits.length} hits along the ray at (${cx}, ${cy}):`, JSON.stringify(deep.hits));
+
+    // THE MECHANISM THE PREVIOUS RUN HYPOTHESISED, AS A STANDING CHECK. `apply_click` resolves a hit
+    // to an entity id at the input boundary and treats an unnameable one as a click on empty space —
+    // so a cycle that lands on a hit the scene cannot name CLEARS the selection. `pick_diagnostics`
+    // reports the same resolution (`entity_of`, empty when it fails), which makes the condition
+    // observable here rather than only as a mysterious deselection.
+    const nameless = deep.hits.filter((h) => !h.entity);
+    if (nameless.length) {
+      throw new Error(`${nameless.length} of ${deep.hits.length} hits under the cursor resolve to no entity — a cycle onto one of them clears the selection`);
+    }
+
+    // THE TWO WAYS OF NAMING ONE POINT, COMPARED BEFORE ANYTHING IS CLICKED. `pick_diagnostics` and
+    // `viewport_peek` take a SURFACE FRACTION; a pointer event carries a window PIXEL, which the front
+    // end divides by `window.innerWidth/Height` (`normalizeSurfacePoint`). If those two disagree, every
+    // click in this file has been landing somewhere other than where its probe looked — which would
+    // make "alt-click cleared the selection" a report about the harness, not about the engine.
+    const peekAtFraction = await browser.execute(
+      async (fx, fy) => window.__TAURI__.core.invoke("viewport_peek", { x: fx, y: fy }),
+      deep.fx,
+      deep.fy,
+    );
+    const peekAtPixel = await browser.execute(
+      async (px, py) => window.__TAURI__.core.invoke("viewport_peek", { x: px / window.innerWidth, y: py / window.innerHeight }),
+      cx,
+      cy,
+    );
+    console.log(`  peek at fraction ${deep.fx},${deep.fy} -> ${peekAtFraction}; at pixel ${cx},${cy} -> ${peekAtPixel}`);
+    if (peekAtFraction !== peekAtPixel) {
+      throw new Error(`the probe and the pointer name different points: fraction says ${peekAtFraction}, the pixel a click carries says ${peekAtPixel}`);
+    }
 
     await stageClick(cx, cy);
     await sleep(400);
     const first = (await engineSelection())[0];
+    if (!first) throw new Error("the first click selected nothing — the scene is not under that pixel");
+    if (first !== peekAtFraction) {
+      // WHICH SIDE OF THE BOUNDARY. `viewport_pick` at the SAME fraction the probe used is the engine's
+      // own answer to a click; if it agrees with the probe, the front end sent a different point, and
+      // if it agrees with the click, the engine's click path and its hover path have diverged. This is
+      // the one direct invocation of a WRITE in this file and it exists only on the failure path.
+      const enginePick = await browser.execute(
+        async (fx, fy) => window.__TAURI__.core.invoke("viewport_pick", { x: fx, y: fy, shift: false, ctrl: false, cycle: false }),
+        deep.fx,
+        deep.fy,
+      );
+      throw new Error(
+        `hover and click are two different answers to one question: the probe says ${peekAtFraction}, ` +
+          `the click selected ${first}, and viewport_pick at the same fraction returns ${enginePick}`,
+      );
+    }
 
     // The SAME pixel, with alt held: the pick starts from the current active object and takes the
     // next one along the ray. Without `cycle` there is no gesture that reaches an occluded part
@@ -416,11 +498,20 @@ describe("the stage can select more than one thing", () => {
     await sleep(400);
     const second = (await engineSelection())[0];
     console.log(`  same pixel: ${first} -> ${second}`);
-    if (!first) throw new Error("the first click selected nothing — the scene is not under that pixel");
-    // A single object under the cursor cycles back to itself, which is correct and proves nothing.
-    // Report it rather than failing: what must never happen is the alt-click clearing the selection.
     if (!second) throw new Error("alt-click cleared the selection instead of cycling");
-    if (first === second) console.log("  (only one object under that pixel — the cycle returned to it)");
+    // The claim this scene now actually makes: with two objects along the ray, the cycle MOVED. A
+    // pixel with one hit can no longer reach this line, so "it returned to itself" is no longer an
+    // acceptable outcome dressed up as a pass.
+    if (first === second) {
+      throw new Error(`alt-click stayed on ${first} with ${deep.hits.length} objects along the ray: ${JSON.stringify(deep.hits.map((h) => h.entity))}`);
+    }
+    // And it went to the NEXT one, not to an arbitrary other one.
+    const order = deep.hits.map((h) => h.entity);
+    const i = order.indexOf(first);
+    const expected = i >= 0 ? order[(i + 1) % order.length] : null;
+    if (expected && second !== expected) {
+      console.log(`  NOTE the cycle went to ${second}, and the ordered list says the next one is ${expected}`);
+    }
     await shot("05_after_alt_cycle");
   });
 
