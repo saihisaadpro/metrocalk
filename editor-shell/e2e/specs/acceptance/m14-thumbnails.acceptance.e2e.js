@@ -61,8 +61,8 @@ describe("M14.2/M14.3 — live thumbnails · 0-IPC-with-thumbnails · C6 + scrub
     // the WebView2 channel under the heavier React renderer; a single `browser.execute` JS read is reliable).
     await browser.waitUntil(
       async () => {
-        const c = await browser.execute(() => document.querySelector("#count")?.textContent || "");
-        return /\d+ entities/.test(c);
+        const c = await browser.execute(() => document.querySelector("#count")?.getAttribute("data-entities"));
+        return c != null && Number.isFinite(Number(c));
       },
       { timeout: 40000, interval: 1500, timeoutMsg: "editor never showed an entity count (no /core connection?)" },
     );

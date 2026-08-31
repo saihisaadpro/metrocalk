@@ -27,7 +27,7 @@ describe("acceptance / north-star #1 — bind-by-intent, the full conjunction", 
   });
 
   it("launches, composites, and connects to /core (functional)", async () => {
-    expect(await ui.count()).toMatch(/\d+ entities/);
+    expect(await ui.entityCount()).toEqual(expect.any(Number));
     expect(await ui.status()).toContain("connected");
   });
 

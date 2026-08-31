@@ -20,12 +20,10 @@ import {
 const ui = page();
 const baseline = loadBaseline();
 
-// The live entity count as a NUMBER (the projection store's size, surfaced into #count as "N entities").
-// The stable structural signal that an add/generate placed an entity and that an undo removed it again.
-const entityCount = async () => {
-  const m = (await ui.count()).match(/(\d+)\s+entities/);
-  return m ? Number(m[1]) : NaN;
-};
+// The live entity count as a NUMBER, off `#count`'s `data-entities`. The stable structural signal that
+// an add/generate placed an entity and that an undo removed it again — a STRUCTURED attribute, never
+// the panel's prose, which is a thing product copy is allowed to change.
+const entityCount = () => ui.entityCount();
 
 describe("acceptance / add-palette + generate — the create-from-catalog + last-resort generation loops", () => {
   before(async () => {

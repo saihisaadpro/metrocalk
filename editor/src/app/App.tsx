@@ -10,10 +10,11 @@
 
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { createSession, isTauri, type EditorClient } from "../transport/session";
-import { projectionStore, useDisplayedEntity, useEntityOrder, useSelectedId } from "../store/projection";
+import { projectionStore, useDisplayedEntity, useEntityOrder, useMultiSelect, useSelectedId } from "../store/projection";
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
 import { setStatus } from "../store/ui";
+import { pushToast } from "../store/toasts";
 import { Modal, Popover } from "../theme/Popover";
 import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
@@ -38,6 +39,14 @@ import { EngineRail, ENGINES, engineById, type EngineId } from "./EngineRail";
 import { BottomDock, type BottomWorkspace } from "./BottomDock";
 import { onStageSurface } from "./stageInput";
 import { normalizeSurfacePoint } from "./viewportCoordinates";
+import { isMarqueeDrag, marqueeBox, marqueeMode, marqueeResult } from "./marquee";
+import { StageMarquee } from "./StageMarquee";
+import { selectionSentence, entityLabel } from "../store/selectionText";
+import { deleteSelection } from "./deleteSelection";
+import { selectAllWith, selectionCommands } from "./selectionCommands";
+import { environmentOutcome } from "./environmentOutcome";
+import { stateSelection } from "./stateSelection";
+import { requestObjectSearch } from "../store/find";
 
 // WHAT MAY BE DEFERRED, AND WHY THE LIST IS SHORT. A chunk that loads on demand is absent until the
 // gesture that needs it — so the only safe candidates are surfaces a user REACHES FOR: Pipe Forge
@@ -151,7 +160,9 @@ export function App() {
   usePlayerDrive(client); // arrows / WASD move the Player role while Play runs
   const native = isTauri(); // inside the packaged .exe the viewport is the real wgpu region (composite)
   // The M3.3 right-click context menu, opened for an entity at a cursor position.
-  const [ctx, setCtx] = useState<{ id: string; x: number; y: number } | null>(null);
+  // The right-click menu acts on the SELECTION (ADR-183), so what is stored here is the set, not the
+  // one id under the cursor. The primary is the last element, matching the projection store.
+  const [ctx, setCtx] = useState<{ ids: string[]; x: number; y: number } | null>(null);
   // M3.3 focus mode — the framed entity + its camera distance (read from `focus_debug`); drives the banner.
   const [focused, setFocused] = useState<{ id: string; dist: number } | null>(null);
   // Tracks a right-press for the orbit-vs-context-menu movement threshold (the scaffold's disambiguation).
@@ -159,6 +170,27 @@ export function App() {
   // M9 gizmo handle-drag: set by a left-press that HIT a gizmo handle (so the click doesn't re-pick + the
   // release commits). A ref (not state) so the click/up guards read it synchronously off the hot path.
   const gizmoHit = useRef(false);
+  // Box selection. The PRESS is a ref (read synchronously in the move handler, off the hot path) and only
+  // the drawn rectangle is state — so a press that turns out to be a click costs no render at all, and a
+  // real marquee re-renders one absolutely-positioned div and nothing else.
+  const marqueePress = useRef<{ x: number; y: number } | null>(null);
+  const [marqueeDrag, setMarqueeDrag] = useState<{
+    start: { x: number; y: number };
+    current: { x: number; y: number };
+    /** The stage's top-left in client coordinates, read ONCE when the box starts. The rectangle is an
+     *  absolutely-positioned child of the stage, so it needs stage-relative pixels; measuring the
+     *  element on every move would put a layout read on a pointer handler for a number that cannot
+     *  change while a pointer is captured. */
+    origin: { left: number; top: number };
+  } | null>(null);
+  // A completed marquee must not also arrive as a pick: `click` fires after `pointerup`, and without
+  // this the release of a box that selected fourteen objects would immediately re-select the one under
+  // the cursor. Consumed by the click it suppresses — and CLEARED AT THE NEXT PRESS, which is what
+  // bounds it to one gesture. Relying on the click alone was wrong and the live `.exe` run proved it:
+  // a drag whose release does not produce a click on the stage (the pointer left the window, or a
+  // synthetic sequence) left the flag standing, and the user's NEXT click on the stage was silently
+  // eaten. One lost click is indistinguishable from a dead viewport.
+  const marqueeConsumedClick = useRef(false);
   const [pipeStatus, setPipeStatus] = useState<PipeForgeStatus | null>(null);
   const pipeActive = pipeStatus?.active === true;
   const [pipeBusy, setPipeBusy] = useState(false);
@@ -182,6 +214,7 @@ export function App() {
   const paused = usePaused();
   const order = useEntityOrder();
   const selectedId = useSelectedId();
+  const multiSelect = useMultiSelect();
   const selectedEntity = useDisplayedEntity(selectedId ?? "");
   const editablePipeId = selectedId && selectedEntity?.components.PipeRecipe ? selectedId : null;
   const sceneEmpty = order.length === 0;
@@ -363,6 +396,19 @@ export function App() {
     }
   }
 
+  /**
+   * Ctrl/Cmd-F — the find chord, landing in the one box that searches the scene.
+   *
+   * The Scene workspace is opened FIRST because the outliner is a `hidden` tabpanel everywhere else,
+   * and focus into a `display:none` subtree is focus nobody can see. The request travels as store
+   * state rather than a ref, so the shell owns the keyboard and the panel owns its field — neither
+   * reaches into the other.
+   */
+  function findObjects() {
+    openEngine("scene");
+    requestObjectSearch();
+  }
+
   function activateDockRail(side: "left" | "right", workspace: string, anchor: HTMLButtonElement) {
     if (side === "left") setLeftWorkspace(workspace as LeftWorkspace);
     else setInspectorWorkspace(workspace as InspectorWorkspace);
@@ -398,16 +444,62 @@ export function App() {
       const editing = !!el && !!el.closest(
         "input, textarea, select, button, [contenteditable='true'], [role='button'], [role='slider'], [role='listbox'], [role='menu'], [data-command-scope]",
       );
+      // **UNDO AND REDO ARE CHORDS, AND A BUTTON DOES NOT OWN A CHORD.** The guard above exists for the
+      // BARE-LETTER shortcuts — W/E/R/F must not switch viewport tools while a control has the
+      // keyboard — and applying it to Ctrl-Z as well made the editor refuse the one promise it prints
+      // out loud. Found live in the packaged `.exe`: delete a selection from the Actions menu, focus
+      // returns to the trigger BUTTON, the toast and the status line both say "recoverable with
+      // Ctrl-Z", and Ctrl-Z does nothing at all until you click somewhere else first. A control that
+      // states a way out and then refuses it is worse than one that never offered.
+      //
+      // What genuinely owns Ctrl-Z is a TEXT-EDITING context, because that is where the browser's own
+      // undo stack lives and stealing it would lose typing. Nothing else.
+      const editingText = !!el && !!el.closest("input, textarea, [contenteditable='true']");
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setCommandsOpen(true);
+        return;
+      }
+      // Ctrl/Cmd-F — find objects. The one chord every person already knows for "where is it", and it
+      // was unbound: the scene search box was reachable only by opening the Scene workspace and
+      // clicking into it. Guarded on `editingText` because a text field owns the browser's own find.
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "f") {
+        if (editingText) return;
+        e.preventDefault();
+        findObjects();
+        return;
+      }
+      // Ctrl/Cmd-A — select every object. Guarded on `editingText` for the same reason Ctrl-Z is: a
+      // text field owns select-all-text, and nothing else owns this chord.
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "a") {
+        if (editingText) return;
+        e.preventDefault();
+        selectAll();
+        return;
+      }
+      // **DELETE / BACKSPACE — the most-pressed key in any editor, and it was not bound at all**
+      // (ADR-183). The only two routes to deleting anything were a row inside a popup menu in the left
+      // dock and a right-click row that destroyed one object; a person who selected 378 bolts and
+      // pressed Delete got silence. Guarded on `editingText` rather than the wider `editing`, for the
+      // same reason Ctrl-Z is: a text field owns Delete over its own characters, and nothing else does
+      // — including a focused BUTTON, which is exactly where focus lands after the Actions menu runs.
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (editingText) return;
+        if (playing || pipeActive) return;
+        const ids = projectionStore.getState().multiSelect;
+        if (!ids.length) return;
+        e.preventDefault();
+        void deleteSelection(client, ids).then((outcome) => {
+          setStatus(outcome.sentence);
+          pushToast(outcome.ok ? outcome.sentence : "couldn't delete the selection", outcome.ok ? "info" : "error");
+        });
         return;
       }
       const redoGesture =
         (e.ctrlKey || e.metaKey) &&
         (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"));
       if (redoGesture) {
-        if (editing) return;
+        if (editingText) return;
         e.preventDefault();
         if (pipeActive) {
           setStatus("Finish or cancel the active route before redoing scene changes");
@@ -418,7 +510,7 @@ export function App() {
       }
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
         // Don't hijack TEXT undo while the user is typing in a field — only undo the SCENE otherwise.
-        if (editing) return;
+        if (editingText) return;
         e.preventDefault();
         if (pipeActive && !pipeBusy) {
           void client.pipeForgeUndo().then((status) => {
@@ -533,6 +625,13 @@ export function App() {
     void client.gizmoSelect(id);
   };
 
+  // SELECTING WITHOUT A GESTURE (ADR-176). ADR-158 gave the stage the four gestures the engine
+  // understood; these are the verbs no gesture can express. Both halves of the selection, always —
+  // the store the Inspector reads AND the engine model the picture is outlined from — through the
+  // same `selectEntities` seam the outliner uses.
+  const applySelection = (ids: string[], sentence: string) => stateSelection(client, ids, sentence);
+  const selectAll = selectAllWith({ apply: applySelection });
+
   const importAsset = () => {
     void client.importAssetDialog().then((id) => {
       selectCreated(id);
@@ -561,6 +660,43 @@ export function App() {
     { id: "create-entity", label: "Create empty entity", category: "Create", description: "Add a named object at the origin", execute: async () => selectCreated(await client.createEntity(0, 1, 0, "Entity")) },
     { id: "create-light", label: "Add point light", category: "Create", description: "Add a warm point light above the origin", execute: async () => selectCreated(await client.addLight("point", 0, 4, 0, 1, 0.96, 0.9, 60)) },
     { id: "import-asset", label: "Import asset…", category: "Create", description: "Choose a supported 3D, image, or CAD file", execute: async () => selectCreated(await client.importAssetDialog()) },
+    // From the one exported list, so the rows a `shots` capture photographs are the rows that ship.
+    ...selectionCommands({
+      apply: applySelection,
+      say: setStatus,
+      find: findObjects,
+      hasSelection: multiSelect.length > 0,
+      sceneEmpty,
+    }),
+    // The scene's LIGHT, reachable without first knowing that a closed section in the Scene column
+    // holds it. Both rows read the reply through the same `environmentOutcome` the panel uses, so a
+    // dismissed file dialog is silent here too rather than reported as a failure.
+    {
+      id: "look-environment",
+      label: "Light the scene from a sky image…",
+      category: "Lighting",
+      description: "Choose a Radiance .hdr panorama — it lights the scene and shows in reflections",
+      keywords: ["hdri", "environment", "panorama", "sky", "ibl"],
+      execute: async () => {
+        const outcome = environmentOutcome(await client.importEnvironment());
+        if (!outcome) return;
+        pushToast(outcome.message, outcome.tone);
+        setStatus(outcome.message);
+      },
+    },
+    {
+      id: "look-environment-reset",
+      label: "Use the built-in studio sky",
+      category: "Lighting",
+      description: "Drop the loaded panorama and go back to the default lighting",
+      keywords: ["environment", "reset", "default"],
+      execute: async () => {
+        const outcome = environmentOutcome(await client.resetEnvironment());
+        if (!outcome) return;
+        pushToast(outcome.message, outcome.tone);
+        setStatus(outcome.message);
+      },
+    },
     { id: "view-frame-all", label: "Frame all", category: "View", description: "Fit the whole scene in the viewport", execute: () => client.frameAll() },
     { id: "view-top", label: "Top view", category: "View", execute: () => client.viewPreset("top") },
     { id: "view-front", label: "Front view", category: "View", execute: () => client.viewPreset("front") },
@@ -591,8 +727,8 @@ export function App() {
         setDockFlyout(null);
       }}
       onImport={importAsset}
-      onContextMenu={(id, x, y) => {
-        if (!playing) setCtx({ id, x, y });
+      onContextMenu={(ids, x, y) => {
+        if (!playing) setCtx({ ids, x, y });
       }}
       onCollapse={!layout.collapsed && !leftDockCollapsed ? () => {
         setLeftDockCollapsed(true);
@@ -718,23 +854,43 @@ export function App() {
               return;
             }
             if (e.button === 0) {
+              // A new press begins a new gesture, so nothing the LAST one left behind may still be
+              // suppressing this one's click.
+              marqueeConsumedClick.current = false;
               if (pipeActive) return; // drawing owns the click; do not start a gizmo drag underneath it
               // M9 gizmo handle-grab: only when an entity is selected; if a handle is HIT the render loop
               // drags it natively (0 IPC/frame, like orbit) and the release commits. A miss falls through to
               // the normal pick. The hit flag resolves async, so a WebDriver synthetic click (which fires
               // immediately) still picks normally — the suppression is for real human-timed drags.
               gizmoHit.current = false;
+              // A left-press on bare stage is the start of a box selection until it turns out to be a
+              // click. Recorded even when a gizmo probe is in flight: if the probe comes back HIT, the
+              // press is withdrawn below, because dragging a handle and dragging a box are the same
+              // gesture until the engine answers which one it was.
+              if (!playing) marqueePress.current = { x: e.clientX, y: e.clientY };
               if (projectionStore.getState().selectedId) {
                 const { x: nx, y: ny } = normalizeSurfacePoint(e.clientX, e.clientY);
                 void client
                   .gizmoPickDrag(nx, ny, e.ctrlKey || e.metaKey)
-                  .then((hit) => (gizmoHit.current = hit))
+                  .then((hit) => {
+                    gizmoHit.current = hit;
+                    if (hit) {
+                      marqueePress.current = null;
+                      setMarqueeDrag(null);
+                    }
+                  })
                   .catch(() => {});
               }
             }
           }}
           onClick={(e) => {
             if (!onStageSurface(e)) return;
+            // A drag that drew a box is not a pick either. `click` fires after `pointerup`, so without
+            // this the release would re-select whatever is under the cursor and throw the box away.
+            if (marqueeConsumedClick.current) {
+              marqueeConsumedClick.current = false;
+              return;
+            }
             // A left-press that grabbed a gizmo handle is a DRAG, not a pick — don't re-select.
             if (gizmoHit.current && !pipeActive) {
               gizmoHit.current = false;
@@ -756,12 +912,29 @@ export function App() {
                 .catch((err) => console.error("pipe_forge_point failed", err));
               return;
             }
+            // What the keyboard was doing is part of the gesture, and the engine has understood these
+            // three since picking was rebuilt — the front end simply never sent them. Shift extends,
+            // Ctrl/Cmd toggles, Alt takes the NEXT object under the cursor so the part behind the part
+            // you can see is reachable without hiding anything.
+            const mods = { extend: e.shiftKey, toggle: e.ctrlKey || e.metaKey, cycle: e.altKey };
+            const modified = mods.extend || mods.toggle;
             void client
-              .viewportPick(nx, ny)
-              .then((picked) => {
+              .viewportPick(nx, ny, mods)
+              .then(async (picked) => {
+                if (modified) {
+                  // A toggle that DESELECTED still hit something, so the hit cannot say what is
+                  // selected now. Read the set back rather than predicting it — the one extra round
+                  // trip happens on a modified click and never on a plain one.
+                  const ids = await client.selectionIds().catch(() => null);
+                  if (ids) {
+                    projectionStore.getState().setSelection(ids);
+                    setStatus(selectionSentence(ids.length));
+                    return;
+                  }
+                }
                 if (picked) {
                   projectionStore.getState().select(picked);
-                  setStatus(`picked ${picked}`);
+                  setStatus(entityLabel(picked));
                 } else {
                   setStatus("nothing here");
                 }
@@ -777,10 +950,67 @@ export function App() {
           onPointerMove={(e) => {
             const rd = rightDrag.current;
             if (rd && (Math.abs(e.clientX - rd.x) > 6 || Math.abs(e.clientY - rd.y) > 6)) rd.moved = true;
+            const press = marqueePress.current;
+            if (!press || gizmoHit.current || pipeActive) return;
+            const current = { x: e.clientX, y: e.clientY };
+            if (!marqueeDrag && !isMarqueeDrag(press, current)) return;
+            // Capture on the FIRST move that qualifies, not on the press: a plain click must not
+            // redirect events away from the overlays it might have landed on, and a real box drag must
+            // keep receiving moves after the cursor leaves the window — otherwise letting go outside
+            // the stage strands a rectangle on screen with no release to clear it.
+            // `try` because pointer capture is not universal: jsdom has no implementation at all, and a
+            // synthetic event carries no live pointer for a real browser to capture. Neither is a reason
+            // to abandon the box — capture is an improvement to a drag that already works without it.
+            if (!marqueeDrag) {
+              try {
+                e.currentTarget.setPointerCapture(e.pointerId);
+              } catch {
+                /* the drag still tracks through the element's own move events */
+              }
+            }
+            const origin = marqueeDrag?.origin ?? (({ left, top }) => ({ left, top }))(e.currentTarget.getBoundingClientRect());
+            setMarqueeDrag({ start: press, current, origin });
           }}
           onPointerUp={(e) => {
             if (e.button === 2 && rightDrag.current) client.dragEnd();
             if (e.button === 0 && gizmoHit.current) client.gizmoDragEnd(); // commit the gizmo move (one tx)
+            const drag = marqueeDrag;
+            marqueePress.current = null;
+            if (!drag || e.button !== 0) {
+              setMarqueeDrag(null);
+              return;
+            }
+            setMarqueeDrag(null);
+            marqueeConsumedClick.current = true;
+            try {
+              if (e.currentTarget.hasPointerCapture?.(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
+            } catch {
+              /* nothing was captured */
+            }
+            // The corners go over IN THE ORDER THEY WERE DRAGGED. The engine reads the policy from the
+            // direction (`ScreenRect::from_drag`), so normalizing them here would silently make every
+            // marquee an enclose — and the caption on screen would be lying about what just happened.
+            const mode = marqueeMode(drag.start.x, drag.current.x);
+            const extend = e.shiftKey || e.ctrlKey || e.metaKey;
+            const from = normalizeSurfacePoint(drag.start.x, drag.start.y);
+            const to = normalizeSurfacePoint(drag.current.x, drag.current.y);
+            void client
+              .viewportPickRegion(from.x, from.y, to.x, to.y, extend)
+              .then((ids) => {
+                projectionStore.getState().setSelection(ids);
+                setStatus(selectionSentence(ids.length, ids));
+                // At the gesture, not only in the gutter (`<ux_quality>` 2): the box is gone by the
+                // time the answer arrives, and a count that only appears in the status bar is a count
+                // nobody looking at the stage will read.
+                pushToast(marqueeResult(ids.length, mode, extend), ids.length ? "success" : "info");
+              })
+              .catch((err) => console.error("viewport_pick_region failed", err));
+          }}
+          onPointerCancel={() => {
+            // A cancelled pointer (the OS took it, a touch was interrupted) must not leave a rectangle
+            // painted over the stage with no release coming to clear it.
+            marqueePress.current = null;
+            setMarqueeDrag(null);
           }}
           onWheel={(e) => {
             // A wheel over a panel floating on the stage scrolls THAT PANEL. Before this line every
@@ -814,8 +1044,11 @@ export function App() {
             const orbited = rightDrag.current?.moved;
             rightDrag.current = null;
             if (orbited) return;
-            const sel = projectionStore.getState().selectedId;
-            if (sel) setCtx({ id: sel, x: e.clientX, y: e.clientY });
+            // THE WHOLE SELECTION, not the primary. `selectedId` is one of what may be 378 outlined
+            // objects; a menu built from it offered `Delete` over a picture of 378 and removed one.
+            const { multiSelect, selectedId } = projectionStore.getState();
+            const sel = multiSelect.length ? multiSelect : selectedId ? [selectedId] : [];
+            if (sel.length) setCtx({ ids: sel, x: e.clientX, y: e.clientY });
           }}
           style={{
             position: "relative",
@@ -940,6 +1173,13 @@ export function App() {
               onImport={importAsset}
             />
           )}
+          {marqueeDrag && (
+            <StageMarquee
+              box={marqueeBox(marqueeDrag.start, marqueeDrag.current)}
+              origin={marqueeDrag.origin}
+              mode={marqueeMode(marqueeDrag.start.x, marqueeDrag.current.x)}
+            />
+          )}
           {/* Keep transient feedback below the authoring toolbar; passive toasts must not cover tools. */}
           <ToastHost top={playing ? 52 : 58} />
         </div>
@@ -1048,7 +1288,7 @@ export function App() {
           <Popover open anchorPoint={{ x: ctx.x, y: ctx.y }} onClose={() => setCtx(null)}>
             <ContextMenu
               client={client}
-              id={ctx.id}
+              ids={ctx.ids}
               onClose={() => setCtx(null)}
               onFocus={(id, dist) => setFocused({ id, dist })}
             />

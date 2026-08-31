@@ -22,6 +22,12 @@ import {
   type AssetLabStage,
 } from "../../src/panels/AssetLabPanel";
 import { STAGE_MIN } from "../../src/app/layout";
+import { CommandPalette } from "../../src/panels/CommandPalette";
+import { ContextMenu } from "../../src/panels/ContextMenu";
+import { Hierarchy } from "../../src/panels/Hierarchy";
+import { LookSection } from "../../src/panels/LookSection";
+import { selectionCommands } from "../../src/app/selectionCommands";
+import { StageMarquee } from "../../src/app/StageMarquee";
 import { BindingGraph } from "../../src/graph/BindingGraph";
 import { Icon, iconTokens } from "../../src/theme/icons";
 import { Inspector } from "../../src/inspector/Inspector";
@@ -192,6 +198,13 @@ export type Scene = {
    *  did nothing would photograph the default state under a caption claiming another, which is worse
    *  than no capture at all. */
   click?: string[];
+  /** Text typed into a control the clicks reached, as `[selector, value]` pairs, after every click.
+   *
+   *  `page.$` searches the whole document rather than the frame, so this reaches a field inside a
+   *  PORTALLED dialog — which is where a command palette's query and a dialog's search have always
+   *  lived. The driver selects the field's existing contents first, so two scenes typing into the
+   *  same selector cannot depend on which ran before. */
+  type?: [selector: string, value: string][];
   setup?: () => void;
   render: () => ReactNode;
 };
@@ -1037,8 +1050,60 @@ export const SCENES: Scene[] = [
   ...assetScenes(),
   ...modelScenes(),
   ...gameplayScenes(),
+  ...selectionVerbScenes(),
+  ...outlinerFindScenes(),
+  ...lookScenes(),
+  ...contextMenuScenes(),
   ...shellScenes(),
+  ...selectionScenes(),
 ];
+
+// ── selecting more than one thing ──────────────────────────────────────────────────────────────────
+
+/** The box you drag on the stage, in both of the modes the engine has and nothing ever showed.
+ *
+ *  A marquee is a gesture, and this harness photographs states — so what is on trial here is the one
+ *  thing a state CAN answer: whether a reader can tell the two modes apart, and read the word that
+ *  names the one they are in, at the size it is actually drawn. The engine has always had
+ *  crossing-versus-enclosing; two identical-looking rectangles selecting different sets is exactly
+ *  the confusion this caption exists to remove, and a caption that is illegible removes nothing. */
+function selectionScenes(): Scene[] {
+  return [
+    {
+      id: "stage-marquee-modes",
+      looking_for:
+        "TWO BOXES, TWO RULES, TOLD APART WITHOUT READING. Left is a left-to-right drag — solid edge, " +
+        "'Fully inside'. Right is a right-to-left drag — dashed edge, 'Touched'. What a reader checks: " +
+        "the two edges are distinguishable at a glance (the border style carries the mode as well as the " +
+        "word does, so the rule survives peripheral vision during a drag); the caption is legible at the " +
+        "12px it is drawn at and sits OUTSIDE the box on the corner the drag is heading towards, not " +
+        "under the hand; and neither caption is clipped by its own box",
+      expect: {
+        present: [["[data-testid='stage-marquee']", 2]],
+        text_present: ["Fully inside", "Touched"],
+        text_absent: ["null", "undefined", "NaN", "enclose", "touch"],
+        // The caption is the point. If it is clipped, the rule it names is unreadable exactly when it
+        // matters — mid-drag, at a glance.
+        unclipped: ["[data-testid='stage-marquee'] span"],
+      },
+      viewport: { width: 760, height: 320 },
+      render: () => (
+        <div style={{ position: "relative", width: 760, height: 320, background: "var(--mtk-bg-inset)" }}>
+          <StageMarquee
+            box={{ left: 60, top: 60, width: 260, height: 160 }}
+            origin={{ left: 0, top: 0 }}
+            mode="enclose"
+          />
+          <StageMarquee
+            box={{ left: 430, top: 60, width: 260, height: 160 }}
+            origin={{ left: 0, top: 0 }}
+            mode="touch"
+          />
+        </div>
+      ),
+    },
+  ];
+}
 
 // ── the inspector ─────────────────────────────────────────────────────────────────────────────────
 
@@ -1579,6 +1644,493 @@ function shell(
     },
     render: () => <App />,
   };
+}
+
+/** THE PALETTE IS WHERE A CAPABILITY WITH NO GESTURE IS FOUND (ADR-176).
+ *
+ *  Three of the four selection verbs have no gesture and none could be invented — "everything",
+ *  "nothing", "the rest" are not shapes you can draw on a stage — and the fourth asks a question about
+ *  what the objects ARE rather than where they are, which a rectangle cannot ask either. So the
+ *  palette is not a convenience route to these; it is the only route, and whether the group reads as a
+ *  group is the whole of whether they are discoverable.
+ *
+ *  The rows come from `selectionCommands`, the same exported function `App` spreads into its own list,
+ *  so this photographs the SHIPPED rows rather than a copy of them that agrees with the product today.
+ *  A vitest case can assert the four rows exist; only a capture answers whether a person scanning the
+ *  palette sees them as one group, with descriptions that fit and a refusal that is readable. */
+function selectionVerbScenes(): Scene[] {
+  return [
+    {
+      id: "palette-selection",
+      looking_for:
+        "the Selection group as a user meets it: five verbs under one heading, each with a " +
+        "plain-language description; `Find objects…` and `Select all` printing their own chords on the " +
+        "row, which is where a chord is learned; and the two that need a selection DISABLED with their " +
+        "reasons in words — `Nothing is selected`, `Select an object first` — rather than silently " +
+        "inert. What a reader checks: the five labels are distinguishable at a glance, no description " +
+        "wraps into its neighbour, the two chord badges sit on their own rows rather than colliding " +
+        "with the descriptions beside them, and the disabled rows are legible rather than merely faded",
+      viewport: { width: 900, height: 560 },
+      expect: {
+        present: [
+          ["[data-testid='command-palette']", 1],
+          ["[data-testid='command-palette'] [role='option']", 5],
+        ],
+        text_present: [
+          "Selection",
+          "Find objects",
+          "Select all",
+          "Select none",
+          "Invert selection",
+          "Select similar",
+          // The two refusals, in words. A disabled row that does not say why is `<ux_quality>` 4 and 6.
+          "Nothing is selected",
+          "Select an object first",
+        ],
+        text_absent: ["null", "undefined", "NaN"],
+        // A description that ran off the dialog would still satisfy `text_present`, because
+        // `textContent` does not know where anything is.
+        unclipped: ["[data-testid='command-palette']"],
+      },
+      render: () => (
+        <CommandPalette
+          open
+          onClose={() => {}}
+          commands={selectionCommands({
+            apply: () => {},
+            say: () => {},
+            find: () => {},
+            // The state a fresh shell is in, which is when a user is most likely to be looking for
+            // these — and therefore the state whose refusals have to be readable.
+            hasSelection: false,
+            sceneEmpty: false,
+          })}
+        />
+      ),
+    },
+  ];
+}
+
+/** THE SUB-ENGINE THE AUDIT KEPT FINDING (ADR-186).
+ *
+ *  `import_environment` and `set_exposure` were registered commands with no caller in `editor/src`, so
+ *  the only ways to light a scene with a real sky were an environment variable read once at process
+ *  start and a driving script. What a capture answers that the vitest suite cannot: whether this reads
+ *  as a control panel or as three unrelated lines. The two states are deliberately paired — the panel
+ *  a fresh project meets, and the panel once a panorama is in — because the second grows two elements
+ *  (the reset and the measured brightness) and the row has to survive both.
+ *
+ *  Photographed at the width it ships in: 328 px inside the left dock's 340 px track. */
+function lookScenes(): Scene[] {
+  const seedLitScene = () => {
+    projectionStore.getState().bulkLoad([
+      { id: "skid", name: "Skid Frame", parentId: null, components: { Transform: {}, MeshRenderer: { mesh: "mtkasset:skid" } } },
+      { id: "key", name: "Key Light", parentId: null, components: { Transform: {}, Light: { intensity: 60 } } },
+      { id: "fill", name: "Fill Light", parentId: null, components: { Transform: {}, Light: { intensity: 20 } } },
+    ] as never);
+  };
+
+  const seedUnlitScene = () => {
+    projectionStore.getState().bulkLoad([
+      { id: "skid", name: "Skid Frame", parentId: null, components: { Transform: {}, MeshRenderer: { mesh: "mtkasset:skid" } } },
+    ] as never);
+  };
+
+  const lookClient = (env: {
+    applied: boolean;
+    label: string;
+    width: number;
+    height: number;
+    meanRadiance: [number, number, number];
+  }) =>
+    ({
+      environmentState: () =>
+        Promise.resolve({ ...env, message: "", reason: null, path: env.applied ? "C:/skies/kloppenheim_06.hdr" : null, cancelled: false }),
+      colourStatus: () =>
+        Promise.resolve({
+          spaces: [], views: [], capabilities: {}, notes: [],
+          working: {
+            current: "linearRec709", label: "Linear Rec.709", wired: true, options: [],
+            setCommand: "set_working_space", luminanceWeights: [0.2126, 0.7152, 0.0722],
+          },
+          activeView: "acesFit", activeViewLabel: "Filmic (ACES-like)",
+          setViewCommand: "set_render_profile", setViewArg: "cinematic",
+          presentationHash: "0000000000000709", exposure: 0.9,
+          environment: { sourceSpace: "linearRec709", label: "Linear Rec.709", assumed: true, options: [], setCommand: "set_environment_colour_space" },
+        }),
+      importEnvironment: () => Promise.resolve({ applied: false, label: "", width: 0, height: 0, meanRadiance: [0, 0, 0], message: "", reason: null, path: null, cancelled: true }),
+      resetEnvironment: () => Promise.resolve({ applied: true, label: "Studio (built in)", width: 0, height: 0, meanRadiance: [0, 0, 0], message: "Back to the built-in studio lighting", reason: null, path: null, cancelled: false }),
+      setExposure: (e: number) => Promise.resolve(e),
+    }) as unknown as EditorClient;
+
+  const inDock = (children: ReactNode) => (
+    <div style={{ width: 328, padding: 12, display: "flex", flexDirection: "column" }}>{children}</div>
+  );
+
+  return [
+    {
+      id: "scene-look-studio",
+      looking_for:
+        "the panel a fresh project meets: the built-in sky, no reset control (there is nothing to reset " +
+        "FROM), the scene's own two lights counted, and an exposure slider reading in stops rather than " +
+        "in the engine's 0.05..8 multiplier. What a reader checks: that the three blocks read as one " +
+        "control panel down a 328px column rather than as three unrelated lines, and that the exposure " +
+        "value label is attached to its own slider rather than floating between the two",
+      width: 380,
+      expect: {
+        present: [
+          ["[data-testid='look-section']", 1],
+          ["[data-testid='look-exposure']", 1],
+          // The reset is offered only when a panorama is loaded — an always-present control that does
+          // nothing on the default state is the inert-control defect.
+          ["[data-testid='look-env-reset']", 0],
+          // No measured brightness either: there is no file to have measured.
+          ["[data-testid='look-brightness']", 0],
+        ],
+        text_present: ["Studio (built in)", "Use a sky image", "2 lights", "+1.0 stops"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='look-env-choose']", "[data-testid='look-exposure']"],
+      },
+      setup: seedLitScene,
+      render: () =>
+        inDock(
+          <LookSection client={lookClient({ applied: false, label: "Studio (built in)", width: 0, height: 0, meanRadiance: [0, 0, 0] })} />,
+        ),
+    },
+    {
+      id: "scene-look-panorama",
+      looking_for:
+        "the same panel with a real 4k panorama in, on a scene with NO lights of its own. Two elements " +
+        "appear: the way back to the studio sky, and the MEASUREMENT line — the size and the brightness " +
+        "the engine already computed and displayed nowhere. What a reader checks: three distinguishable " +
+        "registers down a 328px column, not three grey paragraphs — the measurement reads as numbers " +
+        "about the file, the help under it reads as help, and the ruled-off line at the bottom reads as " +
+        "a footnote about the scene. The first capture of this panel had all three as the same grey " +
+        "sentence at the same indent, and every selector assertion passed",
+      width: 380,
+      expect: {
+        present: [
+          ["[data-testid='look-env-reset']", 1],
+          ["[data-testid='look-brightness']", 1],
+        ],
+        text_present: ["kloppenheim_06", "4096×2048", "stops over mid grey", "No lights in this scene"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='look-env-choose']", "[data-testid='look-env-reset']", "[data-testid='look-brightness']"],
+        // The two verbs are ONE row: a "Studio sky" that drops to its own line reads as a second,
+        // unrelated action rather than as the way back out of the first.
+        same_line: [["[data-testid='look-env-choose']", "[data-testid='look-env-reset']"]],
+      },
+      setup: seedUnlitScene,
+      render: () =>
+        inDock(
+          <LookSection client={lookClient({ applied: true, label: "kloppenheim_06", width: 4096, height: 2048, meanRadiance: [0.55, 0.52, 0.46] })} />,
+        ),
+    },
+  ];
+}
+
+/** THE LIST THAT COULD NAME A SET AND COULD NOT SELECT IT (ADR-185).
+ *
+ *  Two claims here are exactly the kind a capture answers and a unit test cannot. The first is whether
+ *  the chips READ as a vocabulary — five of them, wrapped inside a 340 px dock, each carrying a count
+ *  in a second treatment — or as a wall of small grey buttons a person scans past on the way to the
+ *  rows. The second is whether `Select all 6` reads as a verb on the result rather than as one more
+ *  chip: it is the control that turns a search into a selection, and if the eye does not find it, the
+ *  capability is exactly as unreachable as it was before it existed.
+ *
+ *  A vitest case already asserts every count, every token and every id. Only a picture says whether a
+ *  person meeting this panel for the first time learns that `kind:` is a thing they can type. */
+function outlinerFindScenes(): Scene[] {
+  // An industrial assembly at a believable mix — mostly one repeated part, a handful of lights, and a
+  // few of everything else. The digits matter: chips reading `171` and `2` side by side are what a
+  // reader is judging, not chips reading `3` and `2`.
+  const seedPlant = () => {
+    const rows: unknown[] = [];
+    for (let i = 0; i < 171; i += 1) {
+      rows.push({
+        id: `part-${i}`,
+        name: i % 3 === 0 ? "Bolt M12 — Hex Head, Zinc" : `Skid Frame Member ${i}`,
+        parentId: null,
+        components: { Transform: {}, MeshRenderer: { mesh: "mtkasset:bolt-m12" } },
+      });
+    }
+    for (let i = 0; i < 6; i += 1) {
+      rows.push({
+        id: `bay-light-${i}`,
+        name: `Bay Light ${i + 1}`,
+        parentId: null,
+        components: { Transform: {}, Light: { intensity: 60 } },
+      });
+    }
+    rows.push({ id: "cam-line", name: "Line Camera", parentId: null, components: { Transform: {}, Camera: {} } });
+    rows.push({ id: "cam-cell", name: "Cell Camera", parentId: null, components: { Transform: {}, Camera: {} } });
+    for (let i = 0; i < 5; i += 1) {
+      rows.push({
+        id: `drive-${i}`,
+        name: `Conveyor Drive ${i + 1}`,
+        parentId: null,
+        components: { Transform: {}, RigidBody: { mass: 40 }, MeshRenderer: { mesh: "mtkasset:drive" } },
+      });
+    }
+    rows.push({
+      id: "extractor",
+      name: "Extractor Fan",
+      parentId: null,
+      components: { Transform: {}, AudioSource: { gain: 0.4 } },
+    });
+    projectionStore.getState().bulkLoad(rows as never);
+  };
+
+  const outlinerClient = () =>
+    ({
+      selectEntities: (ids: string[]) => Promise.resolve(ids),
+      gizmoSelect: () => Promise.resolve(),
+      reparentPart: () => {},
+    }) as unknown as EditorClient;
+
+  // THE WIDTH THIS PANEL SHIPS IN, not a comfortable one. The left track is 340 px (`layout.ts`) and
+  // `.mtk-shell-track--left` spends 4 + 8 px of it on the shell gutter, so the card is 328 px and the
+  // panel fills it. A chip row photographed at 380 cannot wrap the way the shipped one wraps, and a
+  // scene that cannot fail the way the product fails is not evidence. The dock also gives the panel its
+  // HEIGHT: in an auto-height frame this list would be five rows under a caption about 185 objects.
+  const inDock = (children: ReactNode) => (
+    <div style={{ width: 328, height: 560, display: "flex", flexDirection: "column" }}>{children}</div>
+  );
+
+  return [
+    {
+      id: "outliner-find",
+      looking_for:
+        "the outliner as a user meets it on a 185-object import: a search box that says what else it " +
+        "accepts, and beneath it ONE row — the two largest kinds this scene contains with their " +
+        "counts, and a control naming the three it is holding back. The cap is measured, not " +
+        "aesthetic: on the packaged .exe the uncapped row took 98px of a 355px panel and pushed the " +
+        "object list to its 180px minimum. What a reader checks: the row is ONE row, `+3 more` reads " +
+        "as a way to see more rather than as a third filter, the count on each chip is " +
+        "distinguishable from its label rather than reading as part of the name, and the object rows " +
+        "below have visibly more room than the chrome above them",
+      width: 380,
+      expect: {
+        present: [
+          ["[data-testid='hierarchy']", 1],
+          ["[data-testid='scene-facets']", 1],
+          // Two facets and the overflow control: three controls, one row.
+          ["[data-testid='scene-facets'] [data-facet]", 2],
+          ["[data-facet='kind:mesh']", 1],
+          ["[data-facet='kind:light']", 1],
+          ["[data-testid='more-facets']", 1],
+          // No verb yet, because nothing has been asked: the button appears with the result.
+          ["[data-testid='select-matches']", 0],
+        ],
+        text_present: ["185 entities", "Meshes", "171", "Lights", "+3 more"],
+        // NEVER A SILENT TRUNCATION: what is hidden is counted on the control, so the reader can see
+        // that three were withheld rather than that five were never there.
+        text_absent: ["null", "undefined", "NaN", "Audio sources"],
+        // A chip whose count ran outside the dock would still satisfy `text_present`, because
+        // `textContent` does not know where anything is.
+        unclipped: ["[data-testid='scene-facets']", "[data-testid='hierarchy']"],
+        // The three controls are ONE row, which is the whole claim the cap exists to make.
+        same_line: [
+          ["[data-facet='kind:mesh']", "[data-facet='kind:light']"],
+          ["[data-facet='kind:light']", "[data-testid='more-facets']"],
+        ],
+      },
+      setup: seedPlant,
+      render: () => inDock(<Hierarchy client={outlinerClient()} />),
+    },
+    {
+      id: "outliner-find-all",
+      looking_for:
+        "the same row expanded — every kind this scene contains, wrapping inside the 328px dock. What " +
+        "a reader checks: no chip is clipped or overlapping at the wrap, the counts stay attached to " +
+        "their own labels across a line break, and `Fewer` is recognisable as the way back rather " +
+        "than as one more filter",
+      width: 380,
+      click: ["[data-testid='more-facets']"],
+      expect: {
+        present: [
+          ["[data-testid='scene-facets'] [data-facet]", 5],
+          ["[data-facet='kind:camera']", 1],
+          ["[data-facet='kind:physics']", 1],
+          ["[data-facet='kind:audio']", 1],
+        ],
+        text_present: ["Meshes", "Lights", "Physics bodies", "Cameras", "Audio sources", "Fewer"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='scene-facets']", "[data-testid='hierarchy']"],
+      },
+      setup: seedPlant,
+      render: () => inDock(<Hierarchy client={outlinerClient()} />),
+    },
+    {
+      id: "outliner-find-result",
+      looking_for:
+        "the same panel once a question has been asked — `kind:light` over 185 objects. What a reader " +
+        "checks: the header states 6 of 185 rather than only 6; the Lights chip is visibly PRESSED, " +
+        "so the way back out is the control that got you in; and `Select all 6` reads as a verb on " +
+        "the result rather than as a sixth chip — this is the control that turns a search into a " +
+        "selection every other verb in the editor already acts on, and if the eye does not find it " +
+        "the capability is as unreachable as it was before it existed",
+      width: 380,
+      type: [["input[aria-label='Search scene objects']", "kind:light"]],
+      expect: {
+        present: [
+          ["[data-testid='hierarchy'] [data-testid='hrow']", 6],
+          // The scope is a STRUCTURED signal, not copy — a test keyed on the sentence would break the
+          // first time the wording changed, and a wording change is not a scope change.
+          ["[data-testid='select-matches'][data-count='6']", 1],
+          ["[data-facet='kind:light'][aria-pressed='true']", 1],
+          ["[data-facet='kind:mesh'][aria-pressed='false']", 1],
+          ["[data-testid='scene-facets'] [data-facet]", 2],
+        ],
+        text_present: ["6 of 185 entities", "Select all 6", "Bay Light 1", "Bay Light 6"],
+        text_absent: ["null", "undefined", "NaN", "Bolt M12"],
+        unclipped: ["[data-testid='select-matches']", "[data-testid='scene-facets']"],
+      },
+      setup: seedPlant,
+      render: () => inDock(<Hierarchy client={outlinerClient()} />),
+    },
+  ];
+}
+
+/** THE MENU THAT OPENS ON WHAT IS SELECTED (ADR-183).
+ *
+ *  The editor produces large selections from three places — the marquee, Ctrl+A, and `Select similar`,
+ *  which on the Skid Weld Line answers with 378 identical bolts — and this menu asked the engine about
+ *  one id and acted on one object. The change is not that a verb was added; it is that every row now
+ *  carries the number of selected objects it acts on, and the two rows that honestly cannot take the
+ *  whole set say so ON THE ROW, before the click.
+ *
+ *  That claim is exactly the kind a capture answers and a unit test cannot: a vitest case can assert
+ *  the string `this one only` is in the DOM, and only a picture says whether a person scanning six
+ *  rows at speed sees which two of them are narrower than the rest — or whether the scope notes and
+ *  the refusal reasons, which share a treatment, blur into one grey column of small text. */
+function contextMenuScenes(): Scene[] {
+  // A selection of 378, most of them the same bolt — the assembly case, at its real size, because the
+  // digits are part of what is being judged. `Select similar` reads this projection directly.
+  const seedAssembly = () => {
+    const rows = [];
+    for (let i = 0; i < 378; i += 1) {
+      rows.push({
+        id: `bolt-${i}`,
+        name: "Bolt M12 — Hex Head, Zinc",
+        parentId: null,
+        components: { Transform: {}, MeshRenderer: { mesh: "mtkasset:bolt-m12" } },
+      });
+    }
+    rows.push({
+      id: "girder",
+      name: "Overhead Crane Assembly Rev C — Long Travel Girder",
+      parentId: null,
+      components: { Transform: {}, MeshRenderer: { mesh: "mtkasset:girder" } },
+    });
+    projectionStore.getState().bulkLoad(rows as never);
+  };
+
+  /** The engine's own answer shape. `appliesTo` IS the availability — there is no third state. */
+  const act = (action: string, label: string, appliesTo: number, mutates: boolean, reason?: string) => ({
+    action,
+    label,
+    available: appliesTo > 0,
+    reason: appliesTo > 0 ? undefined : reason,
+    mutates,
+    appliesTo,
+  });
+
+  const actionsClient = (count: number, items: ReturnType<typeof act>[]) =>
+    ({
+      entityActionsFor: () => Promise.resolve({ count, missing: 0, items }),
+    }) as unknown as EditorClient;
+
+  return [
+    {
+      id: "ctxmenu-selection",
+      looking_for:
+        "the menu over 378 selected objects: a subject line stating the scope BEFORE the first verb; " +
+        "`Delete` taking the whole set and saying nothing extra; `Duplicate` marked `this one only` " +
+        "and `Make dynamic` marked `212 of 378`, because those are the two facts a person needs " +
+        "before the click and not in the toast after it; `Bind…` greyed with its reason; and " +
+        "`Select similar` naming what it would match on. What a reader checks: the scope notes are " +
+        "distinguishable from the refusal reasons rather than blurring into one grey column, no row " +
+        "wraps into its neighbour, and the six labels are still scannable at a glance",
+      viewport: { width: 900, height: 560 },
+      expect: {
+        present: [
+          ["[data-testid='ctxmenu']", 1],
+          ["[data-testid='ctxmenu-subject']", 1],
+          // Five registry rows plus `Select similar`, which shares their keyboard ring.
+          ["[data-testid='ctxitem']", 6],
+          // The scope is a STRUCTURED signal, not copy: a test keyed on the wording would break the
+          // first time the sentence changed, and a wording change is not a scope change.
+          ["[data-action='remove'][data-applies-to='378']", 1],
+          ["[data-action='duplicate'][data-applies-to='1']", 1],
+          ["[data-action='selectsimilar'][data-applies-to='378']", 1],
+        ],
+        text_present: [
+          "378 objects selected",
+          "Delete",
+          "this one only",
+          "212 of 378",
+          "sharing the geometry of Bolt M12 — Hex Head, Zinc",
+          // Every "no" explained, in words rather than a grey row that does nothing.
+          "requires no capabilities",
+        ],
+        text_absent: ["null", "undefined", "NaN"],
+        // A row whose scope note ran past the surface would still satisfy `text_present`, because
+        // `textContent` does not know where anything is.
+        unclipped: ["[data-testid='ctxmenu']"],
+      },
+      setup: seedAssembly,
+      render: () => (
+        <ContextMenu
+          client={actionsClient(378, [
+            act("bind", "Bind…", 0, false, "requires no capabilities, so there is nothing to bind"),
+            act("remove", "Delete", 378, true),
+            act("duplicate", "Duplicate", 1, true),
+            act("focus", "Focus", 378, false),
+            act("inspect", "Inspect", 378, false),
+            act("makedynamic", "Make dynamic", 212, true),
+          ])}
+          ids={Array.from({ length: 378 }, (_, i) => `bolt-${i}`)}
+          onClose={() => {}}
+        />
+      ),
+    },
+    {
+      id: "ctxmenu-one-object",
+      looking_for:
+        "the SAME menu over one object. Nothing carries a scope note, because over one object every " +
+        "verb acts on that object and a suffix on every row is noise — this is the picture that says " +
+        "whether the rule `say it only when it is news` actually produces a quieter menu, or whether " +
+        "the set version above is simply the normal one with extra text",
+      viewport: { width: 900, height: 560 },
+      expect: {
+        present: [
+          ["[data-testid='ctxmenu-subject']", 1],
+          ["[data-testid='ctxitem']", 6],
+          ["[data-action='remove'][data-applies-to='1']", 1],
+        ],
+        text_present: ["Overhead Crane Assembly Rev C — Long Travel Girder", "Delete", "Duplicate"],
+        // The scope vocabulary belongs to a set. Over one object it must not appear at all.
+        text_absent: ["this one only", "of 1", "objects selected", "null", "undefined"],
+        unclipped: ["[data-testid='ctxmenu']"],
+      },
+      setup: seedAssembly,
+      render: () => (
+        <ContextMenu
+          client={actionsClient(1, [
+            act("bind", "Bind…", 0, false, "requires no capabilities, so there is nothing to bind"),
+            act("remove", "Delete", 1, true),
+            act("duplicate", "Duplicate", 1, true),
+            act("focus", "Focus", 1, false),
+            act("inspect", "Inspect", 1, false),
+            act("makedynamic", "Make dynamic", 1, true),
+          ])}
+          ids={["girder"]}
+          onClose={() => {}}
+        />
+      ),
+    },
+  ];
 }
 
 /** A function, not a `const`, purely so the shell scenes can be *read* after the panel scenes while

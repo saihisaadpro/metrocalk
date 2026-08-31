@@ -12,6 +12,7 @@ import type {
   LabelHTMLAttributes,
   AriaRole,
   ReactNode,
+  Ref,
   SelectHTMLAttributes,
   TextareaHTMLAttributes,
 } from "react";
@@ -373,10 +374,18 @@ export function TextArea({
 export function SearchField({
   className,
   style,
+  ref,
   ...rest
-}: Omit<InputHTMLAttributes<HTMLInputElement>, "type">) {
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "type"> & {
+  /** Declared because a search field is a KEYBOARD destination: Ctrl/Cmd-F has to be able to put the
+   *  caret in one, and a shared control that cannot be focused from outside forces every caller that
+   *  needs it back onto a raw `<input>`. React 19 passes `ref` as an ordinary prop; the type is what
+   *  was missing, not the plumbing. */
+  ref?: Ref<HTMLInputElement>;
+}) {
   return (
     <input
+      ref={ref}
       type="search"
       className={["mtk-input", "mtk-search", className].filter(Boolean).join(" ")}
       style={style}

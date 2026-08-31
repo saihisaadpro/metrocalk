@@ -59,7 +59,7 @@ use metrocalk_editor_shell::transform_solver::{
     Constraint, ConstraintIntent, SnapKind, SnapTarget,
 };
 use metrocalk_editor_shell::{
-    actions_for, ai_edit_material, apply_ai_patch, apply_edit, audit_asset, bake_meld,
+    actions_for_selection, ai_edit_material, apply_ai_patch, apply_edit, audit_asset, bake_meld,
     bake_mesh_result, bake_pipe, bake_shape, buy_marketplace, capscene, capture_scene,
     cleanup_asset, decode_pipe_artifact, decode_shape_artifact, enrich_relational,
     land_combined_asset, land_pipe_asset, land_shape_asset, meld_field, optimize_asset,
@@ -69,7 +69,7 @@ use metrocalk_editor_shell::{
     CapScene, CapturedMesh, CleanupConfig, EditIntent, EditTx, Log, MeshCatalog, NormalRepairMode,
     OptimizationConfig, OptimizationPreset, Outcome, PatchOp, PipeBakeReport, PipeBuild,
     PipeFittingKind, PipeForgeOptions, PipeForgeStatus, PipeRecipe, PipeToolSession,
-    ProjectionDelta, ProjectionOp, Record, ShapeBuild, ShapeRecipe, ShapeReply,
+    ProjectionDelta, ProjectionOp, Record, SelectionActions, ShapeBuild, ShapeRecipe, ShapeReply,
     UserFittingCatalogEntry, UvGenerationMode, Wallet, SHAPE_COMPONENT,
 };
 use metrocalk_gizmo::{
@@ -2326,8 +2326,8 @@ enum EngineCmd {
     },
     /// The action model for an entity (M3.3) — valid actions + every-"no"-explained (a read).
     Actions {
-        id: String,
-        reply: Sender<Vec<ActionItem>>,
+        ids: Vec<String>,
+        reply: Sender<SelectionActions>,
     },
     /// Remove an entity + its edges (M3.3) — one undoable transaction.
     Remove {
@@ -2963,6 +2963,11 @@ enum EngineCmd {
     DeleteDeactivate {
         id: String,
         reply: Sender<bool>,
+    },
+    /// Delete a whole SELECTION in one transaction → the ids actually deactivated.
+    DeleteDeactivateMany {
+        ids: Vec<String>,
+        reply: Sender<Vec<String>>,
     },
     /// Copy a sub-tree to the clipboard (a read → fills the thread clipboard).
     CopySubtree {
@@ -6816,7 +6821,7 @@ struct AppState {
     picking: Mutex<scene_pick::PickCache>,
     /// The one selection. The renderer's `selected` index and the front end's ids are both projections
     /// of this; previously each kept its own copy and they drifted apart on any structural change.
-    selection: Mutex<metrocalk_spatial::SelectionModel>,
+    selection: Mutex<scene_pick::Selection>,
 }
 
 fn inactive_pipe_status(message: impl Into<String>) -> PipeForgeStatus {
@@ -9010,11 +9015,21 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 let _ = reply.send(resp);
             }
-            EngineCmd::Actions { id, reply } => {
-                let items = EntityId::from_loro_key(&id)
-                    .map(|e| actions_for(&engine, &scene, e))
-                    .unwrap_or_default();
-                let _ = reply.send(items);
+            EngineCmd::Actions { ids, reply } => {
+                // An id the document cannot parse is a MISSING object, not an absent one: dropping it
+                // silently would make `count` disagree with what the user has highlighted, and the
+                // menu's whole job here is to state the scope it is about to act on.
+                let mut entities = Vec::with_capacity(ids.len());
+                let mut unparsable = 0usize;
+                for key in &ids {
+                    match EntityId::from_loro_key(key) {
+                        Some(e) => entities.push(e),
+                        None => unparsable += 1,
+                    }
+                }
+                let mut answer = actions_for_selection(&engine, &scene, &entities);
+                answer.missing += unparsable;
+                let _ = reply.send(answer);
             }
             EngineCmd::Remove { id } => {
                 if let Some(e) = EntityId::from_loro_key(&id) {
@@ -10896,6 +10911,35 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
                 let _ = reply.send(ok);
+            }
+            EngineCmd::DeleteDeactivateMany { ids, reply } => {
+                // Only ids the document actually knows; a stale row in a list must not turn the whole
+                // gesture into a refusal, and the caller is told exactly which ones went.
+                let targets: Vec<(String, EntityId)> = ids
+                    .into_iter()
+                    .filter_map(|s| EntityId::from_loro_key(&s).map(|e| (s, e)))
+                    .filter(|(_, e)| engine.ecs_entity(*e).is_some())
+                    .collect();
+                let entities: Vec<EntityId> = targets.iter().map(|(_, e)| *e).collect();
+                let ok = !entities.is_empty()
+                    && capscene::delete_deactivate_many(&mut engine, &scene, &entities).is_ok();
+                let done: Vec<String> = if ok {
+                    // ONE record, because one transaction. N `DeleteDeactivate` records replay as N
+                    // commits, and the `Record::Undo` that follows a live Ctrl-Z then reverts exactly
+                    // one of them — so a selection the user deleted and restored comes back deleted
+                    // after a close and reopen. Found by the live `.exe` run, on its second launch.
+                    log.append(&Record::DeleteDeactivateMany {
+                        ids: targets.iter().map(|(key, _)| key.clone()).collect(),
+                    });
+                    if let Some(ch) = &channel {
+                        send_proj!(ch, proj_full(&engine, &scene));
+                    }
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                    targets.into_iter().map(|(key, _)| key).collect()
+                } else {
+                    Vec::new()
+                };
+                let _ = reply.send(done);
             }
             EngineCmd::CopySubtree { id } => {
                 clipboard = EntityId::from_loro_key(&id)
@@ -19946,18 +19990,26 @@ fn viewport_pick(
     let mut selection = state.selection.lock().unwrap();
     let filter = scene_pick::click_filter();
     let hit = if cycle.unwrap_or(false) {
-        cache.cycle(&camera, &viewport, &ray, &filter, selection.active())
+        // Alt-click walks the objects under the cursor from nearest to furthest, so the thing BEHIND
+        // the thing you can see is reachable without hiding, isolating or orbiting to find an angle
+        // where it is on top. The cursor is the same; only the starting point moves — which is why
+        // this needs the current active object and cannot be derived from the ray alone.
+        let previous = selection.active().and_then(|(id, instance)| {
+            scene_pick::slot_of_id(&st, &id).map(|s| (s as u64, instance))
+        });
+        cache.cycle(&camera, &viewport, &ray, &filter, previous)
     } else {
         cache.nearest(&camera, &viewport, &ray, &filter)
     };
 
     scene_pick::apply_click(
+        &st,
         &mut selection,
         hit.as_ref(),
         scene_pick::modifiers(shift.unwrap_or(false), ctrl.unwrap_or(false)),
     );
 
-    scene_pick::apply_selection_highlight(&mut st, &selection);
+    scene_pick::reconcile(&mut st, &mut selection);
     let resolved = hit.as_ref().and_then(|h| scene_pick::entity_of(&st, h));
     drop(selection);
     drop(cache);
@@ -20021,12 +20073,16 @@ fn viewport_pick_region(
     if !shift.unwrap_or(false) {
         selection.clear();
     }
+    // Resolve to entity ids at the boundary, exactly as a click does: the pick key is a slot in the
+    // instance list and is renumbered by the next structural change.
     for (key, instance) in &picked {
-        selection.add(*key, *instance);
+        if let Some(id) = scene_pick::entity_of_key(&st, *key) {
+            selection.add(id, *instance);
+        }
     }
     // Project onto the renderer's highlight flags through the same helper a click uses.
-    scene_pick::apply_selection_highlight(&mut st, &selection);
-    let ids = scene_pick::selected_ids(&st, &selection);
+    scene_pick::reconcile(&mut st, &mut selection);
+    let ids = scene_pick::selected_ids(&selection);
     drop(selection);
     drop(cache);
     ids
@@ -20467,12 +20523,31 @@ fn camera_debug(state: State<AppState>) -> [f32; 6] {
 /// briefly on the engine thread.
 #[tauri::command(async)]
 fn entity_actions(state: State<AppState>, id: String) -> Vec<ActionItem> {
+    entity_actions_selection(state, vec![id]).items
+}
+
+/// **The action model for the whole selection** (ADR-183) — what right-click is actually about.
+///
+/// The editor selects sets (a marquee, Ctrl+A, `Select similar` over 378 identical bolts) and the
+/// menu that opens on them was asking about one id. Every `applies_to` in the reply is measured
+/// against `count`, so a caller can print the scope beside the verb instead of guessing it from the
+/// list it happened to send.
+#[tauri::command]
+fn entity_actions_selection(state: State<AppState>, ids: Vec<String>) -> SelectionActions {
     ipc();
     let (reply, rx) = mpsc::channel();
-    if state.tx.send(EngineCmd::Actions { id, reply }).is_err() {
-        return Vec::new();
+    if state.tx.send(EngineCmd::Actions { ids, reply }).is_err() {
+        return SelectionActions {
+            count: 0,
+            missing: 0,
+            items: Vec::new(),
+        };
     }
-    recv_reply(&rx).unwrap_or_default()
+    recv_reply(&rx).unwrap_or(SelectionActions {
+        count: 0,
+        missing: 0,
+        items: Vec::new(),
+    })
 }
 
 /// Remove an entity + its edges (M3.3) — one undoable transaction (Ctrl-Z restores).
@@ -20741,24 +20816,70 @@ fn gizmo_pivot_toggle(state: State<AppState>) -> String {
 }
 
 /// M9.1 — select an entity by its loro-key (so the gizmo shows on it). Returns whether it was found.
+///
+/// **This used to write the highlight flag and `st.selected` directly**, which made it a second
+/// selection beside `AppState::selection` — and since every React panel reaches the engine's
+/// selection through here and not through a viewport click, it was the one that usually won. The
+/// symptom was that ctrl-clicking forty rows in the outliner outlined exactly one object in 3D.
+/// Routed through the same seam as a click, "what is selected" has one answer again.
 #[tauri::command]
 fn gizmo_select(state: State<AppState>, id: String) -> bool {
     ipc();
     let mut st = state.shared.lock().unwrap();
-    let Some(i) = st.ids.iter().position(|k| *k == id) else {
+    if scene_pick::slot_of_id(&st, &id).is_none() {
         return false;
-    };
-    if let Some(p) = st.selected {
-        if p < st.instances.len() {
-            st.instances[p].selected = 0.0;
-        }
     }
-    st.selected = Some(i);
-    if i < st.instances.len() {
-        st.instances[i].selected = 1.0;
-    }
-    st.revision = st.revision.wrapping_add(1);
+    let mut selection = state.selection.lock().unwrap();
+    selection.set(id, 0);
+    scene_pick::reconcile(&mut st, &mut selection);
     true
+}
+
+/// **State the whole selection at once** — the list surfaces' entry point.
+///
+/// The outliner's range-select, a search result and "select every object of this kind" all know the
+/// answer outright; replaying them as a sequence of clicks would be a second implementation of the
+/// click semantics, in another language, that no compiler compares to the first. `mode` is
+/// `"replace"` (the default), `"add"` or `"toggle"`, named after what the user did rather than after
+/// a modifier key, because the platform mapping belongs at the input boundary.
+///
+/// Returns the resulting selection, in selection order — so the caller never has to predict what the
+/// engine did with ids it does not have. Ids the scene cannot name are dropped rather than refused:
+/// a list can hold a row the render state has not caught up with yet, and refusing the whole gesture
+/// over one of them would make multi-select fail intermittently.
+#[tauri::command]
+fn select_entities(state: State<AppState>, ids: Vec<String>, mode: Option<String>) -> Vec<String> {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    let mut selection = state.selection.lock().unwrap();
+    match mode.as_deref().unwrap_or("replace") {
+        "add" => {
+            for id in ids {
+                selection.add(id, 0);
+            }
+        }
+        "toggle" => {
+            for id in ids {
+                selection.toggle(id, 0);
+            }
+        }
+        _ => selection.set_all(ids.into_iter().map(|id| (id, 0))),
+    }
+    scene_pick::reconcile(&mut st, &mut selection);
+    scene_pick::selected_ids(&selection)
+}
+
+/// Everything currently selected, in selection order — the read the front end mirrors after a
+/// gesture whose result it cannot predict (a modified click, a marquee, a delete).
+///
+/// Reconciles first, so a caller never sees an id the scene has already lost.
+#[tauri::command]
+fn selection_ids(state: State<AppState>) -> Vec<String> {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    let mut selection = state.selection.lock().unwrap();
+    scene_pick::reconcile(&mut st, &mut selection);
+    scene_pick::selected_ids(&selection)
 }
 
 /// M9 (React port) — the currently gizmo-selected entity's loro-key, so a React inspector button can act on
@@ -21240,7 +21361,9 @@ fn pipe_world_point_scene(
                 rotated[2] + inst.center[2],
             ]
         };
-        for triangle in mesh.indices.chunks_exact(3) {
+        // `as_chunks::<3>()` rather than `chunks_exact(3)`: it yields `&[u32; 3]`, so the compiler
+        // knows the length the code already assumed. `clippy::chunks_exact_to_as_chunks` (1.98).
+        for triangle in mesh.indices.as_chunks::<3>().0 {
             let [a, b, c] = [
                 triangle[0] as usize,
                 triangle[1] as usize,
@@ -21975,7 +22098,8 @@ fn step_parts_from_scene(
 
         let mut triangles = Vec::new();
         for prim in &mesh.primitives {
-            for tri in prim.indices.chunks_exact(3) {
+            // Same as above: a fixed-size chunk the type system can see.
+            for tri in prim.indices.as_chunks::<3>().0 {
                 let (Some(a), Some(b), Some(c)) = (
                     prim.positions.get(tri[0] as usize),
                     prim.positions.get(tri[1] as usize),
@@ -22023,6 +22147,16 @@ struct EnvImportReply {
     message: String,
     /// Set iff nothing changed.
     reason: Option<String>,
+    /// The file this was read from, when there was one. `None` for the built-in studio sky.
+    ///
+    /// Reported because it is the only thing that can be written to the project's view sidecar: a
+    /// label cannot be re-loaded, and re-deriving the path from the label is guesswork.
+    path: Option<String>,
+    /// Set iff the person dismissed the file dialog.
+    ///
+    /// A no-op is not a failure, and the two must not read the same. Without this the panel has to
+    /// choose between showing an error for a cancelled dialog and showing nothing for a real refusal.
+    cancelled: bool,
 }
 
 impl EnvImportReply {
@@ -22042,11 +22176,54 @@ impl EnvImportReply {
 /// `MTK_ENV_HDR` environment variable, read once at process start. This is the command that makes it a
 /// capability a person can actually use.
 ///
-/// Decoding runs on this command's own async thread, never the engine tick: an 8k panorama is ~400 MB
-/// of f32 and decoding it inline would freeze the viewport.
+/// **`path` is optional, and that is what makes it reachable.** With no path the native file dialog
+/// opens here, so the UI never has to ask a person to type an absolute path into a text box — the same
+/// arrangement `import_asset_dialog` uses for meshes. The dialog is opened from this command's own
+/// async thread, which is where `blocking_pick_file` is safe; a sync command would run it on the main
+/// thread and deadlock.
+///
+/// Decoding runs on that same async thread, never the engine tick: an 8k panorama is ~400 MB of f32
+/// and decoding it inline would freeze the viewport.
 #[tauri::command(async)]
-fn import_environment(state: State<AppState>, path: String) -> EnvImportReply {
+fn import_environment(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    path: Option<String>,
+) -> EnvImportReply {
     ipc();
+    let path = match path {
+        Some(p) => p,
+        None => match app
+            .dialog()
+            .file()
+            // The decoder reads Radiance only, so the filter states exactly that rather than a
+            // hopeful "images": offering a `.exr` the loader will refuse is a worse experience than
+            // not offering it.
+            .add_filter("Radiance HDR panorama", &["hdr"])
+            .blocking_pick_file()
+            .and_then(|f| f.into_path().ok())
+        {
+            Some(p) => p.display().to_string(),
+            // Dismissing the picker is a decision, not an error. Reported as its own state so the
+            // panel can go quiet instead of showing a refusal for something nobody asked for.
+            None => {
+                return EnvImportReply {
+                    cancelled: true,
+                    message: "No panorama chosen — the lighting is unchanged.".into(),
+                    ..EnvImportReply::default()
+                }
+            }
+        },
+    };
+    load_environment(&state, path)
+}
+
+/// Decode a Radiance panorama and hand it to the render loop.
+///
+/// Separate from the command because **reopening a project has to do exactly this** and must not do it
+/// a second, slightly different way: the sidecar restore path calls this, so a sky restored on open is
+/// the same sky, validated by the same bounds, as one chosen from the dialog.
+fn load_environment(state: &State<AppState>, path: String) -> EnvImportReply {
     let p = std::path::Path::new(&path);
     let label = p
         .file_stem()
@@ -22090,6 +22267,7 @@ fn import_environment(state: State<AppState>, path: String) -> EnvImportReply {
         let mut st = state.shared.lock().unwrap();
         st.pending_env = Some(source);
         st.env_label = label.clone();
+        st.env_path = Some(path.clone());
         st.env_revision = st.env_revision.wrapping_add(1);
     }
     EnvImportReply {
@@ -22102,20 +22280,32 @@ fn import_environment(state: State<AppState>, path: String) -> EnvImportReply {
             "Lighting from \"{label}\" ({w}x{h}) - it lights the scene and shows in reflections"
         ),
         reason: None,
+        path: Some(path),
+        cancelled: false,
     }
+}
+
+/// Drop any imported panorama and go back to the built-in studio sky. Returns the new label.
+///
+/// The command below and the project-open path both need this and must not diverge: an environment
+/// half-cleared — the source dropped but the path still recorded — is a project that saves a sky it is
+/// not being lit by.
+fn clear_environment(state: &State<AppState>) -> String {
+    let mut st = state.shared.lock().unwrap();
+    st.pending_env = None;
+    st.env_label = "Studio (built in)".into();
+    st.env_path = None;
+    st.env_revision = st.env_revision.wrapping_add(1);
+    st.env_label.clone()
 }
 
 /// Go back to the built-in studio sky.
 #[tauri::command(async)]
 fn reset_environment(state: State<AppState>) -> EnvImportReply {
     ipc();
-    let mut st = state.shared.lock().unwrap();
-    st.pending_env = None;
-    st.env_label = "Studio (built in)".into();
-    st.env_revision = st.env_revision.wrapping_add(1);
     EnvImportReply {
         applied: true,
-        label: st.env_label.clone(),
+        label: clear_environment(&state),
         message: "Back to the built-in studio lighting".into(),
         ..EnvImportReply::default()
     }
@@ -22146,6 +22336,8 @@ fn environment_state(state: State<AppState>) -> EnvImportReply {
         mean_radiance: custom.map_or([0.0; 3], |e| mean_radiance(&e.pixels)),
         message: String::new(),
         reason: None,
+        path: st.env_path.clone(),
+        cancelled: false,
     }
 }
 
@@ -22892,6 +23084,37 @@ fn delete_deactivate(state: State<AppState>, id: String) -> bool {
         return false;
     }
     recv_reply(&rx).unwrap_or(false)
+}
+
+/// **Delete a whole selection**, in ONE undoable transaction → the ids that actually went.
+///
+/// The editor has read a multi-selection since M10.6 and its toolbar has been saying `Actions · 14`
+/// for as long as it has had one, while `Delete` called the single-id command on the primary and
+/// silently left the other thirteen. Returning the ids rather than a bool is what lets the front end
+/// dim exactly the rows that went, instead of guessing that its own list is what happened.
+#[tauri::command(async)]
+fn delete_deactivate_many(state: State<AppState>, ids: Vec<String>) -> Vec<String> {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::DeleteDeactivateMany { ids, reply })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let deleted: Vec<String> = recv_reply(&rx).unwrap_or_default();
+    // The selection cannot survive the objects it names. Pruning here rather than waiting for the next
+    // gesture is what stops the inspector showing a phantom and the gizmo editing nothing.
+    if !deleted.is_empty() {
+        let mut st = state.shared.lock().unwrap();
+        let mut selection = state.selection.lock().unwrap();
+        for id in &deleted {
+            selection.remove(id, 0);
+        }
+        scene_pick::reconcile(&mut st, &mut selection);
+    }
+    deleted
 }
 
 /// M10.6 — copy a sub-tree to the clipboard (a read → fills the thread clipboard).
@@ -24930,10 +25153,34 @@ fn presentation_sidecar(project: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{project}.view.json"))
 }
 
+/// What the sidecar actually holds: the renderer's presentation, plus the panorama lighting the scene.
+///
+/// The environment is `#[serde(flatten)]`-adjacent rather than a field of
+/// [`metrocalk_assets::colour::PresentationState`] on purpose. That type is `Copy` and is hashed into
+/// the identity every async render result carries, so giving it a `String` would cost the copy
+/// semantics and change the hash of every existing render — for a value the renderer never reads.
+/// Flattening keeps the file's existing keys exactly where they were, so a sidecar written by an
+/// older build still restores, and one written by this build still opens in an older one.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ViewSidecar {
+    #[serde(flatten)]
+    presentation: metrocalk_assets::colour::PresentationState,
+    /// The Radiance panorama the scene was last lit by. Absent = the built-in studio sky.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment: Option<String>,
+}
+
 /// Write the current presentation beside the project. Best-effort by design: a read-only directory
 /// must not fail a save of the actual work.
 fn save_presentation(state: &State<AppState>, project: &str) {
-    let present = state.shared.lock().unwrap().presentation();
+    let present = {
+        let st = state.shared.lock().unwrap();
+        ViewSidecar {
+            presentation: st.presentation(),
+            environment: st.env_path.clone(),
+        }
+    };
     match serde_json::to_string_pretty(&present) {
         Ok(json) => {
             if let Err(e) = std::fs::write(presentation_sidecar(project), json) {
@@ -24950,21 +25197,51 @@ fn save_presentation(state: &State<AppState>, project: &str) {
 /// project saved by an older build simply has none); a malformed one is reported, because a file that
 /// exists and cannot be read is a different situation from a file that was never written, and quietly
 /// treating them the same is how a corrupted preference becomes a mystery.
+///
+/// **The environment always follows the project you opened**, which is a stronger rule than the one
+/// the other presentation fields keep. It has to be: exposure carrying over from the previous project
+/// is a mild surprise, whereas a panorama carrying over relights the whole scene, so "no sky recorded"
+/// means the built-in studio sky rather than "whatever was on screen a moment ago".
 fn restore_presentation(state: &State<AppState>, project: &str) {
     let path = presentation_sidecar(project);
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return; // no sidecar — defaults, nothing to say
+        clear_environment(state); // no sidecar — the built-in sky, nothing to say
+        return;
     };
-    match serde_json::from_str::<metrocalk_assets::colour::PresentationState>(&text) {
-        Ok(p) => state.shared.lock().unwrap().set_presentation(p),
+    match serde_json::from_str::<ViewSidecar>(&text) {
+        Ok(p) => {
+            state.shared.lock().unwrap().set_presentation(p.presentation);
+            // The sky is restored SECOND and reported when it cannot be: choosing a panorama used to
+            // be something a person did again every session, and the failure mode of fixing that is a
+            // moved file — which must read as "your sky is gone and here is why", never as a scene
+            // that silently opens under different light than it was saved under.
+            match p.environment {
+                Some(env) => {
+                    let reply = load_environment(state, env.clone());
+                    if !reply.applied {
+                        eprintln!(
+                            "[colour] the panorama this project was lit by could not be loaded from {env}: {}",
+                            reply.message
+                        );
+                        clear_environment(state);
+                    }
+                }
+                None => {
+                    clear_environment(state);
+                }
+            }
+        }
         // The number comes from the renderer's own constant, so the message cannot quote an exposure
         // the renderer has stopped using.
-        Err(e) => eprintln!(
-            "[colour] {} could not be read ({e}); the viewport stays at its defaults \
-             (linear Rec.709, filmic, exposure {}).",
-            path.display(),
-            render::DEFAULT_EXPOSURE
-        ),
+        Err(e) => {
+            eprintln!(
+                "[colour] {} could not be read ({e}); the viewport stays at its defaults \
+                 (linear Rec.709, filmic, exposure {}).",
+                path.display(),
+                render::DEFAULT_EXPOSURE
+            );
+            clear_environment(state);
+        }
     }
 }
 
@@ -25182,7 +25459,7 @@ fn main() {
         native_imports,
         moba: Mutex::new(None),
         picking: Mutex::new(scene_pick::PickCache::new()),
-        selection: Mutex::new(metrocalk_spatial::SelectionModel::new()),
+        selection: Mutex::new(scene_pick::Selection::new()),
     };
 
     tauri::Builder::default()
@@ -25260,6 +25537,9 @@ fn main() {
             viewport_pick,
             viewport_peek,
             viewport_pick_region,
+            select_entities,
+            selection_ids,
+            delete_deactivate_many,
             pick_diagnostics,
             focus_entity,
             set_viewport_rect,
@@ -25283,6 +25563,7 @@ fn main() {
             moba_stop,
             camera_debug,
             entity_actions,
+            entity_actions_selection,
             remove_entity,
             duplicate_entity,
             entity_details,
@@ -28680,5 +28961,52 @@ mod imported_assembly_pose_publication_tests {
             restored.center,
             restored.scale
         );
+    }
+}
+
+/// **The view sidecar's shape is a compatibility contract, and both directions matter.**
+///
+/// A project's `.view.json` is written by one build and read by another. Adding the environment as a
+/// flattened key rather than a field of `PresentationState` is what keeps that true in both
+/// directions, and neither direction is checked by anything a compiler does: a sidecar written before
+/// this change has no `environment` key at all, and one written after it must still be readable by a
+/// build whose reader is the older `PresentationState`.
+#[cfg(test)]
+mod view_sidecar_tests {
+    use super::ViewSidecar;
+    use metrocalk_assets::colour::PresentationState;
+
+    /// A sidecar written by the build BEFORE this change — no `environment` key anywhere.
+    const OLD_SIDECAR: &str = r#"{"working":"acesCg","view":"pbrNeutral","exposure":1.25}"#;
+
+    #[test]
+    fn a_sidecar_written_before_the_environment_existed_still_restores_the_presentation() {
+        let read: ViewSidecar = serde_json::from_str(OLD_SIDECAR).expect("old sidecars stay readable");
+        assert_eq!(read.presentation.exposure, 1.25);
+        // Absent is the built-in sky, which is also what `restore_presentation` acts on.
+        assert!(read.environment.is_none());
+    }
+
+    #[test]
+    fn the_presentation_keys_stay_at_the_top_level_so_an_older_build_can_still_read_ours() {
+        let written = serde_json::to_string(&ViewSidecar {
+            presentation: PresentationState { exposure: 2.5, ..PresentationState::default() },
+            environment: Some("C:/skies/sunset_4k.hdr".into()),
+        })
+        .expect("serialisable");
+        // Read back through the OLD reader — `PresentationState` on its own, which is what a build
+        // that predates this change runs. Nesting the presentation under a key would break this and
+        // would still look correct in every test that used the new reader.
+        let old: PresentationState = serde_json::from_str(&written).expect("older readers still work");
+        assert_eq!(old.exposure, 2.5);
+        assert!(written.contains("sunset_4k"), "the sky has to survive the round trip: {written}");
+    }
+
+    #[test]
+    fn the_built_in_sky_writes_no_key_at_all_rather_than_a_null() {
+        // `skip_serializing_if` — a `"environment": null` would be a second spelling of "no sky", and
+        // two spellings of one state is how a reader ends up handling only one of them.
+        let written = serde_json::to_string(&ViewSidecar::default()).expect("serialisable");
+        assert!(!written.contains("environment"), "{written}");
     }
 }

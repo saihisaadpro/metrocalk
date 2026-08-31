@@ -59,7 +59,7 @@ pub mod transform_solver;
 pub mod vfx_intent;
 pub mod wallet;
 
-pub use actions::{actions_for, Action, ActionItem};
+pub use actions::{actions_for, actions_for_selection, Action, ActionItem, SelectionActions};
 pub use ai::{apply_ai_patch, AiPatch, PatchOp};
 pub use animation_bindings::{
     built_in_animation_binding_descriptors, standard_animation_binding_registry,

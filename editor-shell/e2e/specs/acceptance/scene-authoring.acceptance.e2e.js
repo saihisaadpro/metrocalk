@@ -19,9 +19,8 @@ import {
 
 const baseline = loadBaseline();
 const countEntities = async () => {
-  const txt = await $("#count").getText();
-  const m = txt.match(/(\d+)\s+entities/);
-  return m ? Number(m[1]) : NaN;
+  const raw = await $("#count").getAttribute("data-entities");
+  return raw == null ? NaN : Number(raw);
 };
 const yOf = async (id) => (await invoke("read_transform", { id }))[1];
 

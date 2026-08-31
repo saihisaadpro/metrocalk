@@ -69,8 +69,21 @@ export interface ProjectionState {
   select(id: string | null): void;
   /** Ctrl/Cmd-click — toggle `id` in/out of the multi-selection (the primary becomes `id`). */
   toggleSelect(id: string): void;
-  /** Shift-click — extend the selection from the current primary to `id` over the visible `order`. */
-  selectRange(id: string): void;
+  /** Shift-click — extend the selection from the current primary to `id` over the rows the user can
+   *  actually SEE.
+   *
+   *  `scope` is those rows, and it is a parameter because the panel is the only side that knows them.
+   *  This walked `order` — every entity in the scene — so shift-clicking two rows three apart in a
+   *  FILTERED outliner selected everything between them in the unfiltered scene: on a 15,711-part
+   *  import, hundreds of objects the user could not see, silently, immediately before the key ADR-183
+   *  bound to Delete. A range gesture must mean the range that is drawn. Defaults to `order` for the
+   *  unfiltered case, which is every other caller. */
+  selectRange(id: string, scope?: readonly string[]): void;
+  /** **Mirror a selection the ENGINE decided** — a marquee, a modified viewport click, a delete that
+   *  pruned what it removed. The order is the engine's selection order, so the primary is the LAST id:
+   *  the front end never has to predict what a gesture did, which is the only way the outline in 3D and
+   *  the highlighted rows in the list can be guaranteed to agree. */
+  setSelection(ids: string[]): void;
   dismissRejection(clientOpId: string): void;
   /** Mark entities deactivated (Delete/Cut/deactivate-part) so the hierarchy reflects it immediately. */
   markDeactivated(ids: string[]): void;
@@ -309,17 +322,28 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
     set({ multiSelect, selectedId: has ? (multiSelect[multiSelect.length - 1] ?? null) : id });
   },
 
-  selectRange(id) {
+  selectRange(id, scope) {
     const s = get();
+    const rows = scope ?? s.order;
     const anchor = s.selectedId;
-    const ai = anchor ? s.order.indexOf(anchor) : -1;
-    const bi = s.order.indexOf(id);
+    const ai = anchor ? rows.indexOf(anchor) : -1;
+    const bi = rows.indexOf(id);
+    // An anchor OUTSIDE the visible rows has no range to `id` that a person could have meant — a
+    // filter typed after a click leaves exactly that state — so the shift-click starts a new one
+    // rather than inventing a span across rows nobody can see.
     if (ai < 0 || bi < 0) {
       set({ selectedId: id, multiSelect: [id] });
       return;
     }
     const [lo, hi] = ai <= bi ? [ai, bi] : [bi, ai];
-    set({ multiSelect: s.order.slice(lo, hi + 1), selectedId: id });
+    set({ multiSelect: rows.slice(lo, hi + 1), selectedId: id });
+  },
+
+  setSelection(ids) {
+    // Deduplicate keeping the LAST occurrence, exactly as the engine's model does, so "the primary is
+    // the last one named" means the same thing on both sides of the boundary.
+    const multiSelect = ids.filter((id, i) => ids.lastIndexOf(id) === i);
+    set({ multiSelect, selectedId: multiSelect[multiSelect.length - 1] ?? null });
   },
 
   dismissRejection(clientOpId) {

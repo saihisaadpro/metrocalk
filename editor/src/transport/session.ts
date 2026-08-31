@@ -11,7 +11,7 @@ import { pushToast } from "../store/toasts";
 import type { ProjectInfo } from "../store/project";
 import type { PlayInfo } from "../store/play";
 import type {
-  ActionItem,
+  SelectionActions,
   AddResponse,
   AuthoredMatch,
   CatalogItem,
@@ -50,6 +50,7 @@ import type {
   VfxProbe,
   CameraProbe,
   ColourStatus,
+  EnvironmentReply,
   FormatSpec,
   ClauseRequest,
   ConditionListInfo,
@@ -113,6 +114,22 @@ import { inProcessPair } from "./transport";
 /** The one client surface the React UI talks to (the real shell transport + the dev MockCore both satisfy it). */
 export type ViewportRenderProfile = "cinematic" | "cad";
 
+/** What the keyboard was doing during a viewport pick, named by **intent** rather than by key.
+ *
+ *  The platform mapping (Cmd on macOS, Ctrl everywhere else) belongs at the one boundary that reads a
+ *  DOM event, not in the selection logic — which is why the engine's own `ClickModifiers` is spelled
+ *  the same way. `cycle` is the odd one out and is not a selection mode at all: it moves the HIT,
+ *  walking the objects under the cursor from nearest to furthest so the part behind the part you can
+ *  see is reachable without hiding, isolating, or orbiting to find an angle where it is on top. */
+export interface PickModifiers {
+  /** Shift — add to the selection, promoting an already-selected object to primary. */
+  extend?: boolean;
+  /** Ctrl/Cmd — add or remove. */
+  toggle?: boolean;
+  /** Alt — take the NEXT object under the cursor rather than the nearest. */
+  cycle?: boolean;
+}
+
 export interface EditorClient {
   /** Optimistic field edit → a JSON-Patch `EditTx` (the same language the AI layer emits). */
   setField(id: string, component: string, field: string, value: Json): string;
@@ -139,8 +156,10 @@ export interface EditorClient {
   undo(): Promise<boolean>;
   /** Reapply the most recently undone committed transaction. */
   redo(): Promise<boolean>;
-  /** The context-menu actions for an entity (M3.3) — each available-or-explained. */
-  entityActions(id: string): Promise<ActionItem[]>;
+  /** **The context-menu actions for the SELECTION** (M3.3 + ADR-183) — each available-or-explained,
+   *  each carrying the number of selected objects it acts on. Asked about the whole set because
+   *  right-click opens over the whole set; the single-object case is `[id]`. */
+  entityActionsFor(ids: string[]): Promise<SelectionActions>;
   /** The hover-tooltip details for an entity (M3.3) — name + components + caps + bound. */
   entityDetails(id: string): Promise<EntityDetails | null>;
   /** The per-part CAD import report (M15.7) — the fidelity breakdown + a capped part list, off the ECS. */
@@ -286,6 +305,21 @@ export interface EditorClient {
    * reason — an HDR panorama is radiance, so "this EXR is sRGB" is not a thing a person can mean.
    */
   setEnvironmentColourSpace(space: string): Promise<string>;
+  /** What the scene is lit by right now. */
+  environmentState(): Promise<EnvironmentReply>;
+  /**
+   * Light the scene with a Radiance `.hdr` panorama. **With no path the engine opens the native file
+   * picker** — so the UI never has to ask for an absolute path — and `cancelled` comes back set if the
+   * person dismissed it, which is a no-op and not an error.
+   */
+  importEnvironment(path?: string): Promise<EnvironmentReply>;
+  /** Go back to the built-in studio sky. */
+  resetEnvironment(): Promise<EnvironmentReply>;
+  /**
+   * Set the viewport exposure — a linear multiplier applied before the tone curve. Replies the value
+   * actually in force, which is the sent one clamped to the renderer's range.
+   */
+  setExposure(exposure: number): Promise<number>;
   /** What the renderer is drawing this instant (Play only; zeros otherwise). */
   vfxProbe(): Promise<VfxProbe>;
   /** Where the camera actually is this instant. */
@@ -337,6 +371,10 @@ export interface EditorClient {
   multiEdit(ids: string[], component: string, field: string, value: number): Promise<boolean>;
   /** Delete = deactivate (non-destructive; frees dependents) — undo restores → applied. */
   deleteDeactivate(id: string): Promise<boolean>;
+  /** Delete a whole SELECTION in ONE undoable transaction → the ids that actually went. Returning the
+   *  ids rather than a count is what lets the caller dim exactly those rows instead of assuming its own
+   *  list is what happened. */
+  deleteDeactivateMany(ids: string[]): Promise<string[]>;
   /** Copy a sub-tree to the clipboard (cross-project = the serde Composition). */
   copySubtree(id: string): void;
   /** Cut = copy + delete(deactivate) → applied. */
@@ -423,8 +461,26 @@ export interface EditorClient {
   // ── native viewport input (Tauri-only; the dev MockCore has no viewport) — the M10.1 composite closeout ─
   /** Pick over the native wgpu region at NORMALIZED viewport coords (x,y ∈ [0,1]) → the picked entity id
    *  (or null). Computed synchronously in the command from the camera ray (no per-frame race, no OS-cursor
-   *  dependency — so a synthetic click works too). */
-  viewportPick(x: number, y: number): Promise<string | null>;
+   *  dependency — so a synthetic click works too).
+   *
+   *  `mods` carries what the keyboard was doing, named by intent rather than by key so the platform
+   *  mapping (Cmd on macOS, Ctrl elsewhere) stays at this boundary: `extend` adds, `toggle` adds or
+   *  removes, `cycle` walks the objects UNDER the one already selected — the way to reach the part
+   *  behind the part you can see without hiding anything. The reply is still the object the ray hit;
+   *  after a modified click the resulting SET is `selectionIds()`, because a toggle that deselected
+   *  still hit something and the hit alone cannot say what is selected now. */
+  viewportPick(x: number, y: number, mods?: PickModifiers): Promise<string | null>;
+  /** Marquee (box) selection over the native region. The two corners are normalized `[0,1]` surface
+   *  fractions **in the order they were dragged**, because the direction IS the policy: left-to-right
+   *  takes only what the rectangle encloses, right-to-left takes everything it touches. `extend` keeps
+   *  the existing selection. → the whole resulting selection, in selection order. */
+  viewportPickRegion(x0: number, y0: number, x1: number, y1: number, extend?: boolean): Promise<string[]>;
+  /** State the whole selection outright — the list surfaces' entry point (range-select, a search
+   *  result, "select all of this kind"). → the resulting selection, in selection order. */
+  selectEntities(ids: string[], mode?: "replace" | "add" | "toggle"): Promise<string[]>;
+  /** Everything the ENGINE currently has selected, in selection order — read after a gesture whose
+   *  result the front end cannot predict. */
+  selectionIds(): Promise<string[]>;
   /** Begin a right-drag orbit — the native render loop then polls the OS cursor and orbits with **0 IPC per
    *  frame** (invariant 4); only this call + `dragEnd` cross the boundary, once per gesture. */
   dragStart(): void;
@@ -700,8 +756,8 @@ export class TauriClient implements EditorClient {
     });
   }
 
-  entityActions(id: string): Promise<ActionItem[]> {
-    return this.core.invoke<ActionItem[]>("entity_actions", { id }).catch((e: unknown) => { console.error("entity_actions failed", e); throw e; });
+  entityActionsFor(ids: string[]): Promise<SelectionActions> {
+    return this.core.invoke<SelectionActions>("entity_actions_selection", { ids }).catch((e: unknown) => { console.error("entity_actions_selection failed", e); throw e; });
   }
   cadReimportReport(): Promise<ReimportReport> {
     return this.core.invoke<ReimportReport>("cad_reimport_report").catch((e: unknown) => { console.error("cad_reimport_report failed", e); throw e; });
@@ -924,6 +980,20 @@ export class TauriClient implements EditorClient {
   setEnvironmentColourSpace(space: string): Promise<string> {
     return this.core.invoke<string>("set_environment_colour_space", { space }).catch((e: unknown) => { console.error("set_environment_colour_space failed", e); throw e; });
   }
+  environmentState(): Promise<EnvironmentReply> {
+    return this.core.invoke<EnvironmentReply>("environment_state").catch((e: unknown) => { console.error("environment_state failed", e); throw e; });
+  }
+  // `path` is omitted from the payload when absent rather than sent as `null`: the command's argument
+  // is an `Option<String>`, and "not given" is precisely what opens the picker.
+  importEnvironment(path?: string): Promise<EnvironmentReply> {
+    return this.core.invoke<EnvironmentReply>("import_environment", path === undefined ? {} : { path }).catch((e: unknown) => { console.error("import_environment failed", e); throw e; });
+  }
+  resetEnvironment(): Promise<EnvironmentReply> {
+    return this.core.invoke<EnvironmentReply>("reset_environment").catch((e: unknown) => { console.error("reset_environment failed", e); throw e; });
+  }
+  setExposure(exposure: number): Promise<number> {
+    return this.core.invoke<number>("set_exposure", { exposure }).catch((e: unknown) => { console.error("set_exposure failed", e); throw e; });
+  }
   vfxProbe(): Promise<VfxProbe> {
     return this.core.invoke<VfxProbe>("vfx_probe").catch(() => ({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 }));
   }
@@ -998,6 +1068,9 @@ export class TauriClient implements EditorClient {
   }
   deleteDeactivate(id: string): Promise<boolean> {
     return this.core.invoke<boolean>("delete_deactivate", { id }).catch((e: unknown) => { console.error("delete_deactivate failed", e); throw e; });
+  }
+  deleteDeactivateMany(ids: string[]): Promise<string[]> {
+    return this.core.invoke<string[]>("delete_deactivate_many", { ids }).catch((e: unknown) => { console.error("delete_deactivate_many failed", e); throw e; });
   }
   copySubtree(id: string): void {
     void this.core.invoke("copy_subtree", { id }).catch((e: unknown) => console.error("copy_subtree failed", e));
@@ -1124,8 +1197,23 @@ export class TauriClient implements EditorClient {
     });
   }
 
-  viewportPick(x: number, y: number): Promise<string | null> {
-    return this.core.invoke<string | null>("viewport_pick", { x, y }).catch((e: unknown) => { console.error("viewport_pick failed", e); throw e; });
+  viewportPick(x: number, y: number, mods?: PickModifiers): Promise<string | null> {
+    return this.core
+      .invoke<string | null>("viewport_pick", { x, y, shift: !!mods?.extend, ctrl: !!mods?.toggle, cycle: !!mods?.cycle })
+      .catch((e: unknown) => { console.error("viewport_pick failed", e); throw e; });
+  }
+  viewportPickRegion(x0: number, y0: number, x1: number, y1: number, extend?: boolean): Promise<string[]> {
+    return this.core
+      .invoke<string[]>("viewport_pick_region", { x0, y0, x1, y1, shift: !!extend })
+      .catch((e: unknown) => { console.error("viewport_pick_region failed", e); throw e; });
+  }
+  selectEntities(ids: string[], mode?: "replace" | "add" | "toggle"): Promise<string[]> {
+    return this.core
+      .invoke<string[]>("select_entities", { ids, mode: mode ?? "replace" })
+      .catch((e: unknown) => { console.error("select_entities failed", e); throw e; });
+  }
+  selectionIds(): Promise<string[]> {
+    return this.core.invoke<string[]>("selection_ids").catch((e: unknown) => { console.error("selection_ids failed", e); throw e; });
   }
   dragStart(): void {
     void this.core.invoke("drag_start").catch((e: unknown) => console.error("drag_start failed", e));
@@ -1601,6 +1689,8 @@ interface MockAnimationClipInstance {
  *  `npm run dev` still renders the reveal/describe surfaces without a live core. (Vitest tests inject
  *  their own stubbed `EditorClient`; the real reveal/describe come from the shell commands under Tauri.) */
 class MockClient implements EditorClient {
+  /** The one selection, in selection order — the mock's mirror of the engine's `SelectionModel`. */
+  private selection: string[] = [];
   private balance = 100;
   private project: ProjectInfo = { path: null, dirty: false, recents: [], error: null };
   private playInfo: PlayInfo = { playing: false, paused: false };
@@ -1772,16 +1862,45 @@ class MockClient implements EditorClient {
   redo(): Promise<boolean> {
     return Promise.resolve(false);
   }
-  entityActions(id: string): Promise<ActionItem[]> {
-    const e = projectionStore.getState().displayed[id];
-    const canBind = !!e?.components.HealthBar; // a requirer (HealthBar) has an unmet requirement to bind
-    return Promise.resolve([
-      { action: "bind", label: "Bind…", available: canBind, reason: canBind ? undefined : "no unmet requirement to bind", mutates: false },
-      { action: "remove", label: "Remove", available: true, mutates: true },
-      { action: "duplicate", label: "Duplicate", available: true, mutates: true },
-      { action: "focus", label: "Focus", available: true, mutates: false },
-      { action: "inspect", label: "Inspect", available: true, mutates: false },
-    ]);
+  entityActionsFor(ids: string[]): Promise<SelectionActions> {
+    // The dev mock answers with the SAME scope policy the shell's `actions_for_selection` states, so a
+    // menu that looks right here is not a menu that agrees with a fixture. Bind… and Duplicate are
+    // primary-only (the last id); Remove/Focus/Inspect take the whole set; Make dynamic takes the
+    // members that draw a mesh and have no body yet.
+    const displayed = projectionStore.getState().displayed;
+    const live = ids.filter((id, i) => ids.indexOf(id) === i && !!displayed[id]);
+    const count = live.length;
+    const primary = live[live.length - 1];
+    const canBind = !!displayed[primary]?.components.HealthBar; // a requirer with an unmet requirement
+    const dynamicReady = live.filter(
+      (id) => !!displayed[id]?.components.MeshRenderer && !displayed[id]?.components.RigidBody,
+    ).length;
+    const item = (action: string, label: string, appliesTo: number, mutates: boolean, reason?: string) => ({
+      action,
+      label,
+      available: appliesTo > 0,
+      reason: appliesTo > 0 ? undefined : reason,
+      mutates,
+      appliesTo,
+    });
+    return Promise.resolve({
+      count,
+      missing: ids.length - count,
+      items: [
+        item("bind", "Bind…", count && canBind ? 1 : 0, false, "no unmet requirement to bind"),
+        item("remove", "Delete", count, true, "nothing is selected"),
+        item("duplicate", "Duplicate", count ? 1 : 0, true, "nothing is selected"),
+        item("focus", "Focus", count, false, "nothing is selected"),
+        item("inspect", "Inspect", count, false, "nothing is selected"),
+        item(
+          "makedynamic",
+          "Make dynamic",
+          dynamicReady,
+          true,
+          count ? "only a mesh model can be made dynamic" : "nothing is selected",
+        ),
+      ],
+    });
   }
   entityDetails(id: string): Promise<EntityDetails | null> {
     const e = projectionStore.getState().displayed[id];
@@ -2740,7 +2859,7 @@ class MockClient implements EditorClient {
       setViewCommand: "set_render_profile",
       setViewArg: "cinematic",
       presentationHash: this.workingSpace === "acesCg" ? "00000000000000a1" : "0000000000000709",
-      exposure: 0.45,
+      exposure: this.mockExposure,
       environment: {
         sourceSpace: this.envSpace,
         label: this.envSpace === "acesCg" ? "ACEScg (AP1)" : "Linear Rec.709",
@@ -2761,6 +2880,9 @@ class MockClient implements EditorClient {
   /** Mock render state, so the colour card's controls do something in the dev build too. */
   private workingSpace = "linearRec709";
   private envSpace = "linearRec709";
+  /** The renderer's own default, so the dev build's slider starts where the real one does. */
+  private mockExposure = 0.45;
+  private mockEnvironment: { label: string; path: string } | null = null;
 
   setWorkingSpace(space: string): Promise<string> {
     this.workingSpace = space;
@@ -2770,6 +2892,56 @@ class MockClient implements EditorClient {
   setEnvironmentColourSpace(space: string): Promise<string> {
     this.envSpace = space;
     return Promise.resolve(space);
+  }
+
+  environmentState(): Promise<EnvironmentReply> {
+    return Promise.resolve(this.mockEnvironmentReply());
+  }
+
+  importEnvironment(path?: string): Promise<EnvironmentReply> {
+    // There is no native picker in a browser, and pretending otherwise would ship an enabled control
+    // that silently does nothing — `<ux_quality>` 6. A path supplied by a caller (a test, a scripted
+    // scene) is honoured; a click with no path says plainly where the capability lives.
+    if (path === undefined) {
+      return Promise.resolve({
+        applied: false, label: "", width: 0, height: 0, meanRadiance: [0, 0, 0],
+        message: "Choosing a panorama file needs the packaged desktop editor.",
+        reason: "Choosing a panorama file needs the packaged desktop editor.",
+        path: null, cancelled: false,
+      });
+    }
+    const label = path.split(/[\\/]/).pop()?.replace(/\.hdr$/i, "") ?? "environment";
+    this.mockEnvironment = { label, path };
+    return Promise.resolve(this.mockEnvironmentReply());
+  }
+
+  resetEnvironment(): Promise<EnvironmentReply> {
+    this.mockEnvironment = null;
+    return Promise.resolve({
+      applied: true, label: "Studio (built in)", width: 0, height: 0, meanRadiance: [0, 0, 0],
+      message: "Back to the built-in studio lighting", reason: null, path: null, cancelled: false,
+    });
+  }
+
+  setExposure(exposure: number): Promise<number> {
+    this.mockExposure = Math.min(8, Math.max(0.05, exposure));
+    return Promise.resolve(this.mockExposure);
+  }
+
+  /** The one place the mock says what it is lit by, so the read and the write cannot disagree. */
+  private mockEnvironmentReply(): EnvironmentReply {
+    const env = this.mockEnvironment;
+    return {
+      applied: env !== null,
+      label: env?.label ?? "Studio (built in)",
+      width: env ? 2048 : 0,
+      height: env ? 1024 : 0,
+      meanRadiance: env ? [0.42, 0.44, 0.5] : [0, 0, 0],
+      message: env ? `Lighting from "${env.label}" (2048x1024)` : "",
+      reason: null,
+      path: env?.path ?? null,
+      cancelled: false,
+    };
   }
   vfxProbe(): Promise<VfxProbe> {
     return Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 });
@@ -2868,6 +3040,10 @@ class MockClient implements EditorClient {
   deleteDeactivate(): Promise<boolean> {
     return Promise.resolve(true);
   }
+  deleteDeactivateMany(ids: string[]): Promise<string[]> {
+    this.selection = this.selection.filter((id) => !ids.includes(id));
+    return Promise.resolve(ids);
+  }
   copySubtree(): void {}
   cutSubtree(): Promise<boolean> {
     return Promise.resolve(true);
@@ -2905,11 +3081,14 @@ class MockClient implements EditorClient {
     return Promise.resolve({ ok: false, format: "", bodies: 0, joints: 0, meters_per_unit: 1, kilograms_per_unit: 1, reconciled: false, notes: [], error: "import is live-only (the .exe)" });
   }
   gizmoMode(): void {}
-  gizmoSelect(): Promise<boolean> {
-    return Promise.resolve(false);
+  gizmoSelect(id: string): Promise<boolean> {
+    // The engine routes `gizmo_select` through the ONE selection; the mock has to as well, or the dev
+    // build's outliner would report a multi-selection the mock's own `selectionIds` denies.
+    this.selection = [id];
+    return Promise.resolve(true);
   }
   gizmoSelected(): Promise<string | null> {
-    return Promise.resolve(null);
+    return Promise.resolve(this.selection[this.selection.length - 1] ?? null);
   }
   gizmoDebug(): Promise<[string, boolean, boolean, string, string]> {
     return Promise.resolve(["translate", false, false, "world", "origin"]);
@@ -2963,8 +3142,25 @@ class MockClient implements EditorClient {
     return Promise.resolve("cinematic");
   }
   // The dev MockCore has no native viewport — these are inert (the real wgpu input is Tauri-only).
-  viewportPick(_x: number, _y: number): Promise<string | null> {
+  viewportPick(_x: number, _y: number, _mods?: PickModifiers): Promise<string | null> {
     return Promise.resolve(null);
+  }
+  viewportPickRegion(_x0: number, _y0: number, _x1: number, _y1: number, _extend?: boolean): Promise<string[]> {
+    return Promise.resolve([]);
+  }
+  // …but the SELECTION is not a viewport fact, so the mock keeps a real one: the dev build's outliner,
+  // palette and toolbar all read it back, and a mock that always answered `[]` would make every
+  // multi-select surface look broken in the only build most of their tests run against.
+  selectEntities(ids: string[], mode?: "replace" | "add" | "toggle"): Promise<string[]> {
+    if (mode === "add") for (const id of ids) this.selection = [...this.selection.filter((s) => s !== id), id];
+    else if (mode === "toggle")
+      for (const id of ids)
+        this.selection = this.selection.includes(id) ? this.selection.filter((s) => s !== id) : [...this.selection, id];
+    else this.selection = ids.filter((id, i) => ids.lastIndexOf(id) === i);
+    return Promise.resolve([...this.selection]);
+  }
+  selectionIds(): Promise<string[]> {
+    return Promise.resolve([...this.selection]);
   }
   dragStart(): void {}
   dragEnd(): void {}

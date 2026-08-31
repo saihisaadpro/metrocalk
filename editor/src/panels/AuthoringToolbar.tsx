@@ -5,6 +5,8 @@
 import { useRef, useState } from "react";
 import { projectionStore, useMultiSelect, useSelectedId } from "../store/projection";
 import { setStatus, setClipboard, useClipboardHasContent } from "../store/ui";
+import { deleteSelection } from "../app/deleteSelection";
+import { entityLabel } from "../store/selectionText";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
 import { type ButtonVariant } from "../theme/primitives";
@@ -189,7 +191,12 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
                   },
                   close,
                   !!primary,
-                  "Clone the selected object",
+                  // SAY WHICH ONE. A verb that acts on the primary while the trigger beside it counts
+                  // fourteen is the same lie Delete used to tell, and a description that names the
+                  // object is the cheapest honest version of it until this is batched too.
+                  hasMultiple
+                    ? `Clone ${entityLabel(primary ?? "")} — the other ${ids.length - 1} are left alone`
+                    : "Clone the selected object",
                   "Select an object to duplicate",
                   "ghost",
                   "Duplicating…",
@@ -198,21 +205,24 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
                   "authDelete",
                   "Delete",
                   async () => {
-                    if (!primary) return;
-                    const ok = await client.deleteDeactivate(primary);
-                    if (!ok) {
-                      setStatus("couldn't delete the selection");
-                      pushToast("couldn't delete the selection", "error");
-                      return;
-                    }
-                    projectionStore.getState().markDeactivated([primary]);
-                    projectionStore.getState().select(null);
-                    setStatus("deactivated — recoverable with Ctrl-Z");
-                    pushToast("deleted (recoverable) · Ctrl-Z", "info");
+                    if (!ids.length) return;
+                    // THE WHOLE SELECTION, IN ONE TRANSACTION — through `deleteSelection`, which is
+                    // also what the right-click menu and the Delete key call (ADR-183). This row, that
+                    // menu and that key are one request said three ways, and written three times they
+                    // drifted: this one deactivated the set, the menu destroyed one object, and the key
+                    // did not exist.
+                    const outcome = await deleteSelection(client, ids);
+                    setStatus(outcome.sentence);
+                    pushToast(
+                      outcome.ok ? `deleted ${outcome.gone.length === 1 ? entityLabel(outcome.gone[0]) : `${outcome.gone.length} objects`} · Ctrl-Z` : outcome.sentence,
+                      outcome.ok ? "info" : "error",
+                    );
                   },
                   close,
-                  !!primary,
-                  "Deactivate the selection; Ctrl-Z restores it",
+                  hasSelection,
+                  hasMultiple
+                    ? `Deactivate all ${ids.length}; one Ctrl-Z restores them`
+                    : "Deactivate the selection; Ctrl-Z restores it",
                   "Select an object to delete",
                   "danger",
                   "Deleting…",
@@ -234,7 +244,7 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
                   close,
                   hasMultiple,
                   "Place the selected objects in a new group",
-                  "Shift/Ctrl-click at least two objects to group",
+                  "Drag a box on the stage, or Shift-click a second object, then group",
                   "ghost",
                   "Grouping…",
                 )}
@@ -294,7 +304,7 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
                   },
                   close,
                   !!primary,
-                  "Copy the selected subtree",
+                  hasMultiple ? `Copy ${entityLabel(primary ?? "")} — one subtree at a time` : "Copy the selected subtree",
                   "Select an object to copy",
                 )}
                 {action(
@@ -316,7 +326,9 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
                   },
                   close,
                   !!primary,
-                  "Copy then deactivate the selected subtree",
+                  hasMultiple
+                    ? `Cut ${entityLabel(primary ?? "")} — one subtree at a time`
+                    : "Copy then deactivate the selected subtree",
                   "Select an object to cut",
                   "ghost",
                   "Cutting…",

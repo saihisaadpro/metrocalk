@@ -285,7 +285,8 @@ struct Canvas {
 impl Canvas {
     fn new() -> Self {
         let mut px = vec![0u8; IMG_W * IMG_H * 3];
-        for c in px.chunks_exact_mut(3) {
+        // `as_chunks_mut::<3>()`: one RGB pixel is three bytes, and the type now says so.
+        for c in px.as_chunks_mut::<3>().0 {
             c.copy_from_slice(&BG);
         }
         Self { px }
@@ -644,9 +645,14 @@ fn main() {
             .as_ref()
             .and_then(|h| scene_pick::entity_of(&scene.state, h))
             .unwrap_or_else(|| "NOTHING".into());
+        // The pick key IS the instance index while it names an instance — that is what
+        // `build_objects` writes into it. Stated here rather than borrowed from the selection helper
+        // that used to say it, because the selection now speaks in entity ids and no longer has any
+        // reason to translate a pick key at all; the evidence renderer is the last thing that does.
         let new_instance = hit
             .as_ref()
-            .and_then(|h| scene_pick::instance_index_of(&scene.state, h.key));
+            .map(|h| h.key as usize)
+            .filter(|index| *index < scene.state.instances.len());
         let new_marker = hit.as_ref().and_then(|h| {
             let key = h.key as usize;
             (key >= scene.state.instances.len()).then(|| key - scene.state.instances.len())

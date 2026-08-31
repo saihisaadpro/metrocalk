@@ -202,6 +202,34 @@ function installClipRect() {
     box.height = Math.max(0, box.bottom - box.top);
     return box;
   };
+
+  // THE SURFACE UNDER TEST IS THE FRAME **PLUS WHAT THE SCENE PORTALLED OUT OF IT**.
+  //
+  // Every claim and every invariant used to be evaluated inside `[data-testid="shot-frame"]`, and
+  // `theme/Popover.tsx` portals `Modal`/`Popover` to `document.body` BY DESIGN — a raised `z-index`
+  // cannot escape an ancestor's `overflow: hidden`. So a dialog, popover, context menu, command
+  // palette or toast was **unassertable**, and the constitution names four of those as signature
+  // surfaces. Not "hard to assert": the frame does not contain them, so `present` found nothing,
+  // `absent` found nothing, and `textContent` did not include a word of them.
+  //
+  // MEASURED BEFORE IT WAS FIXED, because a suspected gap and a real one look identical in a green
+  // run. A scene rendering the command palette OPEN and claiming `absent: [".mtk-command-palette"]`
+  // plus `text_absent: ["Frame all"]` — both false on screen, in a capture that shows the dialog,
+  // its search field and that exact row — printed `ok` and exit 0. That transcript is the evidence
+  // this function exists; the `--self-test` mutants below are what keep it true.
+  //
+  // A portal root is a body child that is NOT the harness's own mount and that actually renders:
+  // the `<script>` tag is a body child too, and folding its source into the text claims would make
+  // `text_absent: ["null"]` fire on JavaScript nobody photographed.
+  window.__mtkRoots = () => {
+    const frame = document.querySelector('[data-testid="shot-frame"]');
+    if (!frame) return [];
+    const NOT_RENDERED = new Set(["SCRIPT", "STYLE", "LINK", "TEMPLATE", "NOSCRIPT", "META", "TITLE"]);
+    const portals = [...document.body.children].filter(
+      (el) => !el.contains(frame) && !NOT_RENDERED.has(el.tagName) && el.getClientRects().length > 0,
+    );
+    return [frame, ...portals];
+  };
 }
 
 /** Runs IN THE PAGE. A cheap, stable fingerprint of the layout: how wide the frame is, and where
@@ -262,9 +290,20 @@ async function settle(page) {
   }
 }
 
-function layoutInvariants(windowIsTheSubject) {
-  const frame = document.querySelector('[data-testid="shot-frame"]');
+function layoutInvariants({ rootIndex, windowIsTheSubject }) {
+  // ONE ROOT PER CALL. The nine invariants below are written against a single containing surface and
+  // stop their ancestor walks at it; running them over several roots at once would need every one of
+  // those walks to know which root it was under. The driver calls this once per root instead, so the
+  // rules themselves did not have to change shape to reach a portal.
+  const frame = window.__mtkRoots()[rootIndex];
   if (!frame) return [];
+  // A PORTALLED OVERLAY'S BOUNDARY IS THE WINDOW, NOT A PANEL. `Modal` renders `position: fixed;
+  // inset: 0` into `document.body`: it has no panel to escape, and R1's "past the panel's right
+  // edge" would be measured against a box that IS the viewport. So for a portal root the reference
+  // rectangle is the window on both axes — which also makes R5 (content leaves the window downwards)
+  // unconditional here, rather than gated on a scene having declared the window its subject. A
+  // dialog taller than the screen is off the screen whatever the scene said about its own width.
+  const isPortal = rootIndex > 0;
   const out = [];
   const TOL = 1; // sub-pixel rounding; fractional layout is not a defect
 
@@ -310,7 +349,13 @@ function layoutInvariants(windowIsTheSubject) {
     return `<${el.tagName.toLowerCase()}${cls}>` + (txt ? ` "${txt}"` : "");
   };
   const visible = (el, r) => {
-    if (r.width < 1 && r.height < 1) return false;
+    // ONE PIXEL IN BOTH AXES IS NOT A SURFACE A READER CAN BE SHOWN ANYTHING ON. The bound used to be
+    // `< 1`, which is off by exactly the size the screen-reader-only pattern uses: `.mtk-visually-
+    // hidden` is `width: 1px; height: 1px; overflow: hidden`, so every one of them was judged visible
+    // and R2 reported each as text truncated with nothing to say so — a confident finding about a
+    // sentence written to be unseen. Nothing legible fits in a 1x1 box, so excluding it costs no
+    // coverage; the rules keep judging anything larger on either axis.
+    if (r.width <= 1 && r.height <= 1) return false;
     const cs = getComputedStyle(el);
     return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
   };
@@ -376,10 +421,12 @@ function layoutInvariants(windowIsTheSubject) {
 
   const box = frame.getBoundingClientRect();
   const fs = getComputedStyle(frame);
-  const inner = {
-    left: box.left + parseFloat(fs.paddingLeft || 0) + parseFloat(fs.borderLeftWidth || 0),
-    right: box.right - parseFloat(fs.paddingRight || 0) - parseFloat(fs.borderRightWidth || 0),
-  };
+  const inner = isPortal
+    ? { left: 0, right: window.innerWidth }
+    : {
+        left: box.left + parseFloat(fs.paddingLeft || 0) + parseFloat(fs.borderLeftWidth || 0),
+        right: box.right - parseFloat(fs.paddingRight || 0) - parseFloat(fs.borderRightWidth || 0),
+      };
   const els = [...frame.querySelectorAll("*")];
 
   // R1 — CONTENT ESCAPES ITS PANEL. An element painted outside the frame's content box has left the
@@ -444,7 +491,7 @@ function layoutInvariants(windowIsTheSubject) {
   // while the same row inside a scroller hanging off the window keeps a bottom edge below it and
   // does. One definition, now five readers, and the last special case that had its own opinion about
   // where an element is has been removed.
-  if (windowIsTheSubject) {
+  if (windowIsTheSubject || isPortal) {
     for (const el of els) {
       if (!visible(el, el.getBoundingClientRect())) continue;
       if (getComputedStyle(el).position === "fixed") continue; // positioned against the window by design
@@ -1004,6 +1051,7 @@ if (scenes.length === 0) {
 let failed = 0;
 for (const scene of scenes) {
   const { id, looking_for, expect, viewport, click } = scene;
+  const typing = scene.type;
   const page = await browser.newPage();
   // EVERY SCENE STARTS FROM A FIRST-RUN USER'S STATE. Chromium serves one storage area to every
   // `file://` page in a run, and the shell remembers real things there: which docks are pinned
@@ -1055,6 +1103,22 @@ for (const scene of scenes) {
   // in an effect — the 250 ms above is the same flat guess one step earlier.
   await settle(page);
 
+  // Then the text, into the control the clicks reached. `page.$` searches the whole document rather
+  // than the frame, so this reaches a field inside a portalled dialog — which is the only place the
+  // command palette's query has ever lived. `clickCount: 3` selects whatever is in the field first,
+  // so a scene that types twice replaces rather than appends and cannot depend on what ran before it.
+  for (const [sel, value] of typing ?? []) {
+    const el = await page.$(sel);
+    if (!el) {
+      problems.push(`type into \`${sel}\` matched nothing — the scene never reached the state it claims`);
+      break;
+    }
+    await el.click({ clickCount: 3 });
+    await el.type(value, { delay: 0 });
+    await new Promise((r) => setTimeout(r, 300)); // the results are re-ranked on the next render
+  }
+
+
   // MEASURE BEFORE CAPTURING, because capturing MOVES THINGS. `screenshot({ fullPage: true })`
   // resizes the page to the content box and puts it back, and a shell that lays itself out from
   // `window.innerWidth` reacts: `shell-wide` rendered its docks open at 1440, the capture briefly
@@ -1071,15 +1135,31 @@ for (const scene of scenes) {
   await page.evaluate(installClipRect);
   const claim = await page.evaluate((e) => {
     const out = [];
-    const frame = document.querySelector('[data-testid="shot-frame"]');
+    const roots = window.__mtkRoots();
+    const frame = roots[0];
     if (!frame) return ["the harness itself never mounted"];
-    const text = frame.textContent ?? "";
+
+    // EVERY QUERY BELOW SPANS THE FRAME **AND** ANYTHING THE SCENE PORTALLED TO `document.body`.
+    // See `installClipRect` for the measurement that proved this was needed. `matches` is checked as
+    // well as `querySelectorAll` because a portal root can BE the match — `Modal` renders the
+    // `role="dialog"` element itself into the body, and a claim about it would otherwise be looking
+    // only at its descendants.
+    const qsa = (sel) =>
+      roots.flatMap((r) => (r.matches(sel) ? [r, ...r.querySelectorAll(sel)] : [...r.querySelectorAll(sel)]));
+    const qs = (sel) => qsa(sel)[0] ?? null;
+    // A clip walk stops at the root the element is UNDER, never at `roots[0]`: handing a portalled
+    // element the frame would walk it past `document.body` and intersect it with rectangles that are
+    // not its ancestors at all.
+    const rootOf = (el) => roots.find((r) => r === el || r.contains(el)) ?? frame;
+    const clip = (el) => window.__mtkClipRect(el, rootOf(el));
+    const text = roots.map((r) => r.textContent ?? "").join(" ");
+
     for (const [sel, atLeast] of e.present ?? []) {
-      const n = frame.querySelectorAll(sel).length;
+      const n = qsa(sel).length;
       if (n < atLeast) out.push(`expected at least ${atLeast} \`${sel}\`, found ${n}`);
     }
     for (const sel of e.absent ?? []) {
-      const n = frame.querySelectorAll(sel).length;
+      const n = qsa(sel).length;
       if (n) out.push(`expected no \`${sel}\`, found ${n}`);
     }
     for (const s of e.text_present ?? []) {
@@ -1123,7 +1203,7 @@ for (const scene of scenes) {
     const ceiling = (axis, pairs) => {
       const tall = axis === "height";
       for (const [sel, px] of pairs ?? []) {
-        const el = frame.querySelector(sel);
+        const el = qs(sel);
         if (!el) {
           out.push(`max_${axis} needs \`${sel}\`, which is not there`);
           continue;
@@ -1141,13 +1221,13 @@ for (const scene of scenes) {
     const floor = (axis, pairs) => {
       const tall = axis === "height";
       for (const [sel, px] of pairs ?? []) {
-        const el = frame.querySelector(sel);
+        const el = qs(sel);
         if (!el) {
           out.push(`min_${axis} needs \`${sel}\`, which is not there`);
           continue;
         }
         const box = el.getBoundingClientRect();
-        const seen = window.__mtkClipRect(el, frame);
+        const seen = clip(el);
         const claimed = Math.round(tall ? box.height : box.width);
         const onScreen = Math.round(tall ? seen.height : seen.width);
         if (onScreen >= px - 1) continue;
@@ -1195,8 +1275,8 @@ for (const scene of scenes) {
     // sheet takes no layout space, so the stage's room is the whole column, and that is true of any
     // future overlay for the same reason rather than because it is the dock.
     if (e.stage_floor != null) {
-      const col = frame.querySelector(".mtk-stage-column");
-      const vp = frame.querySelector("[data-testid='viewport']");
+      const col = qs(".mtk-stage-column");
+      const vp = qs("[data-testid='viewport']");
       if (!col || !vp) out.push("stage_floor needs .mtk-stage-column and the viewport, and one is not there");
       else {
         // …AND A SIBLING CANNOT RAISE ITS OWN ENTITLEMENT. Reading the declared `min-height` alone
@@ -1219,7 +1299,7 @@ for (const scene of scenes) {
         }
         const room = Math.max(0, Math.round(col.clientHeight - taken));
         const want = Math.min(e.stage_floor, room);
-        const seen = Math.round(window.__mtkClipRect(vp, frame).height);
+        const seen = Math.round(clip(vp).height);
         if (seen < want - 1) {
           out.push(
             `the stage measures ${seen}px tall against the ${want}px it is owed here — its ${e.stage_floor}px ` +
@@ -1247,14 +1327,14 @@ for (const scene of scenes) {
     // against building a waiver mechanism early). A scene that claims "these controls are reachable
     // here" is a claim with an owner, and it is the claim that was missing.
     for (const sel of e.unclipped ?? []) {
-      const els = [...frame.querySelectorAll(sel)];
+      const els = [...qsa(sel)];
       if (!els.length) {
         out.push(`unclipped needs \`${sel}\`, which matches nothing`);
         continue;
       }
       for (const el of els) {
         const r = el.getBoundingClientRect();
-        const c = window.__mtkClipRect(el, frame);
+        const c = clip(el);
         const lost = Math.round(r.width - c.width);
         const lostY = Math.round(r.height - c.height);
         if (lost > 1 || lostY > 1) {
@@ -1304,19 +1384,19 @@ for (const scene of scenes) {
     // compared to the container. A gap means something is missing; a surplus means two of them are
     // on the same pixels; either way the column is not accounted for.
     for (const [csel, kids] of e.fills ?? []) {
-      const container = frame.querySelector(csel);
+      const container = qs(csel);
       if (!container) {
         out.push(`fills needs \`${csel}\`, which is not there`);
         continue;
       }
-      const have = kids.map((k) => [k, frame.querySelector(k)]);
+      const have = kids.map((k) => [k, qs(k)]);
       const gone = have.filter(([, el]) => !el).map(([k]) => k);
       if (gone.length) {
         out.push(`fills \`${csel}\` names ${gone.join(", ")}, which ${gone.length > 1 ? "are" : "is"} not there`);
         continue;
       }
       const box = container.clientHeight;
-      const parts = have.map(([k, el]) => [k, Math.round(window.__mtkClipRect(el, frame).height)]);
+      const parts = have.map(([k, el]) => [k, Math.round(clip(el).height)]);
       const sum = parts.reduce((a, [, h]) => a + h, 0);
       if (Math.abs(sum - box) > 1) {
         out.push(
@@ -1329,8 +1409,8 @@ for (const scene of scenes) {
       }
     }
     for (const [sa, sb] of e.same_line ?? []) {
-      const a = frame.querySelector(sa);
-      const b = frame.querySelector(sb);
+      const a = qs(sa);
+      const b = qs(sb);
       if (!a || !b) {
         out.push(`same_line needs both \`${sa}\` and \`${sb}\`; ${a ? sb : sa} is not there`);
         continue;
@@ -1356,8 +1436,8 @@ for (const scene of scenes) {
     // asserts the ORDER too (`sa` above `sb`), because two blocks that swapped places are still
     // stacked, and a fix printed above the complaint it fixes is not the thing being claimed.
     for (const [sa, sb] of e.stacked ?? []) {
-      const a = frame.querySelector(sa);
-      const b = frame.querySelector(sb);
+      const a = qs(sa);
+      const b = qs(sb);
       if (!a || !b) {
         out.push(`stacked needs both \`${sa}\` and \`${sb}\`; ${a ? sb : sa} is not there`);
         continue;
@@ -1385,7 +1465,16 @@ for (const scene of scenes) {
   // precondition: a scene that set the WINDOW is a scene whose bottom edge is the window's, and a
   // scene that set a frame width is a `maxWidth` box on a page that is allowed to scroll. The
   // driver already rejects a scene that states both, so this reads one flag and not two.
-  const evaluated = await page.evaluate(layoutInvariants, Boolean(scene.viewport));
+  // ONCE PER ROOT — the frame, then each surface the scene portalled to `document.body`. A run that
+  // judged nothing and a run that agreed about everything print the same "ok" line, so the count of
+  // surfaces reached is reported below rather than left to be inferred from silence.
+  const rootCount = await page.evaluate(() => window.__mtkRoots().length);
+  const evaluated = [];
+  for (let rootIndex = 0; rootIndex < rootCount; rootIndex++) {
+    evaluated.push(
+      ...(await page.evaluate(layoutInvariants, { rootIndex, windowIsTheSubject: Boolean(scene.viewport) })),
+    );
+  }
   // A COUNTED BLIND SPOT IS NOT A FINDING. An invariant that cannot judge something must say so —
   // silence reads as coverage — but saying so is not the same as failing, and routing both down one
   // list would have made every graph scene red for a limitation of the rule rather than a defect in
@@ -1436,7 +1525,11 @@ for (const scene of scenes) {
     console.error(`        looking for: ${looking_for}`);
     for (const b of bad) console.error(`        ${b}`);
   } else {
-    console.log(`ok    ${id}.png  (${colours} colours)  ${looking_for}`);
+    // The reach, in numbers, beside the verdict. `1 surface` is the frame alone; anything more means
+    // the scene portalled something to `document.body` and it WAS judged — the distinction a bare
+    // "ok" cannot make, and the one that used to hide four signature surfaces behind a green run.
+    const reach = rootCount > 1 ? `, ${rootCount} surfaces` : "";
+    console.log(`ok    ${id}.png  (${colours} colours${reach})  ${looking_for}`);
   }
   for (const n of notes) console.log(`        ${n}`);
   await page.close();

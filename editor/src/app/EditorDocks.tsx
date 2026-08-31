@@ -39,6 +39,9 @@ const TransformPanel = lazy(() => import("../panels/TransformPanel").then((modul
 const Inspector = lazy(() => import("../inspector/Inspector").then((module) => ({ default: module.Inspector })));
 const BehaviourSection = lazy(() => import("../panels/BehaviourSection").then((module) => ({ default: module.BehaviourSection })));
 const BindingGraph = lazy(() => import("../graph/BindingGraph").then((module) => ({ default: module.BindingGraph })));
+// The scene's look — the sky it is lit by and the exposure it is seen at. Lazy for the same reason as
+// the rest of this list: it is a section a person opens, not chrome the first paint has to carry.
+const LookSection = lazy(() => import("../panels/LookSection").then((module) => ({ default: module.LookSection })));
 
 /// The sub-engines whose workspace is a side panel (a stack of controls). The wide ones — model, import,
 /// animate, logic — open in the bottom dock instead, because a timeline needs width.
@@ -50,7 +53,7 @@ export type InspectorWorkspace = "properties" | "relations";
 export interface LeftDockProps {
   client: EditorClient;
   active: LeftWorkspace;
-  onContextMenu: (id: string, x: number, y: number) => void;
+  onContextMenu: (ids: string[], x: number, y: number) => void;
   onStartPipe: () => void;
   onImport: () => void;
   onCollapse?: () => void;
@@ -161,6 +164,23 @@ export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport,
         className="mtk-dock-panel"
       >
         <AuthoringToolbar client={client} />
+        {/* Scene-WIDE, so it belongs to the engine whose column this is rather than to the Inspector,
+            which answers "what is selected?". Closed by default and `unmountOnClose` so the hierarchy —
+            the reason this column exists — keeps the fill (ADR-170/185) and nothing polls the engine for
+            a sky nobody is looking at. `storageKey` means the default decides only the first run. */}
+        <DisclosureSection
+          id="scene-look"
+          title="Lighting & sky"
+          summary="What the scene is lit by, and how bright"
+          icon={<Icon name="sunrise" size="md" />}
+          defaultOpen={false}
+          unmountOnClose
+          storageKey="scene-look"
+        >
+          {active === "scene" && (
+            <LazyWorkspace label="Lighting and sky"><LookSection client={client} /></LazyWorkspace>
+          )}
+        </DisclosureSection>
         <div className="mtk-dock-panel__fill"><Hierarchy client={client} onContextMenu={onContextMenu} /></div>
       </div>
       <div

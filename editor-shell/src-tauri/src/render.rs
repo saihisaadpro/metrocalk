@@ -1027,6 +1027,12 @@ pub struct SceneState {
     pub env_revision: u64,
     /// What the current environment is called, for the UI to report.
     pub env_label: String,
+    /// The file the current environment was read from, when it came from one.
+    ///
+    /// A label cannot be re-loaded — "sunset_4k" says nothing about where the panorama is — so this is
+    /// the only part of the environment that can survive a reopen. It is written to the project's
+    /// `.view.json` sidecar and read back on open; `None` is the built-in studio sky.
+    pub env_path: Option<String>,
     /// How many MOMENT-fired one-shot bursts are alive right now. Published purely so a test can tell
     /// "the burst was never created" from "the burst was created and drew nothing" — two failures that
     /// look identical from a particle count alone.
@@ -6051,7 +6057,8 @@ fn render_thumbnail(
         let start = (row * padded) as usize;
         let line = &data[start..start + unpadded as usize];
         if bgra {
-            for px in line.chunks_exact(4) {
+            // `as_chunks::<4>()`: one BGRA pixel is four bytes and the type now says so.
+            for px in line.as_chunks::<4>().0 {
                 rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
             }
         } else {

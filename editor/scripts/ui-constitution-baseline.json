@@ -30,6 +30,13 @@
       "literal-motion": 0,
       "unitless-length": 0
     },
+    "src/app/deleteSelection.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
     "src/app/EditorDocks.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
@@ -72,6 +79,13 @@
       "literal-motion": 0,
       "unitless-length": 0
     },
+    "src/app/marquee.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
     "src/app/nativeImportLifecycle.ts": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
@@ -86,7 +100,42 @@
       "literal-motion": 0,
       "unitless-length": 0
     },
+    "src/app/sceneQuery.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
+    "src/app/selectionCommands.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
+    "src/app/selectSimilar.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
     "src/app/stageInput.ts": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
+    "src/app/StageMarquee.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
+    "src/app/stateSelection.ts": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
@@ -220,7 +269,7 @@
       "unitless-length": 0
     },
     "src/panels/ContextMenu.tsx": {
-      "raw-native-control": 1,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
@@ -269,7 +318,7 @@
       "unitless-length": 0
     },
     "src/panels/Hierarchy.tsx": {
-      "raw-native-control": 1,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
@@ -472,6 +521,13 @@
       "unitless-length": 0
     },
     "src/theme/assets.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
+    "src/theme/fields.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,

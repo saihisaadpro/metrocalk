@@ -271,6 +271,15 @@ pub enum Record {
     /// Persisted so a "deleted" (recoverable) entity stays hidden across reload — replayed by id through
     /// the same `delete_deactivate`, so the projection re-emits `active:false` and the hierarchy dims it.
     DeleteDeactivate { id: String },
+    /// **A whole selection deleted in ONE transaction** — and one record, which is the entire point.
+    ///
+    /// Writing N `DeleteDeactivate` records instead replays as N separate commits, so a `Record::Undo`
+    /// that reverted all of them live reverts exactly ONE of them on replay. That is a divergence
+    /// between the live document and the reopened one, and it is invisible until somebody deletes a
+    /// selection, undoes it, and closes the app — which is how the live `.exe` run found it: the next
+    /// launch replayed 27 deactivations and one undo, and 26 objects that the user had restored were
+    /// gone. Undo granularity is part of the record's contract, not an implementation detail of it.
+    DeleteDeactivateMany { ids: Vec<String> },
     /// M9.5 fidelity deformation (G5, ADR-029): a part's saved handle deform — the moved handle targets,
     /// stored as a G2 override (NOT baked geometry — the surface is reproduced deterministically from
     /// these). Replayed by re-emitting the override (`set_part_deform`) so the deformed surface survives
@@ -729,6 +738,14 @@ impl Log {
                     .is_some_and(|e| capscene::set_part_active(engine, e, active).is_ok()),
                 Record::DeleteDeactivate { id } => EntityId::from_loro_key(&id)
                     .is_some_and(|e| capscene::delete_deactivate(engine, scene, e).is_ok()),
+                Record::DeleteDeactivateMany { ids } => {
+                    let targets: Vec<EntityId> = ids
+                        .iter()
+                        .filter_map(|s| EntityId::from_loro_key(s))
+                        .collect();
+                    !targets.is_empty()
+                        && capscene::delete_deactivate_many(engine, scene, &targets).is_ok()
+                }
                 Record::Deform { id, handles } => EntityId::from_loro_key(&id)
                     .is_some_and(|e| capscene::set_part_deform(engine, e, &handles).is_ok()),
                 Record::ApplyMarketplace {

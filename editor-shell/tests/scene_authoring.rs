@@ -377,6 +377,71 @@ fn delete_is_deactivate_not_destroy_and_undo_restores() {
     assert!(e.is_active(id), "undo re-activated it");
 }
 
+/// Deleting a SELECTION is ONE transaction, so one undo brings all of it back.
+///
+/// The replayed half of the same claim — that a reopened project agrees with the live one about how
+/// many undos that was — is in `persistence.rs`, because it is a claim about the LOG and it was wrong
+/// first: N records replay as N commits, and the `Record::Undo` after them reverts exactly one.
+#[test]
+fn deleting_a_selection_is_one_undoable_transaction() {
+    let (mut e, scene) = engine_with_resolver();
+    let ids: Vec<EntityId> = (0..5)
+        .map(|i| capscene::create_entity(&mut e, [i as f32, 0.0, 0.0], "Part").expect("create"))
+        .collect();
+    capscene::delete_deactivate_many(&mut e, &scene, &ids).expect("delete the selection");
+    assert!(ids.iter().all(|id| !e.is_active(*id)), "all five went");
+    assert!(e.undo(), "and ONE undo is offered");
+    assert!(
+        ids.iter().all(|id| e.is_active(*id)),
+        "…which brings all five back, not the last one"
+    );
+    // NOT "there is nothing left to undo" — the five creates above are five transactions of their
+    // own, and a second undo correctly reverts one of them. The claim is that ONE undo restores the
+    // whole batch, which is the thing a loop of single deletes cannot offer.
+}
+
+/// Two selected objects bound to each other must not have the same binding removed twice in one
+/// transaction — the sweep is over the whole set, once, for exactly this reason.
+#[test]
+fn deleting_two_bound_objects_together_does_not_double_remove_their_binding() {
+    let (mut e, scene) = engine_with_resolver();
+    let bar = e.alloc_entity_id();
+    let provider = e.alloc_entity_id();
+    e.commit(
+        "pair",
+        vec![
+            Op::CreateEntity {
+                id: bar,
+                parent: None,
+            },
+            Op::CreateEntity {
+                id: provider,
+                parent: None,
+            },
+        ],
+    )
+    .expect("create the pair");
+    e.commit(
+        "bind",
+        vec![Op::AddBinding {
+            from: bar,
+            kind: metrocalk_editor_shell::TRACKS.to_string(),
+            to: provider,
+        }],
+    )
+    .expect("bind");
+    assert_eq!(e.bindings().len(), 1);
+
+    capscene::delete_deactivate_many(&mut e, &scene, &[bar, provider]).expect("delete both");
+    assert!(e.bindings().is_empty(), "the binding went with them");
+    assert!(e.undo(), "one transaction");
+    assert_eq!(
+        e.bindings().len(),
+        1,
+        "…and the binding came back exactly once"
+    );
+}
+
 #[test]
 fn deleting_a_provider_frees_its_dependents() {
     let (mut e, scene) = engine_with_resolver();

@@ -66,14 +66,23 @@ describe("editor app — end-to-end wiring", () => {
     // user must. (It used to be reachable without this click because the dock rendered all six engines
     // at once and hid five — a testid you can query from a workspace you are not in is not evidence that
     // a user can reach it.)
+    // EVERY WAIT ON A LAZY WORKSPACE IS GIVEN REAL TIME. `findBy*` defaults to a **1000 ms** budget, and
+    // opening Build resolves a dynamic `import()` — so this line was a wall-clock assertion inside a
+    // parallel test runner, the same class as the `performance.now()` bound removed from
+    // `projection.test.tsx`. Measured on an idle machine at HEAD, before this change: two runs of this
+    // file alone, one green and one red on exactly this line. The test above it already carries
+    // `{ timeout: 10_000 }` for the same reason, which is the tell that the budget — not the code — was
+    // what this file kept failing on. A flake is a failure; nothing about the CLAIM changes.
     fireEvent.click(screen.getByTestId("engine-build"));
-    fireEvent.change(await screen.findByTestId("describe"), { target: { value: "a nonexistent thingamajig" } });
+    fireEvent.change(await screen.findByTestId("describe", {}, { timeout: 10_000 }), {
+      target: { value: "a nonexistent thingamajig" },
+    });
     fireEvent.click(screen.getByTestId("describeBtn"));
-    fireEvent.click(await screen.findByTestId("genBtn"));
+    fireEvent.click(await screen.findByTestId("genBtn", {}, { timeout: 10_000 }));
 
     // the top-bar Wallet's displayed balance dropped — it reads the SAME store the DescribeBar wrote to
-    await waitFor(() => expect(bal.textContent).toBe("90"));
-  });
+    await waitFor(() => expect(bal.textContent).toBe("90"), { timeout: 10_000 });
+  }, 20_000);
 
   it("the stage holds priority on resize: below the breakpoint the panels collapse to icon rails (C8)", () => {
     render(<App />);

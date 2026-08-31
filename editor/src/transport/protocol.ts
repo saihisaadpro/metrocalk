@@ -154,15 +154,31 @@ export interface GenerateResponse {
  *  authoritative on the shell; this is only the legible estimate the Generate button shows up-front. */
 export const GENERATE_COST = 10;
 
-/** `entity_actions(id)` — one context-menu action's availability (M3.3). `action` is the lowercase tag
- *  ("bind"|"remove"|"duplicate"|"focus"|"inspect"|"makedynamic"); when `!available`, `reason` explains why
- *  (every "no" explained, ADR-016); `mutates` ⇒ it's an undoable transaction. */
+/** `entity_actions_selection(ids)` — one context-menu action's availability (M3.3). `action` is the
+ *  lowercase tag ("bind"|"remove"|"duplicate"|"focus"|"inspect"|"makedynamic"); when `!available`,
+ *  `reason` explains why (every "no" explained, ADR-016); `mutates` ⇒ it's an undoable transaction.
+ *
+ *  `appliesTo` is how many of the SELECTED objects the verb acts on (ADR-183), and it is `0` exactly
+ *  when `available` is false. A row over 378 selected bolts that does not say its scope is the same
+ *  lie the authoring toolbar's `Delete` told while its trigger read `Actions · 14`. */
 export interface ActionItem {
   action: string;
   label: string;
   available: boolean;
   reason?: string;
   mutates: boolean;
+  appliesTo: number;
+}
+
+/** The action model's answer about a whole selection (ADR-183).
+ *
+ *  `count` is how many of the ids asked about are live — what every `appliesTo` is measured against —
+ *  and `missing` is how many have gone (a stale right-click after a Remove/Undo race). The two are
+ *  separate because a person can act on the first and only be told about the second. */
+export interface SelectionActions {
+  count: number;
+  missing: number;
+  items: ActionItem[];
 }
 
 /** `entity_details(id)` — the hover tooltip read (M3.3): name + component names + provided/required caps
@@ -1917,6 +1933,33 @@ export interface ColourStatus {
   };
   capabilities: Record<string, boolean>;
   notes: string[];
+}
+
+/**
+ * What the scene is lit by — the answer every environment command gives, so a refusal, a no-op and a
+ * success are one shape the UI reads the same way.
+ */
+export interface EnvironmentReply {
+  /** Set iff a panorama is in force (import) or the change landed (reset). */
+  applied: boolean;
+  /** What it is called. The panorama's file stem, or the built-in sky's name. */
+  label: string;
+  /** Panorama size — the legible-cost line. Zero for the built-in sky. */
+  width: number;
+  height: number;
+  /**
+   * Mean linear radiance of the panorama — what the diffuse image-based lighting actually lights the
+   * scene with, not what the thumbnail looks like.
+   */
+  meanRadiance: [number, number, number];
+  /** A sentence to show: the summary on success, the reason on a refusal. Never empty on either. */
+  message: string;
+  /** Set iff nothing changed because something was wrong. */
+  reason: string | null;
+  /** The file it was read from, when there was one. */
+  path: string | null;
+  /** Set iff the person dismissed the file dialog — a no-op, not a failure, and drawn as neither. */
+  cancelled: boolean;
 }
 
 /** What the renderer is drawing this instant — measured, not inferred. */

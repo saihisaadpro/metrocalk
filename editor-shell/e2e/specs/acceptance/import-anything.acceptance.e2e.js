@@ -22,8 +22,8 @@ const ASCII_CUBE_FBX =
   "\t}\n}\n";
 
 const countEntities = async () => {
-  const m = (await $("#count").getText()).match(/(\d+)\s+entities/);
-  return m ? Number(m[1]) : NaN;
+  const raw = await $("#count").getAttribute("data-entities");
+  return raw == null ? NaN : Number(raw);
 };
 
 describe("acceptance / M11.1 — import-anything: a real .fbx → a working asset (native ufbx, live)", () => {

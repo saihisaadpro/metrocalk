@@ -31,10 +31,20 @@ export const scaffold = {
   status: () => css("#status").then((e) => e.getText()),
   reject: () => css("#reject").then((e) => e.getText()),
   count: () => css("#count").then((e) => e.getText()),
+  /** The live entity count as a NUMBER, read from `#count`'s `data-entities`.
+   *
+   *  NOT `count()` plus a regex over "N entities". Nine specs used to key on that word, which made a
+   *  correction to user-facing copy a nine-file blind edit to a suite that only runs locally — the
+   *  exact coupling `<test_and_ci_discipline>` 3 forbids. The panel publishes the number as a
+   *  structured attribute; this is the one place that reads it. */
+  entityCount: async () => {
+    const raw = await css("#count").then((e) => e.getAttribute("data-entities"));
+    return raw == null ? NaN : Number(raw);
+  },
   walletBalance: async () => Number((await css("#walletBal").then((e) => e.getText())).trim()),
 
   async waitConnected(timeout = 60000) {
-    await browser.waitUntil(async () => /\d+ entities/.test(await this.count()), {
+    await browser.waitUntil(async () => Number.isFinite(await this.entityCount()), {
       timeout,
       timeoutMsg: "editor never showed an entity count (no /core connection?)",
     });

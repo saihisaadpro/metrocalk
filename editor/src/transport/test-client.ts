@@ -76,7 +76,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     generate: () => Promise.resolve({ created: "gen-1", cost: 10, available: true, seam: null, balance: 90 }),
     undo: vi.fn(() => Promise.resolve(false)),
     redo: vi.fn(() => Promise.resolve(false)),
-    entityActions: () => Promise.resolve([]),
+    entityActionsFor: (ids: string[]) => Promise.resolve({ count: ids.length, missing: 0, items: [] }),
     entityDetails: () => Promise.resolve(null),
     cadReport: () =>
       Promise.resolve({
@@ -235,6 +235,33 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     ),
     setWorkingSpace: vi.fn((space: string) => Promise.resolve(space)),
     setEnvironmentColourSpace: vi.fn((space: string) => Promise.resolve(space)),
+    // The built-in sky by default — the state a fresh project is actually in, so a test that wants a
+    // panorama has to say so rather than inheriting one.
+    environmentState: vi.fn(() =>
+      Promise.resolve({
+        applied: false, label: "Studio (built in)", width: 0, height: 0,
+        meanRadiance: [0, 0, 0] as [number, number, number],
+        message: "", reason: null, path: null, cancelled: false,
+      }),
+    ),
+    importEnvironment: vi.fn((path?: string) =>
+      Promise.resolve({
+        applied: true, label: "sunset_4k", width: 4096, height: 2048,
+        meanRadiance: [0.62, 0.48, 0.36] as [number, number, number],
+        message: 'Lighting from "sunset_4k" (4096x2048) - it lights the scene and shows in reflections',
+        reason: null, path: path ?? "C:/skies/sunset_4k.hdr", cancelled: false,
+      }),
+    ),
+    resetEnvironment: vi.fn(() =>
+      Promise.resolve({
+        applied: true, label: "Studio (built in)", width: 0, height: 0,
+        meanRadiance: [0, 0, 0] as [number, number, number],
+        message: "Back to the built-in studio lighting", reason: null, path: null, cancelled: false,
+      }),
+    ),
+    // The renderer's own clamp, restated: a test that sends 40 must see what the engine would send
+    // back, or it proves the slider talks and not that it reports.
+    setExposure: vi.fn((exposure: number) => Promise.resolve(Math.min(8, Math.max(0.05, exposure)))),
     vfxProbe: vi.fn(() => Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 })),
     cameraProbe: vi.fn(() => Promise.resolve({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0 })),
     vfxCatalog: vi.fn(() => Promise.resolve([
@@ -309,7 +336,11 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     cameraDebug: () => Promise.resolve([0.785, 0.5, 60, 0, 0, 0]),
     setRenderProfile: (profile) => Promise.resolve(profile),
     renderProfileDebug: () => Promise.resolve("cinematic"),
+    deleteDeactivateMany: vi.fn((ids: string[]) => Promise.resolve(ids)),
     viewportPick: () => Promise.resolve(null),
+    viewportPickRegion: vi.fn(() => Promise.resolve([])),
+    selectEntities: vi.fn((ids: string[]) => Promise.resolve(ids)),
+    selectionIds: () => Promise.resolve([]),
     dragStart: vi.fn(),
     dragEnd: vi.fn(),
     zoom: vi.fn(),
