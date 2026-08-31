@@ -1700,6 +1700,79 @@ body > [role="dialog"][aria-modal="true"] {
   border-top-width: 0;
 }
 
+/* ── The choice grid: a card you press to apply something to the selected object ───────────────────
+   Roles, cinematic shots and effects are one gesture, and all three drew it by hand as a fixed
+   `repeat(2, 1fr)` (or 3) of compact buttons with the explanatory sentence hidden in a `title`.
+   `auto-fit` from a minimum instead: the 234px content box a 300px dock gives a section holds ONE
+   column at a readable width rather than two at 113px, and a wide dock gains columns instead of
+   stretching the same two into billboards.
+
+   The card is quiet by default and lifts on hover — the same one-signal selection language the dock
+   tabs use, so "this is the one you have" reads the same everywhere. It is a `.mtk-btn--ghost` so
+   the focus ring, the disabled treatment and the busy cursor are the button system's and not a
+   fourth opinion about them. */
+.mtk-choice-grid {
+  display: grid;
+  /* 200, and the number is a READABILITY floor rather than a fitting one. At 168 a 760px surface
+     takes four columns of 171px and "Spins; vanishes and scores when somethi…" loses its verb; at 200
+     the same surface takes three of 231 and the sentence survives. The narrow end is unchanged
+     either way — a 300px dock gives a section 242px, which is one column at both numbers. */
+  grid-template-columns: repeat(auto-fit, minmax(var(--mtk-choice-min, 200px), 1fr));
+  gap: var(--mtk-space-3);
+  min-width: 0;
+}
+/* Overriding the button base, not competing with it: a card is a left-aligned two-line block, so the
+   three declarations that make a button a centred single-line pill are the three that change. */
+.mtk-choice {
+  align-items: flex-start;
+  justify-content: flex-start;
+  min-width: 0;
+  padding: var(--mtk-space-4) var(--mtk-space-5);
+  border-color: var(--mtk-border-subtle);
+  border-radius: var(--mtk-radius-lg);
+  background: var(--mtk-bg-panel);
+  text-align: left;
+  white-space: normal;
+}
+.mtk-choice:hover:not(:disabled) { border-color: var(--mtk-border); background: var(--mtk-bg-hover); box-shadow: var(--mtk-shadow-1); }
+.mtk-choice.is-selected { border-color: var(--mtk-accent-border); background: var(--mtk-accent-subtle); color: var(--mtk-accent); }
+.mtk-choice.is-selected:hover:not(:disabled) { background: color-mix(in srgb, var(--mtk-accent-subtle) 76%, var(--mtk-accent-border)); }
+.mtk-choice__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  margin-top: 1px;
+  border-radius: var(--mtk-radius-md);
+  color: var(--mtk-accent);
+  background: var(--mtk-accent-subtle);
+}
+.mtk-choice.is-selected .mtk-choice__icon { color: var(--mtk-on-accent); background: var(--mtk-accent-solid); }
+.mtk-choice:disabled .mtk-choice__icon { color: var(--mtk-text-faint); background: var(--mtk-bg-inset); }
+.mtk-choice__copy { display: grid; gap: 1px; min-width: 0; }
+.mtk-choice__label { color: inherit; font-size: 12px; font-weight: 650; line-height: 1.3; }
+/* TWO LINES, AND THE CAP IS WHAT MAKES THE DESCRIPTION AFFORDABLE. The engine ships ten roles; at
+   the 242px content box a 300px dock leaves a section, an unclamped blurb runs to three and four
+   lines and the Roles catalogue alone is 1,230px of column. Clamped, the tallest card is 65px and
+   the whole catalogue fits in ~700 — a list you can scan rather than one you scroll past. The
+   ellipsis is honest truncation (R2's own rule) and the whole sentence is still the card's `title`,
+   which is now a SECOND statement of visible text rather than the only statement of hidden text. */
+.mtk-choice__description {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--mtk-text-muted);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+.mtk-choice.is-selected .mtk-choice__description { color: var(--mtk-text-secondary); }
+.mtk-choice:disabled .mtk-choice__description { color: var(--mtk-text-faint); }
+.mtk-choice__meta { flex: none; margin-left: auto; color: var(--mtk-text-muted); font: 600 10px/1 var(--mtk-font-mono); }
+
 .mtk-empty-panel {
   display: flex;
   flex: 1 1 auto;
@@ -1772,7 +1845,16 @@ body > [role="dialog"][aria-modal="true"] {
   .mtk-workspace-panel__actions { max-width: 52%; overflow-x: auto; }
   .mtk-workspace-panel__body.is-padded { padding: 6px; }
   .mtk-dock-tab { min-height: 36px; padding: 0 10px; }
-  .mtk-disclosure__summary { display: none; }
+  /* THE SUMMARY STAYS TOO, and for the same reason as the subtitle above it. `display: none` here
+     keyed a SECTION HEADER's content off the WINDOW, and the two have almost nothing to do with each
+     other: the left dock is 340px wide at a 1440 window and 300 at 1000, so the header this rule was
+     protecting is the same size in the regime where it fires and the regime where it does not. What
+     it cost is the whole reason a section carries a summary — a CLOSED disclosure reports its state
+     there and nowhere else, so below 760px `Cinematics` and `Effects` collapsed to a caret and a
+     word, saying nothing about the six shots and six effects inside them.
+     Nothing is needed in its place: `.mtk-disclosure__summary` is already `flex: 1 1 auto` with
+     `min-width: 0` and an ellipsis, so it yields to the title exactly the way the dock tabs yield to
+     each other — down to nothing, if a header ever really is that narrow. */
   /* Stacked: the label takes its own line and the control keeps the full width, with the unit and the
      reset still on the control's line — a reset that stacked under its own field would read as another
      property. The sheet keeps three tracks here rather than four, and its rows keep adopting them. */

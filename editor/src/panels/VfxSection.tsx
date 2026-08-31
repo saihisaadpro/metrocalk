@@ -14,18 +14,13 @@ import { useSelectedId, useSummary } from "../store/projection";
 import { usePlaying } from "../store/play";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Callout } from "../theme/fields";
 import { Icon } from "../theme/icons";
 import { Button, SelectField } from "../theme/primitives";
-import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { ChoiceCard, ChoiceGrid, DisclosureSection } from "../theme/workspace";
+import { color, fontSize, space } from "../theme/tokens";
 import type { EffectSpec, VfxProbe, VfxReply } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
-
-const sectionH3 = {
-  margin: `0 0 ${space.xs}px`,
-  font: font.ui,
-  fontSize: fontSize.body,
-  color: color.text.primary,
-} as const;
 
 const metaText = {
   fontSize: fontSize.meta,
@@ -147,41 +142,40 @@ export function VfxSection({ client }: { client: EditorClient }) {
   }
 
   return (
-    <section data-testid="vfx-section">
-      <h3 style={sectionH3}>Effects</h3>
-
+    // See `RolesSection` for why this is a `DisclosureSection`. Closed by default alongside
+    // Cinematics: the summary reports the layer count while it is shut, so nothing is hidden — the
+    // column simply stops being three open sections deep before anything has been selected.
+    <DisclosureSection
+      data-testid="vfx-section"
+      title="Effects"
+      icon={<Icon name="sparkle" size="md" />}
+      summary={fx.layers > 0 ? `${fx.layers} on this object · ${fx.particles} particles` : specs.length > 0 ? `${specs.length} to choose from` : undefined}
+      storageKey="gameplay.effects"
+      tone="card"
+      density="compact"
+      defaultOpen={false}
+      landmark={false}
+    >
+      <div style={{ display: "grid", gap: space.sm, minWidth: 0 }}>
       {playing && live && (
-        <div
+        <Callout
           data-testid="vfx-live"
-          style={{
-            display: "flex",
-            gap: space.md,
-            alignItems: "baseline",
-            padding: `${space.xs}px ${space.md}px`,
-            background: color.accent.subtle,
-            border: `1px solid ${color.accent.border}`,
-            borderRadius: radius.md,
-            marginBottom: space.sm,
-            fontSize: fontSize.meta,
-            color: color.text.secondary,
-          }}
+          tone="info"
+          icon={<Icon name="sparkle" size="sm" />}
+          title={`${live.total} particle${live.total === 1 ? "" : "s"}`}
         >
-          <span style={{ fontWeight: 700, color: color.accent.base }}>
-            {live.total} particle{live.total === 1 ? "" : "s"}
-          </span>
-          <span>
-            {live.total === 0
-              ? "nothing is running right now"
-              : `${live.additive} glowing${live.soft > 0 ? `, ${live.soft} hazy` : ""}${
-                  live.bursts > 0 ? ` · ${live.bursts} one-shot${live.bursts === 1 ? "" : "s"}` : ""
-                }`}
-          </span>
-        </div>
+          {live.total === 0
+            ? "nothing is running right now"
+            : `${live.additive} glowing${live.soft > 0 ? `, ${live.soft} hazy` : ""}${
+                live.bursts > 0 ? ` · ${live.bursts} one-shot${live.bursts === 1 ? "" : "s"}` : ""
+              }`}
+        </Callout>
       )}
 
-      {selected ? (
-        <div style={{ display: "grid", gap: space.xs }}>
-          <div style={{ fontSize: fontSize.meta, color: color.text.secondary }}>
+      {/* The subject line, and — with nothing selected — the one sentence that says what to do. */}
+      <div style={{ fontSize: fontSize.meta, color: color.text.secondary }} data-testid="vfx-empty">
+        {selected ? (
+          <>
             {summary?.name ?? selected}
             {fx.layers > 0 && (
               <span style={{ color: color.accent.base }}>
@@ -189,148 +183,123 @@ export function VfxSection({ client }: { client: EditorClient }) {
                 {fx.layers} effect{fx.layers === 1 ? "" : "s"} {"·"} {fx.particles} particles
               </span>
             )}
-          </div>
+          </>
+        ) : (
+          "Select an object, then give it an effect — it catches fire, sparks when hit, or pops when taken."
+        )}
+      </div>
 
-          <label style={{ ...metaText, display: "grid", gap: space.xxs }}>
-            Run the next effect
-            <SelectField
-              data-testid="vfx-trigger"
-              aria-label="When the next effect you add should run"
-              value={trigger}
-              disabled={busy || playing}
-              onChange={(e) => setTrigger(e.target.value)}
+      <label style={{ ...metaText, display: "grid", gap: space.xxs }}>
+        Run the next effect
+        <SelectField
+          data-testid="vfx-trigger"
+          aria-label="When the next effect you add should run"
+          value={trigger}
+          disabled={busy || playing || !selected}
+          onChange={(e) => setTrigger(e.target.value)}
+        >
+          {TRIGGERS.map((t) => (
+            <option key={t.value} value={t.value}>
+              {t.label}
+            </option>
+          ))}
+        </SelectField>
+      </label>
+
+      {specs.length > 0 && (
+      <ChoiceGrid label="Add an effect">
+        {specs.map((spec) => (
+          <ChoiceCard
+            key={spec.kind}
+            data-testid={`fx-${spec.kind}`}
+            icon={<Icon name={spec.kind} size="md" fallback="sparkle" />}
+            label={spec.label}
+            description={spec.blurb}
+            disabled={busy || playing || !selected}
+            disabledReason={
+              playing
+                ? "Stop Play first — effects are authored, not live-edited"
+                : !selected
+                  ? `Select an object first. ${spec.blurb}`
+                  : undefined
+            }
+            title={`${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it`}
+            onSelect={() =>
+              selected &&
+              void run(() => client.vfxAdd(selected, spec.kind, trigger), `Add ${spec.label}`)
+            }
+          />
+        ))}
+      </ChoiceGrid>
+      )}
+
+      {selected && fx.reads.length > 0 && (
+        <ul
+          data-testid="vfx-layers"
+          style={{
+            margin: 0,
+            padding: 0,
+            listStyle: "none",
+            display: "grid",
+            gap: space.xxs,
+            fontSize: fontSize.meta,
+            color: color.text.secondary,
+          }}
+        >
+          {fx.reads.map((line, i) => (
+            // eslint-disable-next-line react/no-array-index-key -- a layer stack IS its order
+            <li
+              key={`${line}-${i}`}
+              data-testid="vfx-layer-row"
+              style={{ display: "flex", justifyContent: "space-between", gap: space.xs }}
             >
-              {TRIGGERS.map((t) => (
-                <option key={t.value} value={t.value}>
-                  {t.label}
-                </option>
-              ))}
-            </SelectField>
-          </label>
-
-          <div
-            role="group"
-            aria-label="Add an effect"
-            style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: space.xs }}
-          >
-            {specs.map((spec) => (
+              <span>{line}</span>
               <Button
-                key={spec.kind}
-                data-testid={`fx-${spec.kind}`}
-                variant="secondary"
+                data-testid={`vfx-remove-${i}`}
+                variant="ghost"
                 compact
+                icon
                 disabled={busy || playing}
-                title={
-                  playing
-                    ? "Stop Play first — effects are authored, not live-edited"
-                    : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it`
-                }
+                // A row of six buttons all announced as "✕" tells a screen-reader user nothing
+                // about WHICH effect they are about to delete. The name carries the layer.
+                aria-label={`Remove effect: ${line}`}
+                title={`Remove: ${line}`}
                 onClick={() =>
-                  selected &&
-                  void run(() => client.vfxAdd(selected, spec.kind, trigger), `Add ${spec.label}`)
+                  selected && void run(() => client.vfxRemove(selected, i), "Remove effect")
                 }
               >
-                <Icon name={spec.kind} size="md" fallback="sparkle" /> {spec.label}
+                <Icon name="close" size="sm" />
               </Button>
-            ))}
-          </div>
+            </li>
+          ))}
+        </ul>
+      )}
 
-          {fx.reads.length > 0 && (
-            <ul
-              data-testid="vfx-layers"
-              style={{
-                margin: `${space.xs}px 0 0`,
-                padding: 0,
-                listStyle: "none",
-                display: "grid",
-                gap: space.xxs,
-                fontSize: fontSize.meta,
-                color: color.text.secondary,
-              }}
-            >
-              {fx.reads.map((line, i) => (
-                // eslint-disable-next-line react/no-array-index-key -- a layer stack IS its order
-                <li
-                  key={`${line}-${i}`}
-                  data-testid="vfx-layer-row"
-                  style={{ display: "flex", justifyContent: "space-between", gap: space.xs }}
-                >
-                  <span>{line}</span>
-                  <Button
-                    data-testid={`vfx-remove-${i}`}
-                    variant="ghost"
-                    compact
-                    disabled={busy || playing}
-                    // A row of six buttons all announced as "✕" tells a screen-reader user nothing
-                    // about WHICH effect they are about to delete. The name carries the layer.
-                    aria-label={`Remove effect: ${line}`}
-                    title={`Remove: ${line}`}
-                    onClick={() =>
-                      selected && void run(() => client.vfxRemove(selected, i), "Remove effect")
-                    }
-                  >
-                    <Icon name="close" size="sm" />
-                  </Button>
-                </li>
-              ))}
-            </ul>
-          )}
-
-          {/* ONE live region containing the list. N regions inserted already-populated are commonly
-              not announced at all, and several at once announce in an unpredictable order. */}
-          {fx.problems.length > 0 && (
-            <div role="status" style={{ display: "grid", gap: space.xxs }}>
-              {fx.problems.map((problem) => (
-            <div
-              key={problem}
-              data-testid="vfx-problem"
-              style={{
-                padding: `${space.xs}px ${space.md}px`,
-                background: color.warn.bg,
-                border: `1px solid ${color.warn.border}`,
-                borderRadius: radius.md,
-                fontSize: fontSize.meta,
-                color: color.warn.text,
-              }}
-            >
-              <Icon name="warning" size="sm" /> {problem}
-            </div>
-              ))}
-            </div>
-          )}
-
-          {fx.layers > 0 && (
-            <div data-testid="vfx-hint" style={metaText}>
-              Press Play to see it {"—"} effects run during Play and leave nothing behind on
-              Stop.
-            </div>
-          )}
+      {/* ONE live region containing the list. N regions inserted already-populated are commonly
+          not announced at all, and several at once announce in an unpredictable order. */}
+      {selected && fx.problems.length > 0 && (
+        <div role="status" style={{ display: "grid", gap: space.xs }}>
+          {fx.problems.map((problem) => (
+            <Callout key={problem} data-testid="vfx-problem" tone="warn">
+              {problem}
+            </Callout>
+          ))}
         </div>
-      ) : (
-        <div data-testid="vfx-empty" style={metaText}>
-          Select an object, then give it an effect {"—"} it catches fire, sparks when hit, or
-          pops when taken.
+      )}
+
+      {selected && fx.layers > 0 && (
+        <div data-testid="vfx-hint" style={metaText}>
+          Press Play to see it {"—"} effects run during Play and leave nothing behind on Stop.
         </div>
       )}
 
       {refusal && (
-        <div
-          data-testid="vfx-refusal"
-          role="status"
-          style={{
-            marginTop: space.sm,
-            padding: `${space.sm}px ${space.md}px`,
-            background: color.danger.bg,
-            border: `1px solid ${color.danger.border}`,
-            borderRadius: radius.md,
-            fontSize: fontSize.meta,
-            color: color.danger.text,
-          }}
-        >
+        <Callout data-testid="vfx-refusal" tone="danger" role="status">
           {refusal}
-        </div>
+        </Callout>
       )}
-    </section>
+      </div>
+    </DisclosureSection>
   );
 }
 

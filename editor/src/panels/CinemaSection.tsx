@@ -13,18 +13,13 @@ import { useSelectedId, useSummary } from "../store/projection";
 import { usePlaying } from "../store/play";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Callout } from "../theme/fields";
 import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
-import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { ChoiceCard, ChoiceGrid, DisclosureSection } from "../theme/workspace";
+import { color, fontSize, space } from "../theme/tokens";
 import type { CinemaReply, ShotSpec } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
-
-const sectionH3 = {
-  margin: `0 0 ${space.xs}px`,
-  font: font.ui,
-  fontSize: fontSize.body,
-  color: color.text.primary,
-} as const;
 
 const metaText = {
   fontSize: fontSize.meta,
@@ -133,31 +128,38 @@ export function CinemaSection({ client }: { client: EditorClient }) {
   }
 
   return (
-    <section data-testid="cinema-section">
-      <h3 style={sectionH3}>Cinematics</h3>
-
+    // See `RolesSection` for why this is a `DisclosureSection` and not an `<h3>` over a column of
+    // hand-rolled boxes. Closed by default: a cutscene is the second thing an author reaches for,
+    // and the summary keeps reporting the shot count while it is shut.
+    <DisclosureSection
+      data-testid="cinema-section"
+      title="Cinematics"
+      icon={<Icon name="clapper" size="md" />}
+      summary={cut.shots > 0 ? `${cut.shots} shot${cut.shots === 1 ? "" : "s"} · ${cut.seconds.toFixed(1)}s` : specs.length > 0 ? `${specs.length} shots to choose from` : undefined}
+      storageKey="gameplay.cinematics"
+      tone="card"
+      density="compact"
+      defaultOpen={false}
+      landmark={false}
+    >
+      <div style={{ display: "grid", gap: space.sm, minWidth: 0 }}>
       {playing && (
-        <div
+        <Callout
           data-testid="cinema-live"
-          style={{
-            padding: `${space.xs}px ${space.md}px`,
-            background: rolling ? color.accent.subtle : color.bg.inset,
-            border: `1px solid ${rolling ? color.accent.border : color.border.subtle}`,
-            borderRadius: radius.md,
-            marginBottom: space.sm,
-            fontSize: fontSize.meta,
-            color: rolling ? color.accent.base : color.text.muted,
-          }}
+          tone={rolling ? "info" : "neutral"}
+          icon={<Icon name="camera" size="sm" />}
         >
           {rolling
             ? "A cutscene has the camera right now"
             : "The camera is free — no cutscene is running"}
-        </div>
+        </Callout>
       )}
 
-      {selected ? (
-        <div style={{ display: "grid", gap: space.xs }}>
-          <div style={{ fontSize: fontSize.meta, color: color.text.secondary }}>
+      {/* The subject line, and — with nothing selected — the one sentence that says what to do. The
+          shot cards below stay drawn and disabled, so the vocabulary is visible before the guess. */}
+      <div style={{ fontSize: fontSize.meta, color: color.text.secondary }} data-testid="cinema-empty">
+        {selected ? (
+          <>
             {summary?.name ?? selected}
             {cut.shots > 0 && (
               <span style={{ color: color.accent.base }}>
@@ -165,149 +167,133 @@ export function CinemaSection({ client }: { client: EditorClient }) {
                 · {cut.shots} shot{cut.shots === 1 ? "" : "s"} · {cut.seconds.toFixed(1)}s
               </span>
             )}
-          </div>
+          </>
+        ) : (
+          "Select an object, then pick a shot — the camera frames it for you."
+        )}
+      </div>
 
-          <div
-            role="group"
-            aria-label="Cinematic pacing"
-            style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: space.xs }}
+      <div
+        role="group"
+        aria-label="Cinematic pacing"
+        style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: space.xs }}
+      >
+        {MOODS.map((mood) => (
+          <Button
+            key={mood.value}
+            data-testid={`cinema-mood-${mood.value}`}
+            variant={cut.mood === mood.value ? "toggle" : "secondary"}
+            active={cut.mood === mood.value}
+            compact
+            disabled={busy || playing || !selected}
+            aria-pressed={cut.mood === mood.value}
+            title={
+              playing
+                ? "Stop Play first — pacing is authored, not live-edited"
+                : !selected
+                  ? `Select an object first. ${mood.title}`
+                  : mood.title
+            }
+            onClick={() => selected && void run(
+              () => client.cinemaSetMood(selected, mood.value),
+              `${mood.label} pacing`,
+            )}
           >
-            {MOODS.map((mood) => (
-              <Button
-                key={mood.value}
-                data-testid={`cinema-mood-${mood.value}`}
-                variant={cut.mood === mood.value ? "primary" : "secondary"}
-                compact
-                disabled={busy || playing}
-                aria-pressed={cut.mood === mood.value}
-                title={playing ? "Stop Play first — pacing is authored, not live-edited" : mood.title}
-                onClick={() => selected && void run(
-                  () => client.cinemaSetMood(selected, mood.value),
-                  `${mood.label} pacing`,
-                )}
-              >
-                {mood.label}
-              </Button>
-            ))}
-          </div>
+            {mood.label}
+          </Button>
+        ))}
+      </div>
 
-          <div
-            role="group"
-            aria-label="Add a shot"
-            style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: space.xs }}
-          >
-            {specs.map((spec) => (
+      {specs.length > 0 && (
+      <ChoiceGrid label="Add a shot">
+        {specs.map((spec) => (
+          <ChoiceCard
+            key={spec.kind}
+            data-testid={`shot-${spec.kind}`}
+            icon={<Icon name={spec.kind} size="md" fallback="camera" />}
+            label={spec.label}
+            description={spec.blurb}
+            disabled={busy || playing || !selected}
+            disabledReason={
+              playing
+                ? "Stop Play first — shots are authored, not live-edited"
+                : !selected
+                  ? `Select an object first. ${spec.blurb}`
+                  : undefined
+            }
+            title={`${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it`}
+            onSelect={() => selected && void run(() => client.cinemaAddShot(selected, spec.kind), spec.label)}
+          />
+        ))}
+      </ChoiceGrid>
+      )}
+
+      {selected && cut.reads.length > 0 && (
+        <ol
+          data-testid="cinema-shots"
+          style={{
+            margin: 0,
+            padding: `0 0 0 ${space.lg}px`,
+            display: "grid",
+            gap: space.xxs,
+            fontSize: fontSize.meta,
+            color: color.text.secondary,
+          }}
+        >
+          {cut.reads.map((line, i) => (
+            // eslint-disable-next-line react/no-array-index-key -- a shot list IS its order
+            <li
+              key={`${line}-${i}`}
+              data-testid="cinema-shot-row"
+              style={{ display: "flex", justifyContent: "space-between", gap: space.xs }}
+            >
+              <span>{line}</span>
               <Button
-                key={spec.kind}
-                data-testid={`shot-${spec.kind}`}
-                variant="secondary"
+                data-testid={`cinema-remove-${i}`}
+                variant="ghost"
                 compact
+                icon
                 disabled={busy || playing}
-                title={
-                  playing
-                    ? "Stop Play first — shots are authored, not live-edited"
-                    : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it`
+                aria-label={`Remove shot ${i + 1}: ${line}`}
+                title={`Remove: ${line}`}
+                onClick={() =>
+                  selected &&
+                  void run(() => client.cinemaRemoveShot(selected, i), "Remove shot")
                 }
-                onClick={() => selected && void run(() => client.cinemaAddShot(selected, spec.kind), spec.label)}
               >
-                <Icon name={spec.kind} size="md" fallback="camera" /> {spec.label}
+                <Icon name="close" size="sm" />
               </Button>
-            ))}
-          </div>
+            </li>
+          ))}
+        </ol>
+      )}
 
-          {cut.reads.length > 0 && (
-            <ol
-              data-testid="cinema-shots"
-              style={{
-                margin: `${space.xs}px 0 0`,
-                padding: `0 0 0 ${space.lg}px`,
-                display: "grid",
-                gap: space.xxs,
-                fontSize: fontSize.meta,
-                color: color.text.secondary,
-              }}
-            >
-              {cut.reads.map((line, i) => (
-                // eslint-disable-next-line react/no-array-index-key -- a shot list IS its order
-                <li
-                  key={`${line}-${i}`}
-                  data-testid="cinema-shot-row"
-                  style={{ display: "flex", justifyContent: "space-between", gap: space.xs }}
-                >
-                  <span>{line}</span>
-                  <Button
-                    data-testid={`cinema-remove-${i}`}
-                    variant="ghost"
-                    compact
-                    disabled={busy || playing}
-                    aria-label={`Remove shot ${i + 1}: ${line}`}
-                    title={`Remove: ${line}`}
-                    onClick={() =>
-                      selected &&
-                      void run(() => client.cinemaRemoveShot(selected, i), "Remove shot")
-                    }
-                  >
-                    <Icon name="close" size="sm" />
-                  </Button>
-                </li>
-              ))}
-            </ol>
-          )}
-
-          {cut.problems.length > 0 && (
-            <div role="status" style={{ display: "grid", gap: space.xxs }}>
-              {cut.problems.map((problem, i) => (
-            <div
-              // Four identical shots emit three byte-identical jump-cut warnings, so the string alone
-              // is not a key.
-              // eslint-disable-next-line react/no-array-index-key -- see above
-              key={`${problem}-${i}`}
-              data-testid="cinema-problem"
-              style={{
-                padding: `${space.xs}px ${space.md}px`,
-                background: color.warn.bg,
-                border: `1px solid ${color.warn.border}`,
-                borderRadius: radius.md,
-                fontSize: fontSize.meta,
-                color: color.warn.text,
-              }}
-            >
-              <Icon name="warning" size="sm" /> {problem}
-            </div>
-              ))}
-            </div>
-          )}
-
-          {cut.shots > 0 && (
-            <div data-testid="cinema-hint" style={metaText}>
-              Press Play to watch it — the camera takes over, then hands back.
-            </div>
-          )}
+      {selected && cut.problems.length > 0 && (
+        <div role="status" style={{ display: "grid", gap: space.xs }}>
+          {cut.problems.map((problem, i) => (
+            // Four identical shots emit three byte-identical jump-cut warnings, so the string alone
+            // is not a key.
+            // eslint-disable-next-line react/no-array-index-key -- see above
+            <Callout key={`${problem}-${i}`} data-testid="cinema-problem" tone="warn">
+              {problem}
+            </Callout>
+          ))}
         </div>
-      ) : (
-        <div data-testid="cinema-empty" style={metaText}>
-          Select an object, then pick a shot — the camera frames it for you.
+      )}
+
+      {selected && cut.shots > 0 && (
+        <div data-testid="cinema-hint" style={metaText}>
+          Press Play to watch it — the camera takes over, then hands back.
         </div>
       )}
 
       {refusal && (
-        <div
-          data-testid="cinema-refusal"
-          role="status"
-          style={{
-            marginTop: space.sm,
-            padding: `${space.sm}px ${space.md}px`,
-            background: color.danger.bg,
-            border: `1px solid ${color.danger.border}`,
-            borderRadius: radius.md,
-            fontSize: fontSize.meta,
-            color: color.danger.text,
-          }}
-        >
+        <Callout data-testid="cinema-refusal" tone="danger" role="status">
           {refusal}
-        </div>
+        </Callout>
       )}
-    </section>
+      </div>
+    </DisclosureSection>
   );
 }
 

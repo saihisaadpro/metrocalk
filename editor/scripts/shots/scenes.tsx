@@ -33,6 +33,7 @@ import { Reveal } from "../../src/panels/Reveal";
 import { RigPanel, type RigDocument } from "../../src/panels/RigPanel";
 import RIG_MIXAMO from "../../src/panels/__fixtures__/rig-characterization.json";
 import RIG_BLOCKED from "../../src/panels/__fixtures__/rig-not-retargetable.json";
+import { MatchPanel } from "../../src/panels/MatchPanel";
 import { PhysicsPanel } from "../../src/panels/PhysicsPanel";
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
@@ -44,7 +45,12 @@ import type {
   AnimationWorkspaceInfo,
   CadReport,
   CadReportPart,
+  EffectSpec,
+  MatchValidation,
   RevealResponse,
+  RoleRow,
+  RoleSpec,
+  ShotSpec,
   StateMachine,
   TimelineTuple,
 } from "../../src/transport/protocol";
@@ -1016,6 +1022,7 @@ export const SCENES: Scene[] = [
   ...inspectorScenes(),
   ...assetScenes(),
   ...modelScenes(),
+  ...gameplayScenes(),
   ...shellScenes(),
 ];
 
@@ -2133,5 +2140,194 @@ function modelScenes(): Scene[] {
       },
       { width: 760, height: 560 },
     ),
+  ];
+}
+
+// ── the gameplay workspace ────────────────────────────────────────────────────────────────────────
+
+/** THE CATALOGS THE PACKAGED EDITOR ACTUALLY SERVES, not the ones the dev mock does. `MockClient`
+ *  answers `roleCatalog` with 4 of the engine's 10 roles and `cinemaCatalog`/`vfxCatalog` with `[]`,
+ *  because cinematics and effects are `.exe`-only commands — so a capture taken against the mock
+ *  would photograph a Gameplay column with two empty sections and call it the panel. That is the C6
+ *  failure (green against the mock, different against `/core`) reached through a screenshot.
+ *
+ *  These rows are copied from `editor-shell/src/role_intent.rs`, `cinema_intent.rs` and
+ *  `vfx_intent.rs`. They are a SECOND statement of those catalogs and will drift; what they are for
+ *  is proportion — how a ten-card grid lays out in a 300px dock — and a drifted label still answers
+ *  that. The behaviour of the cards is tested against the real client in `RolesSection.test.tsx`. */
+const GAMEPLAY_ROLES: RoleSpec[] = [
+  { kind: "collectible", label: "Collectible", blurb: "Spins; vanishes and scores when something touches it", adds: "spin animation · touch trigger · pickup rule · +1 on the Score counter" },
+  { kind: "solid", label: "Solid obstacle", blurb: "An immovable body other things collide with", adds: "fixed physics body · auto-fit collider" },
+  { kind: "prop", label: "Physics prop", blurb: "Falls, rolls and collides under gravity", adds: "dynamic physics body · auto-fit collider" },
+  { kind: "spinner", label: "Spinner", blurb: "Turns forever — ambient motion", adds: "looping spin animation" },
+  { kind: "companion", label: "Companion", blurb: "Follows your props, patrols your waypoints, fights your enemies", adds: "dynamic physics body · auto-fit collider · a live brain (follow / patrol / attack)" },
+  { kind: "enemy", label: "Enemy", blurb: "Companions attack it; it falls when struck", adds: "dynamic physics body · auto-fit collider · the defeat rule · +1 Score when beaten" },
+  { kind: "waypoint", label: "Waypoint", blurb: "A patrol stop — companions with nothing to follow walk the chain in order", adds: "a numbered patrol marker (no physics)" },
+  { kind: "vanishing", label: "Vanishing", blurb: "Disappears a few seconds into the run — a crumbling platform, a fuse, a timed gate", adds: "a countdown · the vanish rule" },
+  { kind: "hazard", label: "Hazard", blurb: "Hurts whoever walks into it — spikes, lava, a falling rock", adds: "the hurt rule — it damages the TOUCHER, not itself" },
+  { kind: "player", label: "Player", blurb: "YOU, during Play — drive it with the arrow keys or WASD", adds: "dynamic physics body · auto-fit collider · live keyboard control while playing" },
+];
+
+const GAMEPLAY_SHOTS: ShotSpec[] = [
+  { kind: "establish", label: "Establishing", blurb: "Show where we are before we look at anything closely", adds: "a wide, slowly pulling-out shot from the front" },
+  { kind: "hero", label: "Hero shot", blurb: "The workhorse — three-quarters on, pushing in", adds: "a full-body three-quarter shot that creeps closer" },
+  { kind: "closeup", label: "Close-up", blurb: "Tight and still — for the moment that matters", adds: "a close, locked-off shot in profile" },
+  { kind: "orbit", label: "Show it off", blurb: "Circle the object so every side reads", adds: "a medium shot orbiting a quarter turn" },
+  { kind: "reveal", label: "Crane reveal", blurb: "Lift away to show the world around it", adds: "a full shot craning upward" },
+  { kind: "looming", label: "Looming", blurb: "From below, so the subject towers", adds: "a low-angle medium shot pushing in" },
+];
+
+const GAMEPLAY_EFFECTS: EffectSpec[] = [
+  { kind: "fire", label: "Fire", blurb: "It burns — rising, flickering, warm", adds: "a rising flame that cools from white-hot to ember red", burst: false },
+  { kind: "smoke", label: "Smoke", blurb: "Dark, slow, expanding — pair it with fire", adds: "a slow dark plume that spreads as it climbs", burst: false },
+  { kind: "sparkle", label: "Sparkle", blurb: "Magic, treasure, something worth walking toward", adds: "bright motes orbiting the object", burst: false },
+  { kind: "explosion", label: "Explosion", blurb: "One shot — a violent outward burst", adds: "a one-shot blast of hot debris that falls away", burst: true },
+  { kind: "sparks", label: "Sparks", blurb: "One shot — metal on metal, a hit landing", adds: "a one-shot spray of fast sparks that arc and drop", burst: true },
+  { kind: "pickup", label: "Pick-up pop", blurb: "One shot — the little flourish a collectible deserves", adds: "a one-shot ring of bright motes rising and fading", burst: true },
+];
+
+const NO_MATCH: MatchValidation = {
+  ok: false,
+  is_match_scene: false,
+  diagnostics: [],
+  cook_digest: null,
+  actor_count: 0,
+  wave_count: 0,
+  lane_length_m: 0,
+};
+
+/** The three sections read four endpoints between them and mutate through six more. Only the reads
+ *  matter to a capture, so the writes are absent and would throw — which is the point: a scene that
+ *  silently mutated would be photographing a state no user gesture produced. */
+const gameplayClient = (roster: RoleRow[] = []) =>
+  ({
+    matchValidate: () => Promise.resolve(NO_MATCH),
+    roleCatalog: () => Promise.resolve(GAMEPLAY_ROLES),
+    roleStatus: () =>
+      Promise.resolve({ roster, score: 0, scoreEntity: null, remaining: 0, companions: [], won: false, health: null, blocked: null }),
+    cinemaCatalog: () => Promise.resolve(GAMEPLAY_SHOTS),
+    cinemaList: () =>
+      Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: null }),
+    cameraProbe: () => Promise.resolve({ eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 45, cinematic: false, distance: 0 }),
+    vfxCatalog: () => Promise.resolve(GAMEPLAY_EFFECTS),
+    vfxList: () => Promise.resolve({ entity: null, layers: 0, particles: 0, reads: [], problems: [], message: "", reason: null }),
+    vfxProbe: () => Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 }),
+  }) as unknown as EditorClient;
+
+/** `function`, not `const` — and the whole bundle refuses to load otherwise. `gameplayScenes()` is
+ *  hoisted above `SCENES`, but a `setup: selectCrystal` reference is read while the array is being
+ *  built, so a `const` declared below it is still in its temporal dead zone. The driver reads its
+ *  registry off `window.__MTK_SHOTS__` in the built bundle, so a module that throws on load reports
+ *  ZERO scenes — which is exactly what this cost, once, before it was written this way. */
+function selectCrystal() {
+  const s = projectionStore.getState();
+  s.bulkLoad([
+    { id: "crystal", name: "Crystal", parentId: null, components: { Transform: {} } },
+    { id: "floor", name: "Floor Plate", parentId: null, components: { Transform: {} } },
+  ] as never);
+  s.select("crystal");
+}
+
+function selectNothing() {
+  const s = projectionStore.getState();
+  s.bulkLoad([{ id: "crystal", name: "Crystal", parentId: null, components: { Transform: {} } }] as never);
+  s.select(null);
+}
+
+function gameplayScenes(): Scene[] {
+  return [
+    {
+      id: "gameplay-nothing-selected",
+      looking_for:
+        "THE GAMEPLAY COLUMN BEFORE ANYTHING IS SELECTED, at the 300px the left dock actually gives " +
+        "it. What was here was three bare `<h3>`s, three paragraphs each saying 'Select an object, " +
+        "then …' with a different noun, and — marooned in the middle of that populated column — a " +
+        "full-size empty state with a 40px icon, a five-line centred paragraph, a button floating " +
+        "BELOW it and a second centred paragraph below that. Nine blocks of prose and one control. " +
+        "What a reader is checking now is that it is three NAMED sections with state in their " +
+        "summaries, only the first of them open, and that the one action in the panel sits inside " +
+        "the block that explains it rather than under it",
+      expect: {
+        present: [
+          ["[data-testid='roles-section']", 1],
+          ["[data-testid='cinema-section']", 1],
+          ["[data-testid='vfx-section']", 1],
+          // Ten cards, drawn and disabled rather than absent: the vocabulary is visible before the
+          // guess that clicking an object would reveal something.
+          ["[data-testid='roles-section'] .mtk-choice", 10],
+          ["[data-testid='role-collectible'][disabled]", 1],
+          // The action is INSIDE the empty state now, not in a row under it.
+          [".mtk-empty-panel__actions .mtk-btn--primary", 1],
+        ],
+        // Two of the three closed by default, so the column is calm at rest. `[data-state]` is the
+        // disclosure's own stable token — asserting on a class list would test the styling.
+        absent: ["[data-icon-missing]", "[data-testid='cinema-section'][data-state='open']", "[data-testid='vfx-section'][data-state='open']"],
+        text_present: ["Roles", "Cinematics", "Effects", "Select an object", "Create a starter match"],
+        text_absent: ["undefined", "null", "NaN"],
+        // A CLOSED SECTION STILL REPORTS ITS STATE, AND THIS IS A MEASUREMENT BECAUSE `text_present`
+        // CANNOT SAY SO. `.mtk-disclosure__summary` was `display: none` under a `max-width: 760px`
+        // WINDOW query — a rule about the window deciding what a 340px dock's header may say — and a
+        // `text_present: ["6 shots to choose from"]` claim would have been green over three headers
+        // showing a caret and a word. `min_width` on all three is the claim that cannot be.
+        min_width: [[".mtk-disclosure__summary", 60]],
+        // EVERY GEOMETRIC CLAIM HERE IS SCOPED TO THE OPEN SECTION, and the two that were not is how
+        // this scene first went red: a closed `DisclosureSection` keeps its content mounted so draft
+        // state survives, and collapses it with `grid-template-rows: 0fr` + `overflow: hidden`. Its
+        // cards are therefore 242x65 boxes with 0 pixels on screen — correctly so (they are `hidden`
+        // and `inert` too), and `unclipped` reported all twelve of them.
+        min_height: [["[data-testid='roles-section'] .mtk-choice", 44], ["[data-testid='roles-section'] .mtk-choice__description", 12]],
+        unclipped: ["[data-testid='roles-section'] .mtk-choice", "[data-testid='roles-section']", ".mtk-empty-panel__actions"],
+      },
+      width: 300,
+      setup: selectNothing,
+      render: () => <MatchPanel client={gameplayClient()} />,
+    },
+    {
+      id: "gameplay-object-selected",
+      looking_for:
+        "the same column with an object selected, which is when the ten role cards become live. The " +
+        "grid is `auto-fit` from a minimum card width rather than a hardcoded `repeat(2, 1fr)`: at " +
+        "300px that is ONE column at a readable width instead of two at 113px, where 'Solid " +
+        "obstacle' did not fit. Every card carries the sentence that says what it does — it used to " +
+        "exist only as a `title`, which is invisible to touch, to the keyboard and to anyone reading " +
+        "the panel rather than hunting in it",
+      expect: {
+        present: [
+          ["[data-testid='roles-section'] .mtk-choice", 10],
+          ["[data-testid='role-collectible']:not([disabled])", 1],
+          ["[data-testid='roles-section'] .mtk-choice__description", 10],
+        ],
+        absent: ["[data-icon-missing]", "[data-testid='role-collectible'][disabled]"],
+        text_present: ["Crystal", "Collectible", "Spins; vanishes and scores"],
+        text_absent: ["undefined", "null", "NaN"],
+        min_height: [["[data-testid='roles-section'] .mtk-choice", 44]],
+        unclipped: ["[data-testid='roles-section'] .mtk-choice", "[data-testid='roles-section'] .mtk-choice__label"],
+      },
+      width: 300,
+      setup: selectCrystal,
+      render: () => <MatchPanel client={gameplayClient()} />,
+    },
+    {
+      id: "gameplay-wide",
+      looking_for:
+        "the SAME grid given room. The column count is the browser's decision from a minimum card " +
+        "width, so a wider surface gains columns instead of stretching the same two cards into " +
+        "billboards — the failure `asset-library-wide` is written against, one panel over, and the " +
+        "one a hardcoded `repeat(2, 1fr)` cannot avoid at either end",
+      expect: {
+        present: [["[data-testid='roles-section'] .mtk-choice", 10]],
+        absent: ["[data-icon-missing]"],
+        text_present: ["Collectible", "Waypoint"],
+        text_absent: ["undefined", "null", "NaN"],
+        unclipped: ["[data-testid='roles-section'] .mtk-choice"],
+        // Three cards that fitted one column at 300px share a row here. Named pairs rather than a
+        // column count, because the count is the browser's and asserting it would pin the arithmetic
+        // rather than the rule.
+        same_line: [["[data-testid='role-collectible']", "[data-testid='role-solid']"]],
+      },
+      viewport: { width: 760, height: 980 },
+      setup: selectCrystal,
+      render: () => <MatchPanel client={gameplayClient()} />,
+    },
   ];
 }

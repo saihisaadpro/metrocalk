@@ -10,18 +10,13 @@ import { projectionStore, useSelectedId, useSummary } from "../store/projection"
 import { usePlaying } from "../store/play";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
+import { Callout } from "../theme/fields";
 import { Icon } from "../theme/icons";
 import { Button } from "../theme/primitives";
-import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { ChoiceCard, ChoiceGrid, DisclosureSection } from "../theme/workspace";
+import { color, fontSize, space } from "../theme/tokens";
 import type { RoleReply, RoleSpec, RoleStatusInfo } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
-
-const sectionH3 = {
-  margin: `0 0 ${space.xs}px`,
-  font: font.ui,
-  fontSize: fontSize.body,
-  color: color.text.primary,
-} as const;
 
 const metaText = {
   fontSize: fontSize.meta,
@@ -93,56 +88,50 @@ export function RolesSection({ client }: { client: EditorClient }) {
   }
 
   const currentRole = selected ? status.roster.find((r) => r.entity === selected)?.role ?? null : null;
+  const assigned = status.roster.length;
 
   return (
-    <section data-testid="roles-section">
-      <h3 style={sectionH3}>Roles</h3>
-
+    // ONE SECTION, NOT AN `<h3>` AND A COLUMN OF DIVS. The three Gameplay sections each drew their own
+    // heading, their own accent box, their own warning box and their own refusal box — four private
+    // opinions per section, twelve across the panel, all of them shapes the design system already
+    // owns. What that cost was legible in a capture: with nothing selected the whole workspace was
+    // three headings, three paragraphs each saying "Select an object, then …", and one button.
+    //
+    // A disclosure carries the state in its summary, so a CLOSED section still reports what it holds —
+    // which is what makes closing two of the three the calm default rather than hiding the panel.
+    <DisclosureSection
+      data-testid="roles-section"
+      title="Roles"
+      icon={<Icon name="gameplay" size="md" />}
+      summary={assigned > 0 ? `${assigned} assigned` : specs.length > 0 ? `${specs.length} to choose from` : undefined}
+      storageKey="gameplay.roles"
+      tone="card"
+      density="compact"
+      landmark={false}
+    >
+      <div style={{ display: "grid", gap: space.sm, minWidth: 0 }}>
       {playing && (
-        <div
+        <Callout
           data-testid="role-score"
-          style={{
-            display: "flex",
-            gap: space.md,
-            alignItems: "baseline",
-            padding: `${space.sm}px ${space.md}px`,
-            background: color.accent.subtle,
-            border: `1px solid ${color.accent.border}`,
-            borderRadius: radius.md,
-            marginBottom: space.sm,
-          }}
+          tone="info"
+          icon={<Icon name="star" size="sm" />}
+          title={String(status.score)}
         >
-          <span style={{ fontSize: fontSize.title, fontWeight: 700, color: color.accent.base }}>
-            <Icon name="star" size="sm" /> {status.score}
-          </span>
-          <span style={metaText}>
-            {/* "all collected!" is only true if there was ever anything to collect. A scene with no
-                collectibles at all was congratulating the player for doing nothing — seen in a live
-                capture of a cutscene scene, which has a statue and no coins. */}
-            {status.remaining > 0
-              ? `${status.remaining} collectible${status.remaining === 1 ? "" : "s"} left`
-              : status.roster.some((r) => r.role === "collectible")
-                ? "all collected!"
-                : "nothing to collect in this scene yet"}
-          </span>
-        </div>
+          {/* "all collected!" is only true if there was ever anything to collect. A scene with no
+              collectibles at all was congratulating the player for doing nothing — seen in a live
+              capture of a cutscene scene, which has a statue and no coins. */}
+          {status.remaining > 0
+            ? `${status.remaining} collectible${status.remaining === 1 ? "" : "s"} left`
+            : status.roster.some((r) => r.role === "collectible")
+              ? "all collected!"
+              : "nothing to collect in this scene yet"}
+        </Callout>
       )}
 
       {playing && status.won && (
-        <div
-          data-testid="role-victory"
-          style={{
-            padding: `${space.sm}px ${space.md}px`,
-            background: color.accent.subtle,
-            border: `1px solid ${color.accent.border}`,
-            borderRadius: radius.md,
-            marginBottom: space.sm,
-            fontWeight: 700,
-            color: color.accent.base,
-          }}
-        >
-          <Icon name="trophy" size="md" /> You won! Every enemy beaten, every crystal collected · Stop to keep building
-        </div>
+        <Callout data-testid="role-victory" tone="success" icon={<Icon name="trophy" size="sm" />}>
+          You won! Every enemy beaten, every crystal collected · Stop to keep building
+        </Callout>
       )}
 
       {playing && status.health != null && (
@@ -152,8 +141,7 @@ export function RolesSection({ client }: { client: EditorClient }) {
             display: "flex",
             gap: space.sm,
             alignItems: "baseline",
-            padding: `${space.xs}px ${space.md}px`,
-            marginBottom: space.sm,
+            padding: `0 ${space.xs}px`,
             fontSize: fontSize.meta,
             color: color.text.secondary,
           }}
@@ -176,25 +164,13 @@ export function RolesSection({ client }: { client: EditorClient }) {
       )}
 
       {playing && status.blocked && (
-        <div
-          data-testid="roles-blocked"
-          role="status"
-          style={{
-            padding: `${space.sm}px ${space.md}px`,
-            background: color.warn.bg,
-            border: `1px solid ${color.warn.border}`,
-            borderRadius: radius.md,
-            marginBottom: space.sm,
-            fontSize: fontSize.meta,
-            color: color.warn.text,
-          }}
-        >
-          <Icon name="blocked" size="sm" /> {status.blocked.name || "Something"} didn&apos;t respond — {status.blocked.why}
-        </div>
+        <Callout data-testid="roles-blocked" tone="warn" role="status">
+          {status.blocked.name || "Something"} didn&apos;t respond — {status.blocked.why}
+        </Callout>
       )}
 
       {playing && status.companions.length > 0 && (
-        <div data-testid="companion-status" style={{ display: "grid", gap: 2, marginBottom: space.sm }}>
+        <div data-testid="companion-status" style={{ display: "grid", gap: 2 }}>
           {status.companions.map((c) => (
             <div key={c.entity} style={metaText}>
               <Icon name="heart" size="sm" /> {c.name} — {c.doing || "waking up"}
@@ -203,55 +179,62 @@ export function RolesSection({ client }: { client: EditorClient }) {
         </div>
       )}
 
-      {selected ? (
-        <div style={{ display: "grid", gap: space.xs }}>
-          <div style={{ fontSize: fontSize.meta, color: color.text.secondary }}>
+      {/* THE CARDS ARE ALWAYS DRAWN, AND WITH NOTHING SELECTED THEY ARE DISABLED RATHER THAN ABSENT.
+          What was here instead was one sentence — "Select an object, then give it a role" — and the
+          ten roles the engine offers were invisible until you had already guessed that clicking an
+          object would reveal something. A disabled card says the same sentence AND shows the
+          vocabulary, which is the difference between a prompt and a menu. */}
+      <div style={{ fontSize: fontSize.meta, color: color.text.secondary }} data-testid="roles-hint">
+        {selected ? (
+          <>
             {summary?.name ?? selected}
-            {currentRole && (
-              <span style={{ color: color.accent.base }}> · {currentRole}</span>
-            )}
-          </div>
-          <div role="group" aria-label="Assign a role" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: space.xs }}>
-            {specs.map((spec) => (
-              <Button
-                key={spec.kind}
-                data-testid={`role-${spec.kind}`}
-                variant={currentRole === spec.kind ? "toggle" : "secondary"}
-                active={currentRole === spec.kind}
-                compact
-                disabled={busy || playing}
-                title={
-                  playing
-                    ? "Stop Play first — roles are authored, not live-edited"
-                    : `${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it all`
-                }
-                onClick={() => selected && void run(() => client.roleAssign(selected, spec.kind), `Make it a ${spec.label}`)}
-              >
-                <Icon name={spec.kind} size="md" fallback="shape" /> {spec.label}
-              </Button>
-            ))}
-          </div>
-          {currentRole && (
-            <Button
-              data-testid="role-clear"
-              variant="ghost"
-              compact
-              disabled={busy || playing}
-              title={playing ? "Stop Play first" : "Remove the role and what it added (mesh and transform stay)"}
-              onClick={() => selected && void run(() => client.roleClear(selected), "Clear role")}
-            >
-              Clear role
-            </Button>
-          )}
-        </div>
-      ) : (
-        <div data-testid="roles-hint" style={metaText}>
-          Select an object, then give it a role — it becomes part of the game in one click.
-        </div>
+            {currentRole && <span style={{ color: color.accent.base }}> · {currentRole}</span>}
+          </>
+        ) : (
+          "Select an object, then give it a role — it becomes part of the game in one click."
+        )}
+      </div>
+
+      {specs.length > 0 && (
+      <ChoiceGrid label="Assign a role">
+        {specs.map((spec) => (
+          <ChoiceCard
+            key={spec.kind}
+            data-testid={`role-${spec.kind}`}
+            icon={<Icon name={spec.kind} size="md" fallback="shape" />}
+            label={spec.label}
+            description={spec.blurb}
+            selected={currentRole === spec.kind}
+            disabled={busy || playing || !selected}
+            disabledReason={
+              playing
+                ? "Stop Play first — roles are authored, not live-edited"
+                : !selected
+                  ? `Select an object first. ${spec.blurb}`
+                  : undefined
+            }
+            title={`${spec.blurb}. Adds: ${spec.adds} — one Ctrl-Z removes it all`}
+            onSelect={() => selected && void run(() => client.roleAssign(selected, spec.kind), `Make it a ${spec.label}`)}
+          />
+        ))}
+      </ChoiceGrid>
+      )}
+
+      {selected && currentRole && (
+        <Button
+          data-testid="role-clear"
+          variant="ghost"
+          compact
+          disabled={busy || playing}
+          title={playing ? "Stop Play first" : "Remove the role and what it added (mesh and transform stay)"}
+          onClick={() => selected && void run(() => client.roleClear(selected), "Clear role")}
+        >
+          Clear role
+        </Button>
       )}
 
       {status.roster.length > 0 && (
-        <div data-testid="roles-roster" style={{ marginTop: space.sm, display: "grid", gap: 2 }}>
+        <div data-testid="roles-roster" style={{ display: "grid", gap: 2 }}>
           {status.roster.map((row) => (
             <Button
               key={row.entity}
@@ -271,23 +254,12 @@ export function RolesSection({ client }: { client: EditorClient }) {
       )}
 
       {refusal && (
-        <div
-          data-testid="role-refusal"
-          role="status"
-          style={{
-            marginTop: space.sm,
-            padding: `${space.sm}px ${space.md}px`,
-            background: color.danger.bg,
-            border: `1px solid ${color.danger.border}`,
-            borderRadius: radius.md,
-            fontSize: fontSize.meta,
-            color: color.danger.text,
-          }}
-        >
+        <Callout data-testid="role-refusal" tone="danger" role="status">
           {refusal}
-        </div>
+        </Callout>
       )}
-    </section>
+      </div>
+    </DisclosureSection>
   );
 }
 

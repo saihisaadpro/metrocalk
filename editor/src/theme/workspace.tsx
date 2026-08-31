@@ -469,6 +469,96 @@ export function PopupMenuGroup({ label, children }: { label: ReactNode; children
   );
 }
 
+export interface ChoiceGridProps extends Omit<HTMLAttributes<HTMLDivElement>, "children"> {
+  children: ReactNode;
+  /** Names the group for assistive technology — a grid of unlabelled cards says nothing. */
+  label: string;
+  /** Narrowest a card may get before the grid drops a column. Defaults to the 168px in the stylesheet. */
+  minColumn?: number;
+}
+
+/**
+ * A GRID OF THINGS YOU CAN APPLY, and the reason it is a shared primitive rather than three private
+ * ones. Roles, cinematic shots and effects are the same gesture — pick one card, one undoable commit
+ * happens to the selected object — and all three had built it by hand as
+ * `gridTemplateColumns: "repeat(2, 1fr)"` (or 3) over `Button variant="secondary" compact`, with the
+ * one sentence that says what the card DOES hidden in a `title` attribute.
+ *
+ * Two things were wrong with that and neither is cosmetic. A fixed column count is not responsive in
+ * either direction: at the 234px content box a 300px dock actually gives a section, two columns are
+ * 113px each and "Solid obstacle" does not fit one, and on a wide dock the same two columns stretch
+ * the cards into billboards — the failure `asset-library-wide` is written against, one panel over.
+ * And a description that exists only as a tooltip is not information scent: it is invisible to
+ * touch, to keyboard, and to anyone reading the panel rather than hunting in it, which is exactly
+ * the discoverability the constitution asks these surfaces for.
+ *
+ * So: `auto-fit` from a minimum card width (a wider surface gains columns, it never stretches two),
+ * and the description is ON the card.
+ */
+export function ChoiceGrid({ children, label, minColumn, className, style, ...rest }: ChoiceGridProps) {
+  return (
+    <div
+      className={["mtk-choice-grid", className].filter(Boolean).join(" ")}
+      role="group"
+      aria-label={label}
+      style={minColumn == null ? style : { ...style, ["--mtk-choice-min" as string]: `${minColumn}px` }}
+      {...rest}
+    >
+      {children}
+    </div>
+  );
+}
+
+export interface ChoiceCardProps extends Omit<ButtonProps, "children" | "variant" | "onClick" | "icon"> {
+  label: ReactNode;
+  /** What picking this card does, in one line. Rendered, not hidden in a tooltip. */
+  description?: ReactNode;
+  icon?: ReactNode;
+  /** Trailing annotation — a count, a price, a state word. */
+  meta?: ReactNode;
+  /** The card names a state the object is already in. */
+  selected?: boolean;
+  disabled?: boolean;
+  /** Shown as the card's `title` when disabled, so a dead control always says why (`<ux_quality>` 6). */
+  disabledReason?: string;
+  onSelect: () => void;
+}
+
+/** One card in a {@link ChoiceGrid}: a mark, a name, and the sentence that says what it does. */
+export function ChoiceCard({
+  label,
+  description,
+  icon,
+  meta,
+  selected = false,
+  disabled = false,
+  disabledReason,
+  onSelect,
+  className,
+  title,
+  ...rest
+}: ChoiceCardProps) {
+  return (
+    <Button
+      {...rest}
+      type="button"
+      variant="ghost"
+      className={["mtk-choice", selected && "is-selected", className].filter(Boolean).join(" ")}
+      aria-pressed={selected}
+      disabled={disabled}
+      title={disabled ? (disabledReason ?? title) : title}
+      onClick={onSelect}
+    >
+      {icon != null && <span className="mtk-choice__icon" aria-hidden="true">{icon}</span>}
+      <span className="mtk-choice__copy">
+        <span className="mtk-choice__label">{label}</span>
+        {description != null && <span className="mtk-choice__description">{description}</span>}
+      </span>
+      {meta != null && <span className="mtk-choice__meta">{meta}</span>}
+    </Button>
+  );
+}
+
 export interface EmptyPanelStateProps {
   title: ReactNode;
   description?: ReactNode;

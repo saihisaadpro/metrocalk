@@ -228,20 +228,23 @@ export function MatchPanel({ client }: { client: EditorClient }) {
         <RolesSection client={client} />
         <CinemaSection client={client} />
         <VfxSection client={client} />
+        {/* THE ACTION IS INSIDE THE EMPTY STATE, AND THE EMPTY STATE IS COMPACT. This panel is not
+            empty — three authoring sections sit above it — so the full-size `EmptyPanelState` put a
+            40px icon and a five-line centred paragraph in the MIDDLE of a populated column, with the
+            button floating below it and a second centred paragraph below that. `<ux_quality>` 1 is
+            the rule it broke: the control that starts an action owns its outcome, so the button
+            belongs to the block that explains it, not to a row underneath. */}
         <EmptyPanelState
+          compact
           icon={<Icon name="sword" size="xl" />}
           title="This scene doesn't have a match yet"
-          description="A match is authored like anything else: a play area, a lane to walk, the actors that fight over it, and the waves that spawn. Create one to get a complete, playable starting point you can then edit."
+          description="A play area, a lane, the actors that fight over it and the waves that spawn — all ordinary scene objects you can then move, retune and undo in one step."
+          primaryAction={
+            <Button variant="primary" onClick={create} disabled={busy}>
+              Create a starter match
+            </Button>
+          }
         />
-        <div style={{ ...row, justifyContent: "center", marginTop: space.md }}>
-          <Button variant="primary" onClick={create} disabled={busy}>
-            Create a starter match
-          </Button>
-        </div>
-        <p style={{ ...meta, textAlign: "center", marginTop: space.sm }}>
-          Everything it creates is ordinary scene objects — move them with the gizmo, change their numbers
-          in the inspector, and undo it in one step.
-        </p>
       </div>
     );
   }

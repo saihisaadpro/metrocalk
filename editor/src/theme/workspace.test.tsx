@@ -4,6 +4,8 @@ import { useState } from "react";
 import { Icon } from "./icons";
 import { Button } from "./primitives";
 import {
+  ChoiceCard,
+  ChoiceGrid,
   DisclosureSection,
   DockRail,
   DockTabs,
@@ -330,4 +332,60 @@ test("NavRail: clicking an item reports it, and a tooltip is the item's plain-la
   expect(screen.getByRole("tab", { name: "Inspect" }).getAttribute("title")).toBe("Measure before changing.");
   fireEvent.click(screen.getByRole("tab", { name: "Export" }));
   expect(onChange).toHaveBeenCalledWith("export");
+});
+
+// ── ChoiceGrid / ChoiceCard ───────────────────────────────────────────────────────────────────────
+//
+// jsdom implements no layout, so the RESPONSIVE half of this component — the `auto-fit` column count
+// that replaced four hardcoded `repeat(2, 1fr)` grids — is not testable here and is asserted by the
+// `gameplay-wide` shot instead. What IS testable is the part four panels each had a private opinion
+// about: what a card announces, what it says when it refuses, and whether the sentence that explains
+// it is rendered or merely hovered.
+
+test("ChoiceCard: the description is RENDERED, not hidden in a title", () => {
+  render(
+    <ChoiceGrid label="Assign a role">
+      <ChoiceCard label="Collectible" description="Spins; vanishes and scores" onSelect={() => {}} />
+    </ChoiceGrid>,
+  );
+  // The whole point of the primitive: a blurb that exists only as a `title` is invisible to touch, to
+  // the keyboard and to anyone reading the panel rather than hunting in it.
+  expect(screen.getByText("Spins; vanishes and scores")).toBeTruthy();
+  expect(screen.getByRole("group", { name: "Assign a role" })).toBeTruthy();
+});
+
+test("ChoiceCard: a card that names the current state is pressed, and pressing it reports", () => {
+  const onSelect = vi.fn();
+  render(
+    <ChoiceGrid label="Assign a role">
+      <ChoiceCard label="Collectible" selected onSelect={onSelect} />
+      <ChoiceCard label="Spinner" onSelect={() => {}} />
+    </ChoiceGrid>,
+  );
+  expect(screen.getByRole("button", { name: /Collectible/ }).getAttribute("aria-pressed")).toBe("true");
+  expect(screen.getByRole("button", { name: /Spinner/ }).getAttribute("aria-pressed")).toBe("false");
+  fireEvent.click(screen.getByRole("button", { name: /Collectible/ }));
+  expect(onSelect).toHaveBeenCalledTimes(1);
+});
+
+test("ChoiceCard: a disabled card says WHY in its title and does not fire", () => {
+  const onSelect = vi.fn();
+  render(
+    <ChoiceGrid label="Assign a role">
+      <ChoiceCard
+        label="Collectible"
+        disabled
+        disabledReason="Select an object first."
+        title="Spins; vanishes and scores"
+        onSelect={onSelect}
+      />
+    </ChoiceGrid>,
+  );
+  const card = screen.getByRole("button", { name: /Collectible/ }) as HTMLButtonElement;
+  expect(card.disabled).toBe(true);
+  // `<ux_quality>` 6 — a control that cannot act says why, in words, where the pointer already is.
+  // The reason REPLACES the description here rather than joining it: a `title` is one string.
+  expect(card.title).toBe("Select an object first.");
+  fireEvent.click(card);
+  expect(onSelect).not.toHaveBeenCalled();
 });

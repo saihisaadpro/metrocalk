@@ -12,6 +12,7 @@ import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
 import { Button, NumericField } from "../theme/primitives";
+import { ChoiceCard, ChoiceGrid } from "../theme/workspace";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import { OnlyIfBlock } from "./OnlyIfBlock";
 import type { RoleReply, RoleRow, RoleSpec } from "../transport/protocol";
@@ -184,32 +185,30 @@ export function BehaviourSection({ client, onJumpTo }: BehaviourSectionProps) {
         </span>
       </div>
 
-      <div
-        role="group"
-        aria-label="Assign a behaviour"
-        style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: space.xs }}
-      >
+      {/* THE FOURTH COPY OF ONE GESTURE, NOW THE FOURTH CONSUMER OF ONE COMPONENT. Roles, cinematic
+          shots, effects and this all ask the same question — pick a card, one undoable commit lands
+          on the selected object — and all four had drawn it as a fixed `repeat(2, 1fr)` of compact
+          buttons with the sentence that says what the card DOES hidden in a `title`. The Inspector
+          track is 300px, so two columns here are 113px each: `Solid obstacle` and `Physics prop` did
+          not fit one, and the blurb was invisible to anyone not hovering a mouse. */}
+      <ChoiceGrid label="Assign a behaviour">
         {specs.map((spec) => (
-          <Button
+          <ChoiceCard
             key={spec.kind}
             data-testid={`behaviour-${spec.kind}`}
-            variant={currentRole === spec.kind ? "toggle" : "secondary"}
-            active={currentRole === spec.kind}
-            compact
+            icon={<Icon name={spec.kind} size="md" fallback="shape" />}
+            label={spec.label}
+            description={spec.blurb}
+            selected={currentRole === spec.kind}
             disabled={busy || playing}
-            title={
-              playing
-                ? "Stop Play first — behaviour is authored, not live-edited"
-                : `${spec.blurb}. Adds: ${spec.adds}. One step — Ctrl-Z undoes it.`
-            }
-            onClick={() =>
+            disabledReason="Stop Play first — behaviour is authored, not live-edited"
+            title={`${spec.blurb}. Adds: ${spec.adds}. One step — Ctrl-Z undoes it.`}
+            onSelect={() =>
               selected && void run(() => client.roleAssign(selected, spec.kind), spec.label)
             }
-          >
-            <Icon name={spec.kind} size="md" fallback="shape" /> {spec.label}
-          </Button>
+          />
         ))}
-      </div>
+      </ChoiceGrid>
 
       {held && (TUNING[held.kind]?.length ?? 0) > 0 && (
         <div data-testid="behaviour-tuning" style={{ display: "grid", gap: space.xs }}>
