@@ -300,3 +300,39 @@ test("the range at the size the defect actually had: 57 drawn rows, not the 169 
   const summaries = projectionStore.getState().summaries;
   expect(selected.every((id) => summaries[id]?.name === "Bolt M12")).toBe(true);
 });
+
+test("the chips give the room back to the list: three controls collapsed, all of them one click away", () => {
+  // MEASURED IN THE PACKAGED .exe. The 27-object sample classifies into SEVEN kinds, and the chip row
+  // took 98px of a 355px panel -- 28% of the outliner spent on the way in rather than on what it is a
+  // list of -- pushing the rows to their 180px flex basis, five visible of twenty-seven.
+  projectionStore.getState().bulkLoad([
+    { id: "m1", name: "Bolt", parentId: null, components: { MeshRenderer: { mesh: "b" } } },
+    { id: "m2", name: "Bolt", parentId: null, components: { MeshRenderer: { mesh: "b" } } },
+    { id: "m3", name: "Bolt", parentId: null, components: { MeshRenderer: { mesh: "b" } } },
+    { id: "l1", name: "Key", parentId: null, components: { Light: { intensity: 1 } } },
+    { id: "l2", name: "Fill", parentId: null, components: { Light: { intensity: 1 } } },
+    { id: "c1", name: "Cam", parentId: null, components: { Camera: {} } },
+    { id: "p1", name: "Drive", parentId: null, components: { RigidBody: { mass: 1 } } },
+    { id: "a1", name: "Fan", parentId: null, components: { AudioSource: { gain: 1 } } },
+  ]);
+  render(<Hierarchy client={fakeClient()} />);
+
+  const chips = () => Array.from(screen.getByTestId("scene-facets").querySelectorAll("[data-facet]"));
+  expect(chips().map((c) => c.getAttribute("data-facet"))).toEqual(["kind:mesh", "kind:light"]);
+  // NEVER A SILENT TRUNCATION: the control names how many it is holding.
+  const more = screen.getByTestId("more-facets");
+  expect(more.textContent).toBe("+3 more");
+
+  fireEvent.click(more);
+  expect(chips()).toHaveLength(5);
+  expect(screen.getByTestId("more-facets").textContent).toBe("Fewer");
+
+  // A PRESSED facet survives collapsing, because a filter whose own control is hidden is a state with
+  // no way out of it.
+  fireEvent.click(screen.getByTestId("scene-facets").querySelector("[data-facet='kind:audio']")!);
+  fireEvent.click(screen.getByTestId("more-facets"));
+  const collapsed = chips().map((c) => c.getAttribute("data-facet"));
+  expect(collapsed).toContain("kind:audio");
+  expect(collapsed).toHaveLength(3);
+  expect(screen.getAllByTestId("hrow")).toHaveLength(1);
+});

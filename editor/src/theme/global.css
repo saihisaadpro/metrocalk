@@ -1262,9 +1262,26 @@ body > [role="dialog"][aria-modal="true"] {
 }
 
 /* ── Workspace composition (theme/workspace.tsx) ─────────────────────────────────────────────── */
+/* A PANEL FILLS THE BOX IT IS DOCKED IN, stated once — **ADR-170 decision 1, applied here because it
+   is not on this lane**. That rule was written twice as per-container copies
+   (`.mtk-dock-flyout >` and `.mtk-bottom-workspace >`, both below) and the two SHELL DOCKS — the ones
+   on screen all the time — never got it, so both shrink-wrapped to their content inside a full-height
+   card, invisibly, because the card and the panel paint the same `--mtk-bg-panel`.
+
+   MEASURED AGAIN ON THE PACKAGED .exe, 2026-08-31, walking the objects list's own ancestor chain:
+   `.mtk-shell-card` 883px, `.mtk-workspace-panel` inside it **403px**, and the virtualised object list
+   at its 180px flex basis in a 979px window — five rows of twenty-seven with 600px of blank card
+   below them. `.mtk-dock-panel__fill` (`flex: 1 1 auto`) is how that list is given its height, and it
+   had nothing to fill.
+
+   `flex` for the flex parents and `height` for the block ones, because the panel does not know which
+   kind of container it has been put in and must fill either. ADR-170 is Accepted and its code lives
+   on a lane not merged into `origin/main`; these are its two declarations, not a second design. */
 .mtk-workspace-panel {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
+  height: 100%;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -1592,7 +1609,7 @@ body > [role="dialog"][aria-modal="true"] {
   background: var(--mtk-bg-panel);
   box-shadow: var(--mtk-shadow-4);
 }
-.mtk-dock-flyout > .mtk-workspace-panel { height: 100%; }
+/* (the flyout copy of "a panel fills its dock" is deleted: the rule is stated once, above.) */
 
 .mtk-disclosure {
   overflow: hidden;
@@ -2019,7 +2036,7 @@ body > [role="dialog"][aria-modal="true"] {
    the footer holding the primary action — scroll away with the body. Measured: the Model dock's Bake
    stage put its `Bake maps to derivative` button 0px on screen out of 34, in a container showing no
    scrollbar. `overflow: auto` above stays as the escape hatch below `--mtk-dock-content-min`. */
-.mtk-bottom-workspace > .mtk-workspace-panel { height: 100%; }
+/* (the bottom-dock copy of "a panel fills its dock" is deleted: the rule is stated once, above.) */
 .mtk-bottom-workspace--split { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.3fr); gap: 1px; background: var(--mtk-border-subtle); }
 .mtk-bottom-workspace--split > div { min-width: 0; overflow: auto; background: var(--mtk-bg-panel); }
 .mtk-bottom-workspace--logic { display: flex; flex-direction: column; overflow: hidden; }

@@ -54,6 +54,18 @@ import { color, font, fontSize, space } from "../theme/tokens";
 
 const ROW_H = 32;
 const VIEW_H = 560;
+/** How many facet chips are drawn before the rest go behind a named toggle.
+ *
+ *  THE PANEL'S JOB IS OBJECTS. Measured in the packaged `.exe` on the 27-object sample scene, which
+ *  classifies into SEVEN kinds: the chips took 98 px of a 355 px panel — 28% of the outliner spent on
+ *  the way in rather than on what it is a list of — and the row area was pushed to its 180 px flex
+ *  basis, showing five rows of twenty-seven. So the collapsed row is capped at three CONTROLS: three
+ *  facets when there are three or fewer, otherwise two facets and a toggle naming how many are
+ *  hidden. Never a silent truncation — the count is on the control.
+ *
+ *  On the content this is actually for the cap costs nothing: a CAD import is meshes end to end, one
+ *  kind is the whole scene, and `facetsOf` does not offer a facet that matches everything. */
+const FACETS_COLLAPSED = 3;
 const THUMB = 24;
 const OVERSCAN = 6;
 const INDENT = 12;
@@ -272,6 +284,16 @@ export function Hierarchy({
   // What this scene can be narrowed BY, counted from the scene itself — the discoverability half. A
   // query language nobody is taught is a query language nobody uses.
   const facets = useMemo(() => facetsOf(order, summaries), [order, summaries]);
+  const [facetsOpen, setFacetsOpen] = useState(false);
+  // A PRESSED facet is always drawn, whatever the cap says: a filter whose own control is hidden is a
+  // state with no way out of it, and the chip is the way out.
+  const shownFacets = useMemo(() => {
+    if (facetsOpen || facets.length <= FACETS_COLLAPSED) return facets;
+    const head = facets.slice(0, FACETS_COLLAPSED - 1);
+    const pressed = facets.filter((f) => queryHasFacet(parsed, f) && !head.includes(f));
+    return [...head, ...pressed];
+  }, [facets, facetsOpen, parsed]);
+  const hiddenFacets = facets.length - shownFacets.length;
   const focusRequest = useObjectSearchRequest();
 
   // Ctrl/Cmd-F lands here. Select the existing text too, so the chord starts a NEW search rather than
@@ -404,7 +426,7 @@ export function Hierarchy({
               data-testid="scene-facets"
               style={{ display: "flex", flexWrap: "wrap", gap: space.xs }}
             >
-              {facets.map((facet) => {
+              {shownFacets.map((facet) => {
                 const on = queryHasFacet(parsed, facet);
                 return (
                   <Button
@@ -423,6 +445,22 @@ export function Hierarchy({
                   </Button>
                 );
               })}
+              {(hiddenFacets > 0 || facetsOpen) && (
+                <Button
+                  compact
+                  variant="ghost"
+                  data-testid="more-facets"
+                  aria-expanded={facetsOpen}
+                  title={
+                    facetsOpen
+                      ? "Show only the largest kinds, and give the room back to the object list"
+                      : `Also filter by ${facets.slice(FACETS_COLLAPSED - 1).map((f) => f.label.toLocaleLowerCase()).join(", ")}`
+                  }
+                  onClick={() => setFacetsOpen(!facetsOpen)}
+                >
+                  {facetsOpen ? "Fewer" : `+${hiddenFacets} more`}
+                </Button>
+              )}
             </div>
           )}
 

@@ -1761,30 +1761,60 @@ function outlinerFindScenes(): Scene[] {
       id: "outliner-find",
       looking_for:
         "the outliner as a user meets it on a 185-object import: a search box that says what else it " +
-        "accepts, and beneath it the kinds THIS scene contains, each with its count. What a reader " +
-        "checks: the five chips wrap inside the 340 px dock without clipping or overlapping, the " +
-        "count on each chip is distinguishable from its label rather than reading as part of the " +
-        "name, and the row of chips reads as a vocabulary to pick from rather than as five more " +
-        "buttons competing with the object rows below it",
+        "accepts, and beneath it ONE row — the two largest kinds this scene contains with their " +
+        "counts, and a control naming the three it is holding back. The cap is measured, not " +
+        "aesthetic: on the packaged .exe the uncapped row took 98px of a 355px panel and pushed the " +
+        "object list to its 180px minimum. What a reader checks: the row is ONE row, `+3 more` reads " +
+        "as a way to see more rather than as a third filter, the count on each chip is " +
+        "distinguishable from its label rather than reading as part of the name, and the object rows " +
+        "below have visibly more room than the chrome above them",
       width: 380,
       expect: {
         present: [
           ["[data-testid='hierarchy']", 1],
           ["[data-testid='scene-facets']", 1],
-          // Five kinds present, none of them the whole scene — the facets this scene can offer.
-          ["[data-testid='scene-facets'] [data-facet]", 5],
+          // Two facets and the overflow control: three controls, one row.
+          ["[data-testid='scene-facets'] [data-facet]", 2],
           ["[data-facet='kind:mesh']", 1],
           ["[data-facet='kind:light']", 1],
-          ["[data-facet='kind:camera']", 1],
-          ["[data-facet='kind:physics']", 1],
-          ["[data-facet='kind:audio']", 1],
+          ["[data-testid='more-facets']", 1],
           // No verb yet, because nothing has been asked: the button appears with the result.
           ["[data-testid='select-matches']", 0],
         ],
-        text_present: ["185 entities", "Meshes", "171", "Lights", "Physics bodies", "Cameras", "Audio sources"],
-        text_absent: ["null", "undefined", "NaN"],
+        text_present: ["185 entities", "Meshes", "171", "Lights", "+3 more"],
+        // NEVER A SILENT TRUNCATION: what is hidden is counted on the control, so the reader can see
+        // that three were withheld rather than that five were never there.
+        text_absent: ["null", "undefined", "NaN", "Audio sources"],
         // A chip whose count ran outside the dock would still satisfy `text_present`, because
         // `textContent` does not know where anything is.
+        unclipped: ["[data-testid='scene-facets']", "[data-testid='hierarchy']"],
+        // The three controls are ONE row, which is the whole claim the cap exists to make.
+        same_line: [
+          ["[data-facet='kind:mesh']", "[data-facet='kind:light']"],
+          ["[data-facet='kind:light']", "[data-testid='more-facets']"],
+        ],
+      },
+      setup: seedPlant,
+      render: () => inDock(<Hierarchy client={outlinerClient()} />),
+    },
+    {
+      id: "outliner-find-all",
+      looking_for:
+        "the same row expanded — every kind this scene contains, wrapping inside the 328px dock. What " +
+        "a reader checks: no chip is clipped or overlapping at the wrap, the counts stay attached to " +
+        "their own labels across a line break, and `Fewer` is recognisable as the way back rather " +
+        "than as one more filter",
+      width: 380,
+      click: ["[data-testid='more-facets']"],
+      expect: {
+        present: [
+          ["[data-testid='scene-facets'] [data-facet]", 5],
+          ["[data-facet='kind:camera']", 1],
+          ["[data-facet='kind:physics']", 1],
+          ["[data-facet='kind:audio']", 1],
+        ],
+        text_present: ["Meshes", "Lights", "Physics bodies", "Cameras", "Audio sources", "Fewer"],
+        text_absent: ["null", "undefined", "NaN"],
         unclipped: ["[data-testid='scene-facets']", "[data-testid='hierarchy']"],
       },
       setup: seedPlant,
@@ -1809,6 +1839,7 @@ function outlinerFindScenes(): Scene[] {
           ["[data-testid='select-matches'][data-count='6']", 1],
           ["[data-facet='kind:light'][aria-pressed='true']", 1],
           ["[data-facet='kind:mesh'][aria-pressed='false']", 1],
+          ["[data-testid='scene-facets'] [data-facet]", 2],
         ],
         text_present: ["6 of 185 entities", "Select all 6", "Bay Light 1", "Bay Light 6"],
         text_absent: ["null", "undefined", "NaN", "Bolt M12"],
