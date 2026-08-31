@@ -2948,6 +2948,10 @@ enum EngineCmd {
         folder: String,
         /// The name the frames share, before the number.
         stem: String,
+        /// ADR-177 — the output height the author chose, one of
+        /// [`metrocalk_editor_shell::RENDER_HEIGHTS`]. `None` writes the composed picture at whatever
+        /// size the window is making it, which is what every render before ADR-177 did.
+        height: Option<u32>,
         reply: Sender<metrocalk_editor_shell::RenderReply>,
     },
     /// Cinematics — what a render WOULD produce, without producing it.
@@ -2959,6 +2963,9 @@ enum EngineCmd {
         id: String,
         fps: u32,
         shot: Option<usize>,
+        /// The output height being considered. The plan answers with the pixel size it implies, so the
+        /// dialog states the size above the button rather than multiplying an aspect in TypeScript.
+        height: Option<u32>,
         reply: Sender<metrocalk_editor_shell::RenderReply>,
     },
     /// Cinematics — how far the running render has got. The one read a progress bar polls.
@@ -10631,6 +10638,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 shot,
                 folder,
                 stem,
+                height,
                 reply,
             } => {
                 use metrocalk_editor_shell::{plan_render, RenderReply, RenderScope};
@@ -10648,9 +10656,14 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 }
                 // Asked BEFORE anything is created on disk, so a machine that cannot produce a single
                 // frame says so instead of leaving an empty folder and a stalled progress bar.
-                if !shared.lock().unwrap().frame_capture_supported {
+                //
+                // ADR-177 — ONLY THE WINDOW PATH DEPENDS ON THIS. `frame_capture_supported` is about
+                // the SURFACE allowing `COPY_SRC`; a render at a chosen size reads back a texture this
+                // process created, with that usage set unconditionally. Refusing it here would deny an
+                // adapter the one route it can actually take.
+                if height.is_none() && !shared.lock().unwrap().frame_capture_supported {
                     let _ = reply.send(RenderReply::refusal(
-                        "This graphics adapter does not let the viewport be copied, so frames cannot be written to files.",
+                        "This graphics adapter does not let the viewport be copied, so frames cannot be written at the size on screen. Choose an output height instead.",
                     ));
                     continue;
                 }
@@ -10664,7 +10677,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
                 let scope = shot.map_or(RenderScope::WholeCut, RenderScope::Shot);
-                let plan = match plan_render(&cut, fps, scope) {
+                let sizing = render_sizing(&shared, &cut, height);
+                let plan = match plan_render(&cut, fps, scope, sizing) {
                     Ok(plan) => plan,
                     Err(why) => {
                         let _ = reply.send(RenderReply::refusal(why));
@@ -10682,9 +10696,19 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // Take the camera through the SAME door the timeline preview uses, and pose the first
                 // instant immediately — so the viewport shows frame 1 the moment the render starts
                 // rather than staying on the editor view until the first capture returns.
+                // ADR-177 — TELL THE RENDERER WHAT SIZE THE PICTURE IS, before the first pose. From
+                // here every frame is drawn into targets of exactly this shape and the file is the
+                // whole of them; the window becomes a preview of it. Set only when a height was
+                // chosen, so "as on screen" is the swapchain path it has always been.
+                if height.is_some() {
+                    shared.lock().unwrap().render_size = Some((plan.width, plan.height));
+                }
                 let state = hold_cinema_preview(&shared, &mut cinema_preview, entity, &cut);
                 let first = metrocalk_editor_shell::preview_time(&state.cut, plan.instant(0));
                 let Some(playback) = state.cut.playback_at(first) else {
+                    // Nothing was started, so nothing may be left behind: an offscreen size that
+                    // outlived its refusal would leave the viewport drawing into a texture forever.
+                    shared.lock().unwrap().render_size = None;
                     let _ = reply.send(RenderReply::refusal(
                         "the first frame of that render is past the end of the cutscene",
                     ));
@@ -10700,17 +10724,21 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     &mut state.plans,
                 );
                 let pending = shared.lock().unwrap().request_frame();
+                let offscreen = height.is_some();
                 let job = CinemaRenderJob {
                     owner: entity,
                     key: id.clone(),
-                    plan,
                     folder,
                     stem: metrocalk_editor_shell::sanitise_stem(&stem),
                     next: 0,
                     written: 0,
                     bytes: 0,
-                    width: 0,
-                    height: 0,
+                    // Stated from the start when the renderer was told what to draw, and left at zero
+                    // when it was not — see `CinemaRenderJob::width`.
+                    width: if offscreen { plan.width } else { 0 },
+                    height: if offscreen { plan.height } else { 0 },
+                    offscreen,
+                    plan,
                     pending: Some(pending),
                     failures: Vec::new(),
                     consecutive_failures: 0,
@@ -10720,9 +10748,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     outcome: None,
                 };
                 diag_log!(
-                    "cinema: rendering {} frame(s) of {id} at {} fps into {}",
+                    "cinema: rendering {} frame(s) of {id} at {} fps, {}x{}, into {}",
                     job.plan.frames,
                     job.plan.fps,
+                    job.plan.width,
+                    job.plan.height,
                     job.folder.display()
                 );
                 let _ = reply.send(job.reply());
@@ -10732,6 +10762,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 id,
                 fps,
                 shot,
+                height,
                 reply,
             } => {
                 use metrocalk_editor_shell::{plan_render, RenderReply, RenderScope};
@@ -10745,15 +10776,20 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
                 let scope = shot.map_or(RenderScope::WholeCut, RenderScope::Shot);
-                let answer = match plan_render(&cut, fps, scope) {
+                let sizing = render_sizing(&shared, &cut, height);
+                let answer = match plan_render(&cut, fps, scope, sizing) {
                     Ok(plan) => RenderReply {
                         entity: Some(id),
                         frames: plan.frames,
                         fps: plan.fps,
                         seconds: plan.seconds,
+                        // The SAME two numbers the files will carry, from the same function the job
+                        // runs — so the size above the button is the size in the IHDR.
+                        width: plan.width,
+                        height: plan.height,
                         message: format!(
-                            "{} frames · {:.1}s at {} fps",
-                            plan.frames, plan.seconds, plan.fps
+                            "{} frames · {:.1}s at {} fps · {}x{}",
+                            plan.frames, plan.seconds, plan.fps, plan.width, plan.height
                         ),
                         ..RenderReply::default()
                     },
@@ -22917,6 +22953,33 @@ fn end_cinema_preview(shared: &render::Shared, slot: &mut Option<CinemaPreviewSt
 /// the same four things done together (hand back whoever had it, remember the author's view, turn the
 /// viewport from a workspace into a picture, and suppress the selection outline a shot must not
 /// contain), and a second copy of that sequence is a second chance to leave the author inside a shot.
+/// ADR-177 — the three facts [`metrocalk_editor_shell::render_frame_size`] turns into a pixel size.
+///
+/// The aspect comes from the CUT's own delivery frame, not from `composition_aspect()`. That reads the
+/// live composition, which only insets to the delivery while something is actually holding the camera —
+/// and at plan time, with a dialog open over the ordinary editor view, nothing is. Reading it there
+/// would have printed a 16:9 cost above a 2.39:1 render, which is the exact failure the cost sentence
+/// exists to prevent.
+fn render_sizing(
+    shared: &Shared,
+    cut: &metrocalk_animation::shot::Cutscene,
+    height: Option<u32>,
+) -> metrocalk_editor_shell::FrameSizing {
+    let st = shared.lock().unwrap();
+    let [vw, vh] = st.composed_pixels;
+    let stage = if vh > 0 {
+        vw as f32 / vh as f32
+    } else {
+        st.known_surface_aspect()
+    };
+    metrocalk_editor_shell::FrameSizing {
+        height,
+        viewport: (vw, vh),
+        aspect: cut.delivery.ratio().unwrap_or(stage),
+        max_dimension: st.max_render_dimension,
+    }
+}
+
 fn hold_cinema_preview<'a>(
     shared: &render::Shared,
     slot: &'a mut Option<CinemaPreviewState>,
@@ -23018,9 +23081,13 @@ struct CinemaRenderJob {
     /// How many files exist.
     written: u32,
     bytes: u64,
-    /// The size the frames are actually being written at, from the first capture that arrived.
+    /// The size the frames are actually being written at: seeded from the plan when the renderer was
+    /// GIVEN a size (there is nothing to measure — it either draws at that size or fails), and
+    /// otherwise `0 x 0` until the first capture arrives, because the window can move under a render.
     width: u32,
     height: u32,
+    /// ADR-177 — whether this job put the renderer into targets of its own.
+    offscreen: bool,
     /// The capture this job is waiting on, if any.
     pending: Option<u64>,
     /// Every frame that did not make it, each with its own sentence.
@@ -23066,6 +23133,7 @@ impl CinemaRenderJob {
             written: self.written,
             width: self.width,
             height: self.height,
+            offscreen: self.offscreen,
             fps: self.plan.fps,
             seconds: self.plan.seconds,
             folder: self.folder.display().to_string(),
@@ -23087,10 +23155,20 @@ impl CinemaRenderJob {
         }
     }
 
-    /// Close the job with a sentence, and let go of the capture it was waiting on.
+    /// Close the job with a sentence, let go of the capture it was waiting on, and give the viewport
+    /// its own size back.
+    ///
+    /// ONE exit, for the reason `publish_camera` is one: a render ends six ways — every frame written,
+    /// cancelled, the camera taken, the cut changed, five failures in a row, a stalled surface — and a
+    /// size cleared on five of them is a viewport left drawing into an offscreen texture forever, with
+    /// nothing on screen updating and no control anywhere to turn it off.
     fn finish(&mut self, shared: &render::Shared, outcome: String) {
-        if let Some(req) = self.pending.take() {
-            shared.lock().unwrap().forget_frame(req);
+        {
+            let mut st = shared.lock().unwrap();
+            if let Some(req) = self.pending.take() {
+                st.forget_frame(req);
+            }
+            st.render_size = None;
         }
         self.finished = true;
         self.outcome = Some(outcome);
@@ -24228,6 +24306,10 @@ fn pick_render_folder(app: &tauri::AppHandle) -> Option<String> {
 /// rate, into which folder. The progress is read with [`cinema_render_status`], because a render is
 /// minutes of work and a command that returned at the end of it would be a frozen editor.
 #[tauri::command(async)]
+// A Tauri command's parameters ARE its wire shape: each one is a separate named field the UI sends,
+// and grouping them into a struct here would only move the same eight names one level down while
+// making the invoke payload a nested object nothing else in this file uses.
+#[allow(clippy::too_many_arguments)]
 fn cinema_render_start(
     app: tauri::AppHandle,
     state: State<AppState>,
@@ -24236,6 +24318,7 @@ fn cinema_render_start(
     shot: Option<usize>,
     folder: Option<String>,
     stem: String,
+    height: Option<u32>,
 ) -> metrocalk_editor_shell::RenderReply {
     ipc();
     use metrocalk_editor_shell::RenderReply;
@@ -24251,6 +24334,7 @@ fn cinema_render_start(
             shot,
             folder,
             stem,
+            height,
             reply,
         })
         .is_err()
@@ -24267,6 +24351,7 @@ fn cinema_render_plan(
     id: String,
     fps: u32,
     shot: Option<usize>,
+    height: Option<u32>,
 ) -> metrocalk_editor_shell::RenderReply {
     ipc();
     let (reply, rx) = mpsc::channel();
@@ -24276,6 +24361,7 @@ fn cinema_render_plan(
             id,
             fps,
             shot,
+            height,
             reply,
         })
         .is_err()

@@ -10,6 +10,18 @@ import { ANIMATION_GRAPH_SCHEMA_VERSION, type AnimationGraphStateInfo, type Anim
  *  client with a life longer than a single call — start, poll, poll, done — and a stub that answered
  *  each call independently could not express that. `resetTestClientRender()` puts it back, because a
  *  fixture that leaks between tests decides verdicts by run order. */
+/** ADR-177 — what the ENGINE's `render_frame_size` would answer for this fixture's stage.
+ *
+ *  A fixture is the one place restating that rule belongs: these tests are about whether the dialog
+ *  ASKS with the author's choice and SHOWS the answer, and a stub that returned the same size whatever
+ *  it was handed could not tell those two apart. 2.39 because the fixture cut delivers in scope, and
+ *  1920x803 is the stage every capture in ADR-175 was taken on. */
+function plannedSize(height: number | null): [number, number] {
+  if (height === null) return [1920, 803];
+  const even = (n: number) => (n % 2 === 0 ? n : n + 1);
+  return [even(Math.round(height * 2.39)), even(height)];
+}
+
 const RENDER_FIXTURE: RenderReply = {
   running: false,
   done: false,
@@ -18,6 +30,7 @@ const RENDER_FIXTURE: RenderReply = {
   written: 0,
   width: 0,
   height: 0,
+  offscreen: false,
   fps: 24,
   seconds: 0,
   folder: "",
@@ -40,6 +53,7 @@ export function resetTestClientRender(): void {
     written: 0,
     width: 0,
     height: 0,
+    offscreen: false,
     fps: 24,
     seconds: 0,
     folder: "",
@@ -455,12 +469,13 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     // A render that ACTUALLY ADVANCES. A stub answering one fixed row would let a panel that never
     // polls pass every assertion about progress, which is the one thing these tests exist to catch:
     // each `cinemaRenderStatus` call writes one more frame until the plan is full, then goes `done`.
-    cinemaRenderPlan: vi.fn((id: string, fps: number, shot: number | null) => {
+    cinemaRenderPlan: vi.fn((id: string, fps: number, shot: number | null, height: number | null = null) => {
       const seconds = shot === null ? 12.5 : 2.5;
       const frames = Math.max(1, Math.round(seconds * fps));
-      return Promise.resolve({ ...RENDER_FIXTURE, entity: id, fps, frames, seconds, message: `${frames} frames · ${seconds.toFixed(1)}s at ${fps} fps` });
+      const [w, h] = plannedSize(height);
+      return Promise.resolve({ ...RENDER_FIXTURE, entity: id, fps, frames, seconds, width: w, height: h, message: `${frames} frames · ${seconds.toFixed(1)}s at ${fps} fps · ${w}x${h}` });
     }),
-    cinemaRenderStart: vi.fn((id: string, fps: number, shot: number | null, stem: string) => {
+    cinemaRenderStart: vi.fn((id: string, fps: number, shot: number | null, stem: string, _folder: string | null = null, height: number | null = null) => {
       RENDER_FIXTURE.running = true;
       RENDER_FIXTURE.done = false;
       RENDER_FIXTURE.entity = id;
@@ -470,8 +485,12 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
       RENDER_FIXTURE.seconds = RENDER_FIXTURE.frames / Math.max(1, fps);
       RENDER_FIXTURE.written = 0;
       RENDER_FIXTURE.bytes = 0;
-      RENDER_FIXTURE.width = 0;
-      RENDER_FIXTURE.height = 0;
+      // ADR-177 — the engine's split, mirrored: a size the renderer was GIVEN is known before the
+      // first frame; a size read off the window is not known until one has been captured.
+      RENDER_FIXTURE.offscreen = height !== null;
+      const [planW, planH] = plannedSize(height);
+      RENDER_FIXTURE.width = height === null ? 0 : planW;
+      RENDER_FIXTURE.height = height === null ? 0 : planH;
       RENDER_FIXTURE.folder = "C:/renders/skid-weld-line";
       RENDER_FIXTURE.failures = [];
       RENDER_FIXTURE.message = `Rendering frame 1 of ${RENDER_FIXTURE.frames}`;
@@ -481,14 +500,16 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     cinemaRenderStatus: vi.fn(() => {
       if (RENDER_FIXTURE.running) {
         RENDER_FIXTURE.written = Math.min(RENDER_FIXTURE.frames, RENDER_FIXTURE.written + 20);
-        RENDER_FIXTURE.width = 1920;
-        RENDER_FIXTURE.height = 803;
+        if (!RENDER_FIXTURE.offscreen) {
+          RENDER_FIXTURE.width = 1920;
+          RENDER_FIXTURE.height = 803;
+        }
         RENDER_FIXTURE.bytes = RENDER_FIXTURE.written * 512_000;
         RENDER_FIXTURE.elapsedMs = RENDER_FIXTURE.written * 40;
         if (RENDER_FIXTURE.written >= RENDER_FIXTURE.frames) {
           RENDER_FIXTURE.running = false;
           RENDER_FIXTURE.done = true;
-          RENDER_FIXTURE.message = `Rendered ${RENDER_FIXTURE.frames} frames at 1920x803 in 2.4s`;
+          RENDER_FIXTURE.message = `Rendered ${RENDER_FIXTURE.frames} frames at ${RENDER_FIXTURE.width}x${RENDER_FIXTURE.height} in 2.4s`;
         } else {
           RENDER_FIXTURE.message = `Rendering frame ${RENDER_FIXTURE.written + 1} of ${RENDER_FIXTURE.frames}`;
         }

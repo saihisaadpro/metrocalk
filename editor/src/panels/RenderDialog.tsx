@@ -29,6 +29,30 @@ import type { EditorClient } from "../transport/session";
  *  somewhere other than this list is still answered rather than assumed. */
 const RATES = [24, 25, 30, 60] as const;
 
+/** ADR-177 — the output heights the engine offers, in the order a picker should list them.
+ *
+ *  HEIGHTS AND NOT SIZES. The width is the delivery frame's aspect times the height, worked out by
+ *  `render_frame_size` in the engine — so a 2.39:1 cut at 1080 comes out 2582 wide and a vertical one
+ *  608, with nobody doing that multiplication here. Duplicating it in TypeScript is exactly the
+ *  one-contract-twice `cinemaRenderPlan` exists to prevent; the size the dialog SHOWS is the plan's own
+ *  answer, so what it says and what lands in the file's IHDR are the same two numbers by construction.
+ *  The engine states the same four in `RENDER_HEIGHTS` and refuses anything else by name. */
+const HEIGHTS = [
+  { value: "720", label: "720 · HD" },
+  { value: "1080", label: "1080 · Full HD" },
+  { value: "1440", label: "1440 · QHD" },
+  { value: "2160", label: "2160 · 4K UHD" },
+] as const;
+
+/** The height a render starts on.
+ *
+ *  1080 AND NOT "AS ON SCREEN", which is what this dialog shipped with. A render is a DELIVERY — the
+ *  thing that leaves the editor — and the size a stage happens to be after the author opened a dock is
+ *  not a delivery format. The old default silently made every sequence as tall as the window, which on
+ *  a laptop with both docks open is around 400 lines: a film nobody can use, produced by a dialog that
+ *  never asked. */
+const DEFAULT_HEIGHT = "1080";
+
 /** How long a render's own progress is polled for, in ms.
  *
  *  A POLL AND NOT A PUSH, and four times a second and not sixty. The job advances on the engine's
@@ -76,6 +100,9 @@ export function RenderDialog({
   deliveryLabel,
 }: RenderDialogProps) {
   const [fps, setFps] = useState<number>(24);
+  /** `"viewport"`, or one of `HEIGHTS`. A string because that is what a `<select>` carries; the number
+   *  it means is `height` below, and `null` is the engine's own word for "as on screen". */
+  const [sizeChoice, setSizeChoice] = useState<string>(DEFAULT_HEIGHT);
   const [scope, setScope] = useState<"cut" | "shot">("cut");
   const [stem, setStem] = useState(() => name);
   const [plan, setPlan] = useState<RenderReply | null>(null);
@@ -87,6 +114,7 @@ export function RenderDialog({
   // places need the same answer and a second copy of "…and only when a shot is actually open" is how
   // a dialog ends up offering to render shot `null`.
   const shotIndex = scope === "shot" && activeShotIndex !== null ? activeShotIndex : null;
+  const height = sizeChoice === "viewport" ? null : Number(sizeChoice);
   const running = job?.running === true;
   const finished = job?.done === true;
 
@@ -106,6 +134,7 @@ export function RenderDialog({
     // is the narrower second choice, and a dialog that opened on it would quietly make "Render" mean
     // two seconds of a thirteen-second cut for anybody who had clicked a clip first.
     setScope("cut");
+    setSizeChoice(DEFAULT_HEIGHT);
     let live = true;
     void client
       .cinemaRenderStatus()
@@ -127,7 +156,7 @@ export function RenderDialog({
     if (!open) return;
     let live = true;
     void client
-      .cinemaRenderPlan(entity, fps, shotIndex)
+      .cinemaRenderPlan(entity, fps, shotIndex, height)
       .then((reply) => {
         if (live) setPlan(reply);
       })
@@ -137,7 +166,7 @@ export function RenderDialog({
     return () => {
       live = false;
     };
-  }, [open, client, entity, fps, shotIndex]);
+  }, [open, client, entity, fps, shotIndex, height]);
 
   // Progress. Stops the moment the job does, so a finished render is not polled forever — and the
   // ledger it left is exactly what the last poll returned.
@@ -155,12 +184,12 @@ export function RenderDialog({
   const start = useCallback(async () => {
     setStarting(true);
     try {
-      const reply = await client.cinemaRenderStart(entity, fps, shotIndex, stem);
+      const reply = await client.cinemaRenderStart(entity, fps, shotIndex, stem, null, height);
       setJob(reply);
     } finally {
       setStarting(false);
     }
-  }, [client, entity, fps, shotIndex, stem]);
+  }, [client, entity, fps, shotIndex, stem, height]);
 
   const stop = useCallback(async () => {
     setJob(await client.cinemaRenderCancel());
@@ -170,7 +199,24 @@ export function RenderDialog({
 
   const refusal = job?.reason ?? plan?.reason ?? null;
   const frames = plan?.frames ?? 0;
-  const canRender = refusal === null && frames > 0 && !running && !starting;
+  // The size the files will be, from the plan — never multiplied here. `0` while the first plan is in
+  // flight, and while a refusal stands there is no size because there is no render.
+  const outWidth = plan?.width ?? 0;
+  const outHeight = plan?.height ?? 0;
+  // ENABLED WHILE THE COUNT IS STILL COMING.
+  //
+  // A plan that has not arrived yet is not a refusal, and painting it as one is not free: the primary
+  // button spent the first frames of every open in the DISABLED palette and then animated out of it,
+  // which is a control that looks broken for about as long as a person needs to notice. It was caught
+  // by the shots gate reading the capture's own pixels — 3.36:1 grey-on-grey on a control the gate
+  // could see was not disabled — and by nothing else, because every selector assertion in this file
+  // and in `specs-render` reads the settled state.
+  //
+  // Safe because `cinema_render_start` PLANS AGAIN on the engine before it writes anything, with the
+  // same `plan_render` this dialog is waiting on: an author who hits Render in that first moment gets
+  // a render, and a cut with nothing to render is still refused — in a sentence, by the engine. This
+  // is not an enabled control that cannot act; it is one whose price tag is still loading.
+  const canRender = refusal === null && !running && !starting;
   const headingId = "render-dialog-heading";
   const describedId = "render-dialog-description";
 
@@ -212,8 +258,8 @@ export function RenderDialog({
             id={describedId}
             style={{ margin: 0, fontSize: fontSize.meta, color: color.text.secondary }}
           >
-            Every frame is drawn by the viewport itself and written as a PNG, composed for{" "}
-            {deliveryLabel} — the same picture the preview shows, without the editor over it.
+            Every frame is drawn by the renderer the viewport draws with and written as a PNG, composed
+            for {deliveryLabel} — the same picture the preview shows, without the editor over it.
           </p>
         </header>
 
@@ -317,9 +363,16 @@ export function RenderDialog({
               {" · "}
               {secondsLabel(job.elapsedMs)}
             </p>
+            {/* WHAT IS TRUE OF *THIS* RENDER. The warning below is real on the swapchain path — a
+                minimised window stops vending textures and the job stalls, which is why it is bounded
+                at 30s with a sentence about it — and false on the offscreen one, where the frames are
+                drawn into targets the window has nothing to do with. `job.offscreen` is the engine's
+                own answer rather than this component remembering which button was clicked, because a
+                reopened dialog is looking at a render it did not start. */}
             <Callout tone="neutral" title="The viewport is filming">
-              The stage is showing each frame as it is written. Leave it in front — a minimised window
-              produces no frames to save.
+              {job.offscreen
+                ? "The stage is showing each frame as it is written, fitted to the window. The render is drawn separately, so it keeps going if the editor is covered or minimised."
+                : "The stage is showing each frame as it is written. Leave it in front — a minimised window produces no frames to save."}
             </Callout>
           </section>
         ) : (
@@ -368,6 +421,32 @@ export function RenderDialog({
                 </SelectField>
               </Field>
               <Field
+                label="Frame size"
+                htmlFor="render-size"
+                help={
+                  // WHAT THE CHOICE IS FOR, not what the numbers are — the numbers are in the cost
+                  // block below, stated once, by the engine.
+                  "The width follows the frame the shots are composed for. Taller is sharper and slower."
+                }
+              >
+                <SelectField
+                  id="render-size"
+                  data-testid="render-size"
+                  value={sizeChoice}
+                  onChange={(event) => setSizeChoice(event.currentTarget.value)}
+                >
+                  {/* THE OLD BEHAVIOUR, STILL OFFERED AND NO LONGER THE DEFAULT. Rendering the stage
+                      at whatever size the docks have left it is the right answer for a quick look at
+                      a cut, and the wrong one for anything that leaves the editor. */}
+                  <option value="viewport">As on screen</option>
+                  {HEIGHTS.map((h) => (
+                    <option key={h.value} value={h.value}>
+                      {h.label}
+                    </option>
+                  ))}
+                </SelectField>
+              </Field>
+              <Field
                 label="Name"
                 htmlFor="render-stem"
                 help="Frames are numbered after it — name.0000.png, name.0001.png."
@@ -398,21 +477,36 @@ export function RenderDialog({
               <strong style={{ fontSize: fontSize.body, color: color.info.text }}>
                 {refusal ?? plan?.message ?? "Counting the frames…"}
               </strong>
+              {/* NOT THE FRAME COUNT AGAIN. The strong line above is the engine's own sentence and
+                  already carries the count, the span, the rate and the size; a second line repeating
+                  any of them is the stutter ADR-175 found in the ledger and ADR-162 in the preview
+                  read-out. What is NOT above it is what the files are — lossless PNG — and that a
+                  folder is the next question. */}
               {refusal === null && frames > 0 && (
                 <span style={{ fontSize: fontSize.meta, color: color.text.secondary }}>
-                  Written as {frames} PNG files into a folder you choose next.
+                  Lossless PNG, one file per frame, into a folder you choose next.
                 </span>
               )}
             </div>
 
-            {/* THE ONE THING THIS CANNOT DO, SAID BEFORE THE CLICK. Frames come off the viewport's own
-                swapchain, so their size is the size of the composed frame on screen — a fact the
-                dialog cannot change and must not hide behind an output-resolution box that would
-                have to lie. */}
-            <Callout tone="neutral" title="Frame size">
-              Each frame is written at the size of the composed picture on screen. Make the window
-              bigger, or collapse a dock, for a larger render.
-            </Callout>
+            {/* WHAT A CHOSEN SIZE ACTUALLY COSTS, said before the click. Until ADR-177 this callout
+                said the opposite — that the size was the window's and could not be chosen — because
+                it could not be. It can now, and the honest thing left to say is that a render bigger
+                than the stage is drawn rather than upscaled, which is why it is slower. */}
+            {refusal === null && outHeight > 0 && (
+              <Callout
+                tone="neutral"
+                title={
+                  height === null
+                    ? "Rendering the stage"
+                    : `Rendering at ${outWidth} × ${outHeight}`
+                }
+              >
+                {height === null
+                  ? "Each frame is the composed picture at the size the window is making it, so opening a dock makes the next render smaller. Choose a height for a size that does not move."
+                  : "Each frame is drawn at this size rather than stretched up to it, so it is sharper than the stage and takes longer per frame."}
+              </Callout>
+            )}
           </>
         )}
 

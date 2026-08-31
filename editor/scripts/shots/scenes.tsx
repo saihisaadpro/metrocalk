@@ -626,6 +626,7 @@ const RENDER_IDLE = {
   written: 0,
   width: 0,
   height: 0,
+  offscreen: false,
   fps: 24,
   seconds: 0,
   folder: "",
@@ -637,20 +638,22 @@ const RENDER_IDLE = {
   reason: null as string | null,
 };
 
-/** A finished render, with the numbers a real one produces: the composed frame of a 2.39:1 delivery
- *  on a 1920-wide stage is 1920x803, which is where the ledger's size comes from. */
+/** A finished render, with the numbers a real one produces. ADR-177: 1080 lines of a 2.39:1 delivery
+ *  is 2582x1080 - a DELIVERY size and not the stage's, which is the whole difference this pass made.
+ *  The stage a capture of this dialog is taken on is 1400x900, and the frames are taller than it. */
 const RENDER_DONE = {
   ...RENDER_IDLE,
   done: true,
   frames: 319,
   written: 319,
-  width: 1920,
-  height: 803,
+  width: 2582,
+  height: 1080,
+  offscreen: true,
   seconds: 13.3,
   folder: "C:/renders/skid-weld-line",
   bytes: 319 * 486_000,
   elapsedMs: 41_800,
-  message: "Rendered 319 frames at 1920x803 in 41.8s",
+  message: "Rendered 319 frames at 2582x1080 in 41.8s",
 };
 
 /** ADR-175 - the same cutscene with a render PLAN behind it. Delivered in scope, because the frame a
@@ -664,16 +667,22 @@ const renderingCutsceneClient = () =>
   ({
     ...cutsceneClient(),
     cinemaList: () => Promise.resolve({ ...CUTSCENE, delivery: "scope" as const }),
-    cinemaRenderPlan: (id: string, fps: number, shot: number | null) => {
+    cinemaRenderPlan: (id: string, fps: number, shot: number | null, height: number | null = null) => {
       const seconds = shot === null ? CUTSCENE.seconds : (CUTSCENE.rows[shot]?.effectiveSeconds ?? 0);
       const frames = Math.max(1, Math.round(seconds * fps));
+      // ADR-177 - the size is the ENGINE's answer in the product; here it is the same arithmetic over
+      // this fixture's scope delivery, so the sentence photographed is the one a real plan produces.
+      const width = height === null ? 1920 : Math.round((height * 2.39) / 2) * 2;
+      const tall = height ?? 803;
       return Promise.resolve({
         ...RENDER_IDLE,
         entity: id,
         fps,
         frames,
         seconds,
-        message: `${frames} frames \u00b7 ${seconds.toFixed(1)}s at ${fps} fps`,
+        width,
+        height: tall,
+        message: `${frames} frames \u00b7 ${seconds.toFixed(1)}s at ${fps} fps \u00b7 ${width}x${tall}`,
       });
     },
     cinemaRenderStatus: () => Promise.resolve(RENDER_DONE),
@@ -1281,12 +1290,17 @@ export const SCENES: Scene[] = [
       "an operating-system screenshot taken by a script outside the engine - while the renderer had " +
       "been reading its own frames back to PNG since M14.2 and the shot solver could pose the " +
       "camera at any instant. Check that all three moments of the task are here and in this order: " +
-      "WHAT will be written (the scope, the rate, the name), WHAT IT COSTS stated above the button " +
-      "that pays it - a frame count that is the ENGINE's own plan, not this dialog's arithmetic - " +
-      "and the one thing the dialog cannot change, said before the click rather than discovered " +
-      "after it: a frame is written at the size of the composed picture on screen. The description " +
-      "names the delivery frame the cut is composed for, because that is what decides the SHAPE of " +
-      "every file. The primary button says the number: 'Render 319 frames', never a bare 'Render'",
+      "WHAT will be written (the scope, the FRAME SIZE, the rate, the name), WHAT IT COSTS stated " +
+      "above the button that pays it - a frame count AND a pixel size that are the ENGINE's own " +
+      "plan, not this dialog's arithmetic - and what that choice means, said before the click " +
+      "rather than discovered after it. ADR-177: the size used to be the one thing this dialog " +
+      "could not change, because every frame came off the window's own swapchain and was therefore " +
+      "as tall as whatever the docks had left; it is now a delivery format, and the dialog opens " +
+      "on 1080 rather than on the stage. Check that the size control offers 'As on screen' as well, " +
+      "because the stage is still the right answer for a quick look. The description names the " +
+      "delivery frame the cut is composed for, because that is what decides the SHAPE of every " +
+      "file - and the width follows from it, which is why the picker asks for a HEIGHT and not a " +
+      "resolution. The primary button says the number: 'Render 319 frames', never a bare 'Render'",
     viewport: { width: 1400, height: 900 },
     setup: selectAnimatedEntity,
     click: ["[data-testid='cutscene-render']"],
@@ -1295,6 +1309,7 @@ export const SCENES: Scene[] = [
         ["[data-testid='render-dialog']", 1],
         ["[data-testid='render-scope']", 1],
         ["[data-testid='render-fps']", 1],
+        ["[data-testid='render-size']", 1],
         ["[data-testid='render-stem']", 1],
         ["[data-testid='render-cost']", 1],
         ["[data-testid='render-start']", 1],
@@ -1305,15 +1320,25 @@ export const SCENES: Scene[] = [
         "2.39:1 scope",
         // The cost, and the fact that it is a count of FILES.
         "319 frames",
-        "PNG files",
-        // The limit, before the click.
+        "PNG",
+        // ADR-177 - the size is a choice, and the pixels it comes to are stated before the click.
         "Frame size",
+        "2582 × 1080",
+        "As on screen",
       ],
-      text_absent: ["null", "undefined", "NaN", "0 frames"],
+      text_absent: [
+        "null",
+        "undefined",
+        "NaN",
+        "0 frames",
+        // The sentence this dialog used to end on, before a size could be chosen.
+        "the size of the composed picture on screen",
+      ],
       unclipped: [
         "[data-testid='render-start']",
         "[data-testid='render-cost']",
         "[data-testid='render-scope']",
+        "[data-testid='render-size']",
       ],
       // The cost sits ABOVE the button that pays it. Below it, it is a receipt.
       stacked: [["[data-testid='render-cost']", "[data-testid='render-start']"]],
@@ -1328,8 +1353,9 @@ export const SCENES: Scene[] = [
       "WHERE THE FRAMES WENT. A render is 319 files in a folder, and 'done' is not an answer to " +
       "'where are they' - which is exactly what a status-bar toast could say and no more. The " +
       "options are GONE and their space is the ledger: how many frames exist, the pixel size they " +
-      "were actually written at (measured from the first captured frame, never guessed from the " +
-      "window), what they weigh, how long it took, and the destination path in mono, whole, " +
+      "were actually written at (2582x1080 - the delivery the author chose, not the shape of the " +
+      "1400x900 stage this capture was taken on), what they weigh, how long it took, and the " +
+      "destination path in mono, whole, " +
       "wrapping rather than truncating. Check that the reader can answer 'where are my files' " +
       "without leaving this dialog, and that no settings control is still on screen asking a " +
       "question the reader has stopped having",
@@ -1345,7 +1371,7 @@ export const SCENES: Scene[] = [
       ],
       // The settings are gone, not merely disabled.
       absent: ["[data-testid='render-fps']", "[data-testid='render-scope']"],
-      text_present: ["319", "1920", "Rendered", "renders"],
+      text_present: ["319", "2582", "1080", "Rendered", "renders"],
       text_absent: ["null", "undefined", "NaN"],
       unclipped: ["[data-testid='render-ledger-folder']", "[data-testid='render-done']"],
     },

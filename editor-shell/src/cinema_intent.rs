@@ -1438,11 +1438,124 @@ pub const RENDER_RATES: [u32; 4] = [24, 25, 30, 60];
 /// chosen against.
 pub const DEFAULT_RENDER_FPS: u32 = 24;
 
+/// The output heights a render offers, on top of "whatever the window makes it".
+///
+/// A LIST AND NOT A NUMBER BOX, for the reason [`RENDER_RATES`] is one: these four are what delivery
+/// actually means — 720 for the web, 1080 for nearly everything, 1440 and 2160 for a master — and a
+/// field somebody can type `3` or `9000` into is a field that has to refuse. The WIDTH is never asked
+/// for: it is the delivery frame's own aspect times the height, so a 2.39:1 cut at 1080 is 2582 wide
+/// and a vertical one is 608, with nobody doing that arithmetic by hand and nobody able to ask for a
+/// size that is the wrong shape for the shot.
+pub const RENDER_HEIGHTS: [u32; 4] = [720, 1080, 1440, 2160];
+
+/// The largest either side of a rendered frame may be.
+///
+/// `wgpu`'s downlevel-webgl2 floor for `max_texture_dimension_2d` is 8192 and every desktop backend
+/// this ships on is at least that; the render allocates a colour target, a depth target, an HDR scene,
+/// an SSAO copy and a half-res bloom chain at this size, so the ceiling is set where the memory is
+/// defensible rather than where the driver gives up. 2160 at 2.39:1 is 5162 wide and fits.
+pub const MAX_RENDER_DIMENSION: u32 = 8192;
+
 /// The ceiling on one render job, in frames. A twelve-shot cut at the 20 s-per-shot maximum and the
 /// slowest mood is 600 s, which at 60 fps is 36,000 frames — an hour of rendering and several
 /// gigabytes, started by one click. The cap is not a technical limit; it is the point past which the
 /// answer should be "that is more than you meant", said before anything is written.
 pub const MAX_RENDER_FRAMES: u32 = 12_000;
+
+/// What decides the pixels a render is written at.
+///
+/// FACTS AND NO POLICY, so the one function that turns them into a size can be tested without a window
+/// or a graphics device: the height the author chose (or did not), the composed picture on screen, the
+/// aspect that picture is composed for, and what this machine will hold. The aspect is carried
+/// separately from `viewport` on purpose: the on-screen rectangle is an integer number of pixels and
+/// its ratio is the delivery aspect ROUNDED, so deriving the width from it would drift the frame away
+/// from the shape the shot was solved for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameSizing {
+    /// The output height the author asked for. `None` = whatever the window makes it, which is what
+    /// every render before this one did and still the right answer for a quick look.
+    pub height: Option<u32>,
+    /// The composed rectangle on screen, in pixels. The size used when no height was chosen.
+    pub viewport: (u32, u32),
+    /// The exact aspect the picture is composed for — `composition_aspect()`, the same number the shot
+    /// solver stands the camera back for.
+    pub aspect: f32,
+    /// The largest either side may be ON THIS MACHINE: the graphics device's own
+    /// `max_texture_dimension_2d`, which the renderer publishes once it has one.
+    ///
+    /// READ FROM THE ADAPTER RATHER THAN ASSUMED, because the alternative to refusing here is the
+    /// render loop asking for a texture the driver will not make — and that is not an error anybody
+    /// reads, it is the viewport going away mid-render. `0` means nothing has been published yet, and
+    /// falls back to [`MAX_RENDER_DIMENSION`].
+    pub max_dimension: u32,
+}
+
+/// The pixel size a render will be written at, or the sentence saying why it cannot be.
+///
+/// Both dimensions come back EVEN. Not taste: every mainstream `yuv420p` encoder refuses an odd
+/// dimension, so a 1080-line render 2581 pixels wide is a sequence `ffmpeg` will not turn into a
+/// movie — and the person who finds that out is the person who already waited for the render.
+///
+/// # Errors
+/// When the height is not one this build offers, when the viewport has no size yet, or when the size
+/// the aspect implies is past what this machine's graphics device will hold.
+pub fn render_frame_size(sizing: FrameSizing) -> Result<(u32, u32), String> {
+    let (vw, vh) = sizing.viewport;
+    let Some(height) = sizing.height else {
+        if vw == 0 || vh == 0 {
+            return Err(
+                "The viewport has not drawn a frame yet, so there is no size to render at.".into(),
+            );
+        }
+        return Ok((vw, vh));
+    };
+    if !RENDER_HEIGHTS.contains(&height) {
+        return Err(format!(
+            "{height} is not a height this build renders at — choose {}.",
+            RENDER_HEIGHTS
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !sizing.aspect.is_finite() || sizing.aspect <= 0.05 {
+        return Err("The picture has no shape yet, so there is no width to render at.".into());
+    }
+    let ceiling = if sizing.max_dimension == 0 {
+        MAX_RENDER_DIMENSION
+    } else {
+        sizing.max_dimension.min(MAX_RENDER_DIMENSION)
+    };
+    // In `f64` so the multiply itself loses nothing: `u32 -> f64` and `f32 -> f64` are both exact, so
+    // the only approximation left is the rounding, which is the one this function is choosing to do.
+    let exact = f64::from(height) * f64::from(sizing.aspect);
+    // ONE cast, of a number this function has already bounded. `aspect` is finite and above 0.05 and
+    // `height` is one of four constants, so `exact` is finite and positive; a float that is somehow
+    // enormous saturates at `u32::MAX` and is refused by the very next line rather than wrapping.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bounded above, and the refusal below is what catches anything that is not"
+    )]
+    let width = exact.round().max(2.0) as u32;
+    if width > ceiling || height > ceiling {
+        return Err(format!(
+            "{height} lines at this frame's shape is {width} x {height} pixels — more than the {ceiling} this graphics device will hold in one render target. Choose a shorter height."
+        ));
+    }
+    Ok((even(width), even(height)))
+}
+
+/// The next even number at or above `n` (and never zero) — see [`render_frame_size`].
+fn even(n: u32) -> u32 {
+    let n = n.max(2);
+    if n.is_multiple_of(2) {
+        n
+    } else {
+        n + 1
+    }
+}
 
 /// What to film: the whole cut, or one shot of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1475,6 +1588,11 @@ pub struct RenderPlan {
     pub frames: u32,
     /// What is being filmed.
     pub scope: RenderScope,
+    /// The pixel size every file will be written at — [`render_frame_size`]'s answer, decided here so
+    /// that the number above the button is the number in the file's IHDR rather than a guess the
+    /// renderer may not honour.
+    pub width: u32,
+    pub height: u32,
 }
 
 impl RenderPlan {
@@ -1493,8 +1611,13 @@ impl RenderPlan {
 ///
 /// # Errors
 /// When the cutscene is empty, the rate is not one this build offers, the named shot is not in the
-/// cut, or the job would exceed [`MAX_RENDER_FRAMES`].
-pub fn plan_render(cut: &Cutscene, fps: u32, scope: RenderScope) -> Result<RenderPlan, String> {
+/// cut, the job would exceed [`MAX_RENDER_FRAMES`], or the frame size cannot be produced.
+pub fn plan_render(
+    cut: &Cutscene,
+    fps: u32,
+    scope: RenderScope,
+    sizing: FrameSizing,
+) -> Result<RenderPlan, String> {
     if cut.shots.is_empty() {
         return Err("There is nothing to render — this object has no shots yet.".into());
     }
@@ -1535,12 +1658,18 @@ pub fn plan_render(cut: &Cutscene, fps: u32, scope: RenderScope) -> Result<Rende
             "That is {frames} frames — more than the {MAX_RENDER_FRAMES} one render writes at once. Render a single shot, or choose a lower frame rate."
         ));
     }
+    // LAST, so that "there is nothing to render" and "that shot is gone" are still the sentences an
+    // empty or stale cut produces. A size refusal is about the delivery, and reaching it means the
+    // cutscene itself was fine.
+    let (width, height) = render_frame_size(sizing)?;
     Ok(RenderPlan {
         start_seconds,
         seconds,
         fps,
         frames,
         scope,
+        width,
+        height,
     })
 }
 
@@ -1597,10 +1726,23 @@ pub struct RenderReply {
     pub frames: u32,
     /// How many files exist on disk so far.
     pub written: u32,
-    /// The pixel size the frames are being written at, from the first one actually captured. `0 x 0`
-    /// until then — a size guessed from the window would be a claim the files may not honour.
+    /// The pixel size the frames are being written at.
+    ///
+    /// Measured, from the first frame actually captured — a size read off the window would be a claim
+    /// the files may not honour, and the window can move under a render. The ONE exception is a render
+    /// at a chosen output size (ADR-177): there the size is not read off anything, it is the
+    /// instruction the renderer was given, so it is known before the first frame and stated from the
+    /// start. `0 x 0` until whichever of those applies.
     pub width: u32,
     pub height: u32,
+    /// ADR-177 — whether the frames are drawn into targets of their own rather than read off the
+    /// window.
+    ///
+    /// Reported because it changes what is TRUE about the render, not merely how it looks: an
+    /// offscreen render does not need the window at all, so the advice to leave it in front — which a
+    /// swapchain capture genuinely depends on — would be a false warning on the path that does not.
+    #[serde(default)]
+    pub offscreen: bool,
     /// The rate the sequence is timed at.
     pub fps: u32,
     /// The span of the cutscene clock being filmed.
@@ -2726,12 +2868,26 @@ mod tests {
 
     // ── ADR-175: planning a render ───────────────────────────────────────────────────────────────
 
+    /// The sizing a 908x410 stage with nothing delivering reports — the size these captures were
+    /// actually taken at, so a plan in this module is measured against a real window and not a round
+    /// number nobody's editor produces.
+    fn stage() -> FrameSizing {
+        FrameSizing {
+            height: None,
+            viewport: (908, 410),
+            aspect: 908.0 / 410.0,
+            // What a desktop adapter reports; `using_resolution(adapter.limits())` is how the renderer
+            // gets it, so this is the number a real machine supplies rather than the constant.
+            max_dimension: 16384,
+        }
+    }
+
     #[test]
     fn a_render_plan_covers_the_whole_cut_and_one_frame_per_tick_of_it() {
         let (mut engine, _scene) = world();
         let hero = spawn(&mut engine);
         let cut = three_shot_cut(&mut engine, hero);
-        let plan = plan_render(&cut, 24, RenderScope::WholeCut).expect("plans");
+        let plan = plan_render(&cut, 24, RenderScope::WholeCut, stage()).expect("plans");
         assert!(exactly(plan.start_seconds, 0.0), "the cut starts at zero");
         assert!(
             (plan.seconds - cut.seconds()).abs() < 1.0e-4,
@@ -2761,7 +2917,7 @@ mod tests {
         let (mut engine, _scene) = world();
         let hero = spawn(&mut engine);
         let cut = three_shot_cut(&mut engine, hero);
-        let second = plan_render(&cut, 30, RenderScope::Shot(1)).expect("plans");
+        let second = plan_render(&cut, 30, RenderScope::Shot(1), stage()).expect("plans");
         let one = cut.effective_shot_seconds(0).expect("shot 0");
         assert!(
             (second.start_seconds - one).abs() < 1.0e-4,
@@ -2791,26 +2947,27 @@ mod tests {
         let (mut engine, _scene) = world();
         let hero = spawn(&mut engine);
         let empty = Cutscene::default();
-        assert!(plan_render(&empty, 24, RenderScope::WholeCut)
+        assert!(plan_render(&empty, 24, RenderScope::WholeCut, stage())
             .expect_err("an empty cut has nothing to render")
             .contains("no shots"));
         let cut = three_shot_cut(&mut engine, hero);
         // A rate this build does not offer. Refused rather than clamped: a render that quietly became
         // 24 fps would produce a sequence timed against a rate nobody chose.
-        let refused = plan_render(&cut, 23, RenderScope::WholeCut).expect_err("23 is not a rate");
+        let refused =
+            plan_render(&cut, 23, RenderScope::WholeCut, stage()).expect_err("23 is not a rate");
         assert!(refused.contains("23"), "{refused}");
         assert!(
             refused.contains("24"),
             "and names what is offered: {refused}"
         );
         // A shot that is not there.
-        assert!(plan_render(&cut, 24, RenderScope::Shot(9))
+        assert!(plan_render(&cut, 24, RenderScope::Shot(9), stage())
             .expect_err("shot 10 of 3")
             .contains("Shot 10"));
         // And the ceiling. NEGATIVE CONTROL beside it: the same cut at 24 fps is well inside, so this
         // asserts the ceiling and not merely that some rate somewhere refuses.
         assert!(
-            plan_render(&cut, 24, RenderScope::WholeCut).is_ok(),
+            plan_render(&cut, 24, RenderScope::WholeCut, stage()).is_ok(),
             "a three-shot cut at 24 fps is nowhere near the ceiling"
         );
         let long = Cutscene {
@@ -2828,11 +2985,173 @@ mod tests {
             mood: Mood::Calm,
             ..Cutscene::default()
         };
-        let over = plan_render(&long, 60, RenderScope::WholeCut).expect_err("over the ceiling");
+        let over =
+            plan_render(&long, 60, RenderScope::WholeCut, stage()).expect_err("over the ceiling");
         assert!(
             over.contains(&MAX_RENDER_FRAMES.to_string()),
             "the refusal names the ceiling: {over}"
         );
+    }
+
+    // ── ADR-177: the size the frames are written at ──────────────────────────────────────────────
+
+    #[test]
+    fn asking_for_nothing_writes_the_picture_that_is_on_screen() {
+        // The behaviour every render before this one had, and still the default: no height chosen, so
+        // the file is the composed rectangle, whatever the docks have left it.
+        assert_eq!(render_frame_size(stage()).expect("sizes"), (908, 410));
+    }
+
+    #[test]
+    fn a_chosen_height_takes_its_width_from_the_frame_the_shot_was_composed_for() {
+        // THE POINT OF THE WHOLE PASS. A 900-pixel window, and a 1080-line delivery out of it.
+        let small_window = FrameSizing {
+            height: Some(1080),
+            viewport: (620, 260),
+            aspect: 2.39,
+            ..stage()
+        };
+        let (w, h) = render_frame_size(small_window).expect("sizes");
+        assert_eq!(h, 1080, "the height is the one that was asked for");
+        assert!(
+            h > small_window.viewport.1 * 4,
+            "and it is nothing to do with how tall the window is"
+        );
+        // 1080 x 2.39 = 2581.2, rounded to 2581, and then made even.
+        assert_eq!(w, 2582);
+        assert!(
+            ((w as f32 / h as f32) - 2.39).abs() < 0.002,
+            "the file is the shape the shot was solved for: {w}x{h}"
+        );
+        // A vertical delivery gets a NARROW frame from the same rule — the width is never assumed to
+        // be the larger number.
+        let vertical = render_frame_size(FrameSizing {
+            height: Some(1080),
+            aspect: 9.0 / 16.0,
+            ..small_window
+        })
+        .expect("sizes");
+        assert_eq!(vertical, (608, 1080));
+    }
+
+    #[test]
+    fn both_dimensions_come_back_even_because_an_encoder_refuses_an_odd_one() {
+        // 720 x 2.39 = 1720.8 -> 1721, which is odd, and `ffmpeg -pix_fmt yuv420p` refuses it. Every
+        // offered height against a shape that rounds odd.
+        for height in RENDER_HEIGHTS {
+            let (w, h) = render_frame_size(FrameSizing {
+                height: Some(height),
+                aspect: 2.39,
+                ..stage()
+            })
+            .expect("sizes");
+            assert!(w.is_multiple_of(2) && h.is_multiple_of(2), "{w}x{h}");
+        }
+        // And the negative control: 1721 is what the unrounded arithmetic gives, so the assertion
+        // above is testing the rounding and not a coincidence.
+        assert_eq!((720.0f32 * 2.39).round() as u32, 1721);
+    }
+
+    #[test]
+    fn a_size_this_build_cannot_render_is_refused_by_name_rather_than_clamped() {
+        // A height nobody offered. Named, and the offered list named back — the same shape of
+        // refusal as an unoffered frame rate, because a render silently becoming 1080 would deliver a
+        // master at a size nobody chose.
+        let odd = render_frame_size(FrameSizing {
+            height: Some(900),
+            ..stage()
+        })
+        .expect_err("900 is not offered");
+        assert!(odd.contains("900"), "{odd}");
+        assert!(odd.contains("2160"), "and names what is offered: {odd}");
+        // A window that has not drawn yet cannot supply the fallback, and says so instead of
+        // producing a zero-pixel file.
+        assert!(render_frame_size(FrameSizing {
+            viewport: (0, 0),
+            ..stage()
+        })
+        .expect_err("nothing has been drawn")
+        .contains("not drawn"));
+        // Past the target ceiling. 2160 at 4:1 is 8640 wide.
+        let wide = render_frame_size(FrameSizing {
+            height: Some(2160),
+            aspect: 4.0,
+            ..stage()
+        })
+        .expect_err("too wide");
+        assert!(wide.contains(&MAX_RENDER_DIMENSION.to_string()), "{wide}");
+        // …and a MACHINE's own ceiling refuses lower than the constant does, because the alternative
+        // is the render loop asking a driver for a texture it will not make.
+        let small_gpu = render_frame_size(FrameSizing {
+            height: Some(2160),
+            aspect: 2.39,
+            max_dimension: 4096,
+            ..stage()
+        })
+        .expect_err("5162 is past a 4096 device");
+        assert!(small_gpu.contains("4096"), "{small_gpu}");
+        // NEGATIVE CONTROL: the same device renders 1080 of the same cut without complaint.
+        assert!(render_frame_size(FrameSizing {
+            height: Some(1080),
+            aspect: 2.39,
+            max_dimension: 4096,
+            ..stage()
+        })
+        .is_ok());
+        // NEGATIVE CONTROL: the widest delivery the picker offers at the tallest height still fits,
+        // so the ceiling refuses an extreme rather than the product.
+        assert!(render_frame_size(FrameSizing {
+            height: Some(2160),
+            aspect: 2.39,
+            ..stage()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn the_plan_states_the_pixel_size_before_a_single_frame_is_drawn() {
+        let (mut engine, _scene) = world();
+        let hero = spawn(&mut engine);
+        let cut = three_shot_cut(&mut engine, hero);
+        let plan = plan_render(
+            &cut,
+            24,
+            RenderScope::WholeCut,
+            FrameSizing {
+                height: Some(1080),
+                viewport: (620, 260),
+                aspect: 16.0 / 9.0,
+                ..stage()
+            },
+        )
+        .expect("plans");
+        assert_eq!((plan.width, plan.height), (1920, 1080));
+        // A size refusal is a PLAN refusal — the dialog gets one sentence, from one function, whether
+        // the problem is the cut, the rate or the delivery.
+        let refused = plan_render(
+            &cut,
+            24,
+            RenderScope::WholeCut,
+            FrameSizing {
+                height: Some(999),
+                ..stage()
+            },
+        )
+        .expect_err("999 is not a height");
+        assert!(refused.contains("999"), "{refused}");
+        // …and the cut's own refusals still win, because they are the ones that say the render is
+        // pointless rather than the wrong shape.
+        assert!(plan_render(
+            &Cutscene::default(),
+            24,
+            RenderScope::WholeCut,
+            FrameSizing {
+                height: Some(999),
+                ..stage()
+            },
+        )
+        .expect_err("an empty cut")
+        .contains("no shots"));
     }
 
     #[test]

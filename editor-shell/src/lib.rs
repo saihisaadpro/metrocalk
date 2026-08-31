@@ -128,12 +128,13 @@ pub use capscene::{
 };
 pub use cinema_intent::{
     add_shot_ops, cutscene_of, describe_shot, framing_catalog, move_shot_ops, plan_render,
-    preview_time, remove_shot_ops, render_frame_name, reply_for as cinema_reply,
+    preview_time, remove_shot_ops, render_frame_name, render_frame_size, reply_for as cinema_reply,
     reply_with_names as cinema_reply_named, sanitise_stem, set_delivery_ops, set_mood_ops,
     set_shot_framing_ops, set_shot_seconds_ops, set_shot_subject_ops, shot_specs, subject_catalog,
-    subject_chain, CinemaError, CinemaPreviewReply, CinemaReply, FramingCatalog, FramingEdit,
-    FramingOption, RenderPlan, RenderReply, RenderScope, ShotRow, ShotSpec, SubjectCandidate,
-    SubjectCatalog, CINEMA_COMPONENT, DEFAULT_RENDER_FPS, MAX_RENDER_FRAMES, RENDER_RATES,
+    subject_chain, CinemaError, CinemaPreviewReply, CinemaReply, FrameSizing, FramingCatalog,
+    FramingEdit, FramingOption, RenderPlan, RenderReply, RenderScope, ShotRow, ShotSpec,
+    SubjectCandidate, SubjectCatalog, CINEMA_COMPONENT, DEFAULT_RENDER_FPS, MAX_RENDER_DIMENSION,
+    MAX_RENDER_FRAMES, RENDER_HEIGHTS, RENDER_RATES,
 };
 pub use compose_ai::{ComposeAiError, Composer, DemoComposer, RemoteComposer};
 pub use constraint_intent::{

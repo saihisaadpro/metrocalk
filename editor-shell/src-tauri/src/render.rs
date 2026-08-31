@@ -1641,6 +1641,30 @@ pub struct SceneState {
     /// once at start-up and published here so a refusal can name the real reason instead of the request
     /// timing out. `false` until the render thread has configured a surface.
     pub frame_capture_supported: bool,
+    /// ADR-177 — the largest either side of a render target may be on THIS machine's graphics device
+    /// (`max_texture_dimension_2d`), published once the device exists. `0` before then.
+    ///
+    /// Here rather than assumed at the ceiling constant because the alternative to refusing a size is
+    /// the render loop asking a driver for a texture it will not make, and that is not an error
+    /// anybody reads — it is the viewport going away in the middle of a render.
+    pub max_render_dimension: u32,
+    /// ADR-177 — the size the picture is DRAWN at, when it is not the window's.
+    ///
+    /// `None` — every frame the author is looking at — means the swapchain is the picture and a
+    /// capture is a crop of it, which is why a render used to be exactly as tall as whatever the docks
+    /// had left of the window. `Some((w, h))` means a render job asked for an output size: the frame is
+    /// drawn into offscreen targets of exactly that shape, the file is the whole of them, and the
+    /// window shows the same picture fitted into its viewport hole.
+    ///
+    /// One field, set by the job and cleared when it closes, because the alternative — a size passed
+    /// down with each capture request — would let two frames of one sequence be different sizes.
+    pub render_size: Option<(u32, u32)>,
+    /// The composed rectangle ON SCREEN, in pixels, published by the render loop every frame.
+    ///
+    /// What a render is written at when nobody chose a size, and the number the dialog states so that
+    /// "as on screen" is an offer with a size on it rather than a shrug. `[0, 0]` until the first
+    /// frame — a size guessed before the surface exists is a claim the files may not honour.
+    pub composed_pixels: [u32; 2],
     /// M19 (ADR-104) — terrain chunks the runtime wants uploaded, drained by the render thread a few per
     /// frame. Geometry and textures are separate `Option`s: a LOD switch re-sends only the vertices, because
     /// the chunk's half-megabyte splat texture has not changed.
@@ -1936,6 +1960,43 @@ impl SceneState {
     #[must_use]
     pub fn view_frame(&self, surface_aspect: f32) -> ViewFrame {
         ViewFrame::new(surface_aspect, self.composition_rect())
+    }
+
+    /// ADR-177 — the rectangle THIS frame is composed for, given whether it is being drawn into the
+    /// window or into targets of its own.
+    ///
+    /// The ONE place that difference is decided, extracted from the frame loop so a gate can hold it.
+    /// Offscreen the target *is* the frame: a render at a chosen size was handed a rectangle of exactly
+    /// the delivery shape with no docks over it, so the composition is all of it — a plain centred
+    /// projection, no inset, and a file that is the whole texture. On the window it is the hole the
+    /// docks have left, inset to the delivery frame, which is what it has always been.
+    #[must_use]
+    pub fn drawn_frame(&self, offscreen: bool, aspect: f32) -> ViewFrame {
+        if offscreen {
+            ViewFrame::new(aspect, [0.0, 0.0, 1.0, 1.0])
+        } else {
+            self.view_frame(aspect)
+        }
+    }
+
+    /// ADR-177 — the bars around this frame, in pixels, or `None` when there are none.
+    ///
+    /// Bars exist because a stage is the wrong shape for the delivery. A target built AT the delivery
+    /// shape cannot be, so an offscreen render has none — and a file with bars baked into it would be
+    /// a file that cannot be re-framed by anything downstream.
+    #[must_use]
+    pub fn drawn_letterbox(
+        &self,
+        offscreen: bool,
+        frame: &ViewFrame,
+        w: u32,
+        h: u32,
+    ) -> Option<[u32; 4]> {
+        if offscreen {
+            return None;
+        }
+        self.delivery_aspect
+            .map(|_| frame_pixels(frame.rect(), w, h))
     }
 
     /// The aspect ratio of the rectangle the picture is composed for -- the number a shot solver needs
@@ -3185,7 +3246,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             "viewport: this surface cannot be copied from - rendering a frame to a file is unavailable on this adapter",
         );
     }
-    shared.lock().unwrap().frame_capture_supported = can_capture;
+    {
+        let mut st = shared.lock().unwrap();
+        st.frame_capture_supported = can_capture;
+        st.max_render_dimension = device.limits().max_texture_dimension_2d;
+    }
     let mut config = wgpu::SurfaceConfiguration {
         usage: if can_capture {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
@@ -3443,6 +3508,10 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         ssao,
         bloom,
     };
+    // ADR-177 — allocated only while a render at a chosen size is running. Its size is read under the
+    // same lock as the camera generation (see the frame loop), so a capture can never be answered by a
+    // frame drawn at a size the requester did not ask for.
+    let mut offscreen: Option<Offscreen> = None;
     let mut targets = Targets::create(
         &device,
         &target_spec,
@@ -4126,12 +4195,30 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             working_space,
             letterbox,
             capture_rect,
+            preview_rect,
+            want_out,
             drawn_epoch,
         ) = {
             // The real surface aspect, so the very first framing fits the lens the user is looking
             // through rather than an assumed one.
             let aspect_hint = config.width as f32 / config.height.max(1) as f32;
             let mut st = shared.lock().unwrap();
+            // ADR-177 — THE SIZE THE PICTURE IS DRAWN AT, read HERE and not at the top of the loop.
+            //
+            // It has to be read in the same critical section as `pose_epoch`, for exactly the reason
+            // `pose_epoch` exists: a render job sets the size, publishes its camera and asks for a
+            // frame, and each of those takes this lock separately. Read the size earlier and this
+            // sequence is possible — loop sees `None`, job sets the size AND publishes, loop reads the
+            // new epoch, and the frame is drawn at the WINDOW's size while carrying an epoch that says
+            // it may answer the request. The first file of the sequence is then a different shape from
+            // the other 59. That is not a thought experiment: it is what the `.exe` determinism gate
+            // caught on 2026-08-31, as `take.0000.png` differing between two otherwise identical runs.
+            //
+            // Read together, the two are consistent by construction: a frame either has the new size
+            // and the new epoch, or the old size and an epoch too low to answer.
+            let want_out = st.render_size;
+            let (rw, rh) = want_out.unwrap_or((w, h));
+            let offscreen_on = want_out.is_some();
             let visibility = ViewportVisibility::from_cinematic(st.cinematic);
             // Publish it before anything reads it, so a `frame_all` arriving from the UI this frame
             // frames against the surface as it is now rather than as it was when the window opened.
@@ -4770,10 +4857,20 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 cur_lights_rev = st.lights_revision;
                 lights_buf.upload(&device, &queue, &lights_bgl, &st.lights);
             }
-            let aspect = w as f32 / h.max(1) as f32;
+            let aspect = rw as f32 / rh.max(1) as f32;
+            // THE COMPOSED RECTANGLE ON SCREEN, always — where the author sees the picture, and (when
+            // nobody has chosen a size) what a render is written at. Published so the dialog can put a
+            // size on "as on screen" instead of shrugging.
+            let window_rect = frame_pixels(st.view_frame(aspect_hint).rect(), w, h);
+            st.composed_pixels = [window_rect[2], window_rect[3]];
             // The rectangle the picture is composed for, decided ONCE per frame and used by the editor
             // camera, the cinematic override below and the bars drawn around it.
-            let frame = st.view_frame(aspect);
+            //
+            // ADR-177 — OFFSCREEN, THE TARGET *IS* THE FRAME. A render at a chosen size was handed a
+            // rectangle of exactly the delivery shape with no docks over it, so the composition is all
+            // of it: a plain centred projection, no inset, and a file that is the whole texture. On the
+            // window it is the hole in the docks, inset to the delivery frame, as it has always been.
+            let frame = st.drawn_frame(offscreen_on, aspect);
             // LETTERBOX. When a cutscene composes for a delivery frame, the final resolve is scissored
             // to that frame and the swapchain's own black clear becomes the bars.
             //
@@ -4782,13 +4879,21 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // ever takes the camera all get them from the one rectangle the camera was composed for,
             // with no command, no poll and no second copy of the inset rule to drift. And they are the
             // only honest way to author a shot for a frame the author's stage is not the shape of.
-            let letterbox = st.delivery_aspect.map(|_| frame_pixels(frame.rect(), w, h));
+            //
+            // None offscreen: bars exist because a stage is the wrong shape for the delivery, and a
+            // target built AT the delivery shape cannot be.
+            let letterbox = st.drawn_letterbox(offscreen_on, &frame, w, h);
             // WHAT A CAPTURE WOULD KEEP: the composed frame, in pixels, whether or not there are bars.
             // Not `letterbox`, which is `None` when nothing is delivering — and the whole window is the
             // wrong answer there, because the window includes the strips behind the docks that the
             // camera was never composed for. This is the same rectangle the projection is sheared to,
             // which is what makes the file and the picture agree at every aspect.
-            let capture_rect = frame_pixels(frame.rect(), w, h);
+            let capture_rect = frame_pixels(frame.rect(), rw, rh);
+            // WHERE THE WINDOW SHOWS IT while a render runs at another size: the composed hole, with
+            // the picture FITTED into it rather than cropped to it. So the author watches the file
+            // being written instead of a frozen viewport, and the dialog's "the stage is showing each
+            // frame as it is written" stays true at every output size.
+            let preview_rect = offscreen_on.then_some(window_rect);
             let mut cam = camera_matrix_with(
                 st.orbit,
                 st.elevation,
@@ -5009,11 +5114,47 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 st.working_space,
                 letterbox,
                 capture_rect,
+                preview_rect,
+                want_out,
                 // The camera generation THIS frame is being drawn at, read under the same lock as the
-                // camera itself. A capture asked for at a later epoch must not be answered by it.
+                // camera itself — and as the size above. A capture asked for at a later epoch must not
+                // be answered by it.
                 st.pose_epoch,
             )
         };
+        // The same answer the block above computed its rectangles from, in the scope the draw runs in.
+        let offscreen_on = want_out.is_some();
+        // The chain the size just read asks for. Built AFTER the lock, because allocating five GPU
+        // textures is not something to do while the render mutex is held — and nothing between here
+        // and the draw needs it.
+        match want_out {
+            Some(size) if offscreen.as_ref().map(|o| o.size) != Some(size) => {
+                offscreen = Some(Offscreen::new(
+                    &device,
+                    format,
+                    size,
+                    Targets::create(
+                        &device,
+                        &target_spec,
+                        size.0,
+                        size.1,
+                        &post_samp,
+                        &post_bgl1,
+                        &post_bgl2,
+                        &ssao_input_bgl,
+                        &black_bloom,
+                    ),
+                ));
+                crate::diag::log(&format!(
+                    "viewport: rendering offscreen at {}x{} (window is {w}x{h})",
+                    size.0, size.1
+                ));
+            }
+            Some(_) => {}
+            // Dropped the moment the job clears the size: a 2160-line chain is tens of megabytes an
+            // editor sitting idle has no use for.
+            None => offscreen = None,
+        }
         queue.write_buffer(
             &camera_buf,
             0,
@@ -5133,12 +5274,21 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             }
         }
 
+        // ADR-177 — A RENDER AT A CHOSEN SIZE DOES NOT NEED THE WINDOW. Nothing the file depends on is
+        // drawn into the swapchain, so a surface that has stopped vending textures — minimised,
+        // occluded, mid-resize — costs the author the live preview and nothing else. Without the
+        // offscreen branch every one of those `continue`s was a frame the render never got, which is
+        // exactly how a render used to stall behind a minimised window for thirty seconds and then
+        // stop with a sentence about it.
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => Some(f),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 surface.configure(&device, &config);
-                continue;
+                if !offscreen_on {
+                    continue;
+                }
+                None
             }
             // Every other state (`Timeout`, `Other`, ...) used to be an unlabelled 16 ms sleep, so a
             // surface that had permanently stopped vending textures presented as a frozen viewport
@@ -5151,19 +5301,41 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                         "viewport: surface returned {other:?} - no frame acquired                          ({surface_stall_frames} consecutive)"
                     ));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(16));
-                continue;
+                if !offscreen_on {
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                    continue;
+                }
+                None
             }
         };
-        if surface_stall_frames > 0 {
+        if surface_stall_frames > 0 && frame.is_some() {
             crate::diag::log(&format!(
                 "viewport: surface recovered after {surface_stall_frames} stalled acquisitions"
             ));
             surface_stall_frames = 0;
         }
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let window_view = frame.as_ref().map(|f| {
+            f.texture
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        });
+        // WHERE THIS FRAME IS DRAWN, and what everything below attaches to. One binding, so no pass can
+        // be routed to one target while the final resolve writes another.
+        // `offscreen` was just reconciled with the `want_out` the rectangles were computed from, so
+        // these two cannot disagree about which size this frame is.
+        debug_assert_eq!(offscreen.is_some(), offscreen_on);
+        let (draw_targets, draw_view) = match offscreen.as_ref() {
+            Some(o) => (&o.targets, &o.view),
+            // `None` here is unreachable: the acquire above only yields no texture while an offscreen
+            // render is running, and the arm above claims it when one is.
+            None => (
+                &targets,
+                window_view
+                    .as_ref()
+                    .expect("the window path always acquires a frame"),
+            ),
+        };
+        // A preview needs somewhere to draw it. Offscreen with no swapchain texture, there is nowhere.
+        let preview_rect = preview_rect.filter(|_| window_view.is_some());
         let mut enc =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         // M11.3 inc.3 — shadow depth pass FIRST (same encoder ⇒ it finishes before the scene pass samples
@@ -5232,8 +5404,11 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             // MSAA off it draws straight into that same texture. The destination is `scene_raw` when SSAO
             // will run (the AO pass then produces `hdr_scene`), otherwise `hdr_scene` itself. The
             // swapchain is NOT reachable from here under any configuration.
-            let scene_dest = targets.scene_raw.as_ref().unwrap_or(&targets.hdr_scene);
-            let (scene_color, scene_resolve) = match targets.msaa.as_ref() {
+            let scene_dest = draw_targets
+                .scene_raw
+                .as_ref()
+                .unwrap_or(&draw_targets.hdr_scene);
+            let (scene_color, scene_resolve) = match draw_targets.msaa.as_ref() {
                 Some(m) => (m, Some(scene_dest)),
                 None => (scene_dest, None),
             };
@@ -5252,7 +5427,7 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &targets.depth,
+                    view: &draw_targets.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -5438,11 +5613,19 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         }
         // Every remaining pass is a fullscreen triangle over the HDR scene. They share one helper so the
         // group-0 (camera) binding, the clear and the draw cannot diverge between routes.
+        //
+        // `into` is the rectangle of the target the triangle is mapped onto: `None` is the whole of it
+        // (every pass but one), and a rectangle FITS the picture inside it — which is a different thing
+        // from `scissor`, and the difference is the whole reason both exist. A scissor clips a
+        // full-target draw, so it CROPS; the viewport transform places the same clip-space triangle
+        // inside the rectangle, so it SCALES. Bars are the first; showing a 2582-wide render inside a
+        // 908-wide hole is the second.
         let mut fullscreen = |label: &str,
                               target: &wgpu::TextureView,
                               pipeline: &wgpu::RenderPipeline,
                               bg: &wgpu::BindGroup,
-                              scissor: Option<[u32; 4]>| {
+                              scissor: Option<[u32; 4]>,
+                              into: Option<[u32; 4]>| {
             let mut p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -5465,6 +5648,12 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             if let Some([x, y, sw, sh]) = scissor {
                 p.set_scissor_rect(x, y, sw, sh);
             }
+            // A viewport does NOT clip — the oversized fullscreen triangle would still paint past the
+            // rectangle — so it is always paired with the scissor that does.
+            if let Some([x, y, sw, sh]) = into {
+                p.set_scissor_rect(x, y, sw, sh);
+                p.set_viewport(x as f32, y as f32, sw as f32, sh as f32, 0.0, 1.0);
+            }
             p.set_pipeline(pipeline);
             p.set_bind_group(0, &cam_bg, &[]); // exposure + presentation profile + encode selector
             p.set_bind_group(1, bg, &[]);
@@ -5473,34 +5662,38 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
         // The route is DATA, not control flow: `post_route` appends the final resolve by construction, so
         // no combination of SSAO/bloom can produce a frame that misses it — and the test module asserts
         // exactly that for all four combinations, which an `if`/`else` chain could not be held to.
-        let (route, route_len) = post_route(targets.ssao_bg.is_some(), targets.bloom.is_some());
+        let (route, route_len) =
+            post_route(draw_targets.ssao_bg.is_some(), draw_targets.bloom.is_some());
         for &pass in &route[..route_len] {
             let resolved = match pass {
                 // SSAO (HDR → HDR): reads `scene_raw` + the scene depth, reconstructs positions from the
                 // camera uniform, and writes occlusion-attenuated LINEAR radiance into `hdr_scene`.
-                PostPass::Ssao => targets
+                PostPass::Ssao => draw_targets
                     .ssao_bg
                     .as_ref()
-                    .map(|bg| (pass.label(), &targets.hdr_scene, &ssao_pipeline, bg)),
+                    .map(|bg| (pass.label(), &draw_targets.hdr_scene, &ssao_pipeline, bg)),
                 // Bloom (HDR → HDR): bright-pass → separable Gaussian (H then V). It does NOT composite;
                 // the final resolve adds it, so bloom cannot be applied after tone mapping.
-                PostPass::BloomBright => targets
+                PostPass::BloomBright => draw_targets
                     .bloom
                     .as_ref()
                     .map(|b| (pass.label(), &b.a, &bright_pipeline, &b.bg_bright)),
-                PostPass::BloomBlurH => targets
+                PostPass::BloomBlurH => draw_targets
                     .bloom
                     .as_ref()
                     .map(|b| (pass.label(), &b.b, &blur_h_pipeline, &b.bg_blur_h)),
-                PostPass::BloomBlurV => targets
+                PostPass::BloomBlurV => draw_targets
                     .bloom
                     .as_ref()
                     .map(|b| (pass.label(), &b.a, &blur_v_pipeline, &b.bg_blur_v)),
                 // THE final resolve — the one pass that writes the swapchain, and the one place exposure,
                 // tone mapping and the display transfer function are applied.
-                PostPass::Resolve => {
-                    Some((pass.label(), &view, &resolve_pipeline, &targets.resolve_bg))
-                }
+                PostPass::Resolve => Some((
+                    pass.label(),
+                    draw_view,
+                    &resolve_pipeline,
+                    &draw_targets.resolve_bg,
+                )),
             };
             let Some((label, target, pipeline, bg)) = resolved else {
                 continue;
@@ -5510,7 +5703,23 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             } else {
                 None
             };
-            fullscreen(label, target, pipeline, bg, scissor);
+            fullscreen(label, target, pipeline, bg, scissor, None);
+        }
+        // ADR-177 — THE FINAL RESOLVE, A SECOND TIME, INTO THE WINDOW.
+        //
+        // Not a blit of the file's pixels: the same tone map over the same HDR scene, sampled down into
+        // the composed hole. Copying the resolved texture would have run the output transform twice and
+        // shown the author a picture the file does not contain — the one bug a "preview" of a render is
+        // actually capable of. Costs one fullscreen pass, and only while a render at another size runs.
+        if let (Some(rect), Some(window)) = (preview_rect, window_view.as_ref()) {
+            fullscreen(
+                "final-resolve-preview",
+                window,
+                &resolve_pipeline,
+                &draw_targets.resolve_bg,
+                None,
+                Some(rect),
+            );
         }
         queue.submit([enc.finish()]);
         // ADR-175 — KEEP THIS FRAME, if anybody asked for it while it was being drawn.
@@ -5537,10 +5746,19 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
             };
             if !due.is_empty() {
                 let rect = capture_rect;
-                let captured = if can_capture {
-                    capture_presented_frame(&device, &queue, &frame.texture, format, rect)
-                } else {
-                    Err("this graphics adapter does not allow the viewport to be copied, so a frame cannot be written to a file".to_string())
+                // ADR-177 — an offscreen render reads back ITS OWN colour target, which is created with
+                // `COPY_SRC` unconditionally. Only the swapchain path depends on the adapter allowing
+                // its surface to be copied, and only that path has to refuse.
+                let captured = match offscreen.as_ref() {
+                    Some(o) => capture_presented_frame(&device, &queue, &o.color, format, rect),
+                    None if can_capture => {
+                        let surface_texture = &frame
+                            .as_ref()
+                            .expect("the window path always acquires a frame")
+                            .texture;
+                        capture_presented_frame(&device, &queue, surface_texture, format, rect)
+                    }
+                    None => Err("this graphics adapter does not allow the viewport to be copied, so a frame cannot be written to a file".to_string()),
                 };
                 let mut st = shared.lock().unwrap();
                 for request in due {
@@ -5567,7 +5785,9 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 st.frame_results.drain(0..excess);
             }
         }
-        frame.present();
+        if let Some(frame) = frame {
+            frame.present();
+        }
 
         let cpu_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
         acc_ms += cpu_ms;
@@ -6019,6 +6239,65 @@ struct Targets {
     bloom: Option<BloomTargets>,
     /// The final resolve's group-1 input: sampler + `hdr_scene` + (bloom result | 1×1 black).
     resolve_bg: wgpu::BindGroup,
+}
+
+/// ADR-177 — the picture's OWN targets, for a render at a size the window is not.
+///
+/// The whole chain at the chosen size — depth, MSAA, the HDR scene, the SSAO copy, the bloom
+/// ping-pong — plus the colour texture the final resolve writes and the capture reads. Built by
+/// [`Targets::create`], the same constructor the window's chain goes through, so there is no second
+/// definition of what a frame is made of and no way for the file's route to drift from the viewport's.
+///
+/// It also removes the one failure a swapchain capture could not avoid: a minimised or occluded window
+/// stops vending swapchain textures, and these are vended by nothing.
+struct Offscreen {
+    /// What it was built for. Rebuilt only when this changes.
+    size: (u32, u32),
+    /// The final resolve's destination — `COPY_SRC`, because the capture reads it straight back.
+    color: wgpu::Texture,
+    view: wgpu::TextureView,
+    targets: Targets,
+}
+
+impl Offscreen {
+    /// `targets` is built by the CALLER, with [`Targets::create`] and the same concrete layouts the
+    /// window's chain is built from.
+    ///
+    /// Not forwarded through here, though that would read better: `gpu-contract-audit` resolves a bind
+    /// group's layout by following the value back to where it was created, and a second function
+    /// passing the same parameter along makes that chain unresolvable — three bind groups went from
+    /// checked to "UNCHECKED, not clean" the moment this constructor took them. The audit is right to
+    /// say so, and the fix is to not add the hop.
+    fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        (w, h): (u32, u32),
+        targets: Targets,
+    ) -> Self {
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("render-output"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // The SWAPCHAIN's format, so the one resolve pipeline writes both this and the window with
+            // no second variant and no second output transform.
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            size: (w, h),
+            color,
+            view,
+            targets,
+        }
+    }
 }
 
 impl Targets {
@@ -9371,6 +9650,105 @@ mod tests {
         assert!(h < 0.836, "and the bars are real: {h}");
         st.delivery_aspect = None;
         assert_eq!(st.composition_rect(), st.adopted_visible_rect());
+    }
+
+    // ── ADR-177: a render at a size the window is not ────────────────────────────────────────────
+
+    /// The state a render job puts the viewport in: a scope cutscene holding the camera, on a stage
+    /// with both docks open. Everything below is the difference between drawing THAT into the window
+    /// and drawing it into a target of its own.
+    fn cutscene_on_a_docked_stage() -> SceneState {
+        let mut st = docked_scene();
+        st.visible_rect = [0.369, 0.104, 0.395, 0.836];
+        st.surface_aspect = 1296.0 / 839.0;
+        st.delivery_aspect = Some(2.39);
+        st.cam_override = Some(CamView {
+            pos: [0.0, 2.0, 8.0],
+            look_at: Some([0.0, 1.0, 0.0]),
+            fov_deg: 50.0,
+            near: 0.1,
+            far: 400.0,
+        });
+        st
+    }
+
+    #[test]
+    fn a_render_at_its_own_size_is_composed_for_the_whole_target_and_has_no_bars() {
+        let st = cutscene_on_a_docked_stage();
+        // The offscreen target was BUILT at the delivery shape, so the picture is all of it.
+        let out = 2582.0 / 1080.0;
+        let frame = st.drawn_frame(true, out);
+        assert_eq!(frame.rect(), [0.0, 0.0, 1.0, 1.0]);
+        assert!(
+            (frame.aspect() - out).abs() < 1.0e-4,
+            "and its shape is the target's: {}",
+            frame.aspect()
+        );
+        // NO BARS. A file with them baked in is a file nothing downstream can re-frame — and there is
+        // nothing for them to be the difference between, because the target is already the frame.
+        assert_eq!(st.drawn_letterbox(true, &frame, 2582, 1080), None);
+        // The whole texture is what gets written.
+        assert_eq!(frame_pixels(frame.rect(), 2582, 1080), [0, 0, 2582, 1080]);
+    }
+
+    #[test]
+    fn the_window_path_is_exactly_what_it_was_before_a_size_could_be_chosen() {
+        // NEGATIVE CONTROL, and the one that matters most: the assertions above are only interesting
+        // if the other branch still insets, still letterboxes and still crops.
+        let st = cutscene_on_a_docked_stage();
+        let stage = st.known_surface_aspect();
+        let frame = st.drawn_frame(false, stage);
+        assert_eq!(frame.rect(), st.composition_rect());
+        assert_ne!(
+            frame.rect(),
+            [0.0, 0.0, 1.0, 1.0],
+            "the docks are still there"
+        );
+        assert!(
+            (frame.aspect() - 2.39).abs() < 1.0e-3,
+            "and it is still composed for scope: {}",
+            frame.aspect()
+        );
+        let bars = st
+            .drawn_letterbox(false, &frame, 1296, 839)
+            .expect("a scope cutscene on a 1.55 stage letterboxes");
+        assert_eq!(bars, frame_pixels(frame.rect(), 1296, 839));
+        assert!(bars[1] > 0 && bars[3] < 839, "and they are real: {bars:?}");
+    }
+
+    #[test]
+    fn the_two_paths_compose_the_same_picture_at_different_sizes() {
+        // THE PROPERTY THE WHOLE PASS RESTS ON. A 1080-line render out of a 400-pixel stage is only
+        // worth anything if it is the SAME SHOT — the same lens, the same framing — at more pixels.
+        // Both frames are 2.39:1, so both projections have the same field of view; only the sampling
+        // rate differs.
+        let st = cutscene_on_a_docked_stage();
+        let window = st.drawn_frame(false, st.known_surface_aspect());
+        let offscreen = st.drawn_frame(true, 2582.0 / 1080.0);
+        assert!(
+            (window.aspect() - offscreen.aspect()).abs() < 1.0e-3,
+            "{} vs {}",
+            window.aspect(),
+            offscreen.aspect()
+        );
+        // …and the same subject lands in the same place in each. Projected through both frames from
+        // ONE camera — stated here rather than read off the state, because a `SceneState` that has
+        // never framed anything has `distance == 0`, and a camera standing inside its own target
+        // projects to NaN rather than to a wrong answer.
+        let centre = Vec3::new(3.0, 1.0, -2.0);
+        for (label, frame) in [("window", window), ("offscreen", offscreen)] {
+            let vp = camera_matrix_with(0.7, 0.3, 25.0, frame, centre, st.projection);
+            let clip = vp * centre.extend(1.0);
+            let ndc = clip.truncate() / clip.w;
+            let (sx, sy) = ((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5);
+            let [x, y, fw, fh] = frame.rect();
+            assert!(
+                (sx - fw.mul_add(0.5, x)).abs() < 2.0e-3
+                    && (sy - fh.mul_add(0.5, y)).abs() < 2.0e-3,
+                "{label}: the look-at landed at ({sx}, {sy}), not the centre of {:?}",
+                frame.rect()
+            );
+        }
     }
 
     #[test]

@@ -2171,10 +2171,14 @@ export interface RenderReply {
   frames: number;
   /** How many files exist on disk so far. */
   written: number;
-  /** The pixel size the frames are written at, from the first one actually captured. `0` until then —
-   *  a size guessed from the window would be a claim the files may not honour. */
+  /** The pixel size the frames are written at: measured from the first captured frame, or — for a
+   *  render at a chosen output height (ADR-177) — the size the renderer was instructed to draw at,
+   *  which is known before the first frame. `0` until whichever applies. */
   width: number;
   height: number;
+  /** ADR-177 — whether the frames are drawn into targets of their own rather than read off the window.
+   *  Changes what is true about the render: an offscreen one does not need the window in front. */
+  offscreen: boolean;
   fps: number;
   /** The span of the cutscene clock being filmed. */
   seconds: number;
@@ -2193,6 +2197,14 @@ export interface RenderReply {
 
 /** What a render is asked to film: the whole cut, or one shot of it. `null` is the whole cut. */
 export type RenderScopeIndex = number | null;
+
+/** ADR-177 — the output height a render is asked for. `null` is "whatever the window makes it".
+ *
+ *  A HEIGHT AND NOT A SIZE. The width is the delivery frame's own aspect times this, worked out by
+ *  `render_frame_size` in the engine, so a 2.39:1 cut and a 9:16 one both get their right shape from
+ *  one number and nobody can ask for a size the shot was not composed for. The engine states the four
+ *  it offers in `RENDER_HEIGHTS` and refuses anything else by name. */
+export type RenderHeight = number | null;
 
 export interface ConditionSpec {
   kind: string;

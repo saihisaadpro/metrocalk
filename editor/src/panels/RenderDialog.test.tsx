@@ -73,7 +73,7 @@ describe("RenderDialog", () => {
     // The dialog asks; it does not multiply. The arguments matter as much as the answer: a dialog
     // that asked about the whole cut and then rendered one shot would show an honest number about
     // the wrong thing. `null` is the whole cut, which is what it opens on even with a shot selected.
-    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 24, null));
+    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 24, null, 1080));
     // 12.5s of cut at 24 fps — the fixture's own arithmetic, echoed onto the button that pays it.
     await waitFor(() =>
       expect(screen.getByTestId("render-start").textContent).toMatch(/Render 300 frames/),
@@ -87,7 +87,7 @@ describe("RenderDialog", () => {
       expect(screen.getByTestId("render-start").textContent).toMatch(/Render 300 frames/),
     );
     fireEvent.change(screen.getByTestId("render-fps"), { target: { value: "60" } });
-    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 60, null));
+    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 60, null, 1080));
     await waitFor(() =>
       expect(screen.getByTestId("render-start").textContent).toMatch(/Render 750 frames/),
     );
@@ -95,12 +95,12 @@ describe("RenderDialog", () => {
 
   it("narrows to one shot when the scope says so, and renders THAT one", async () => {
     const { client } = open();
-    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 24, null));
+    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 24, null, 1080));
     fireEvent.change(screen.getByTestId("render-scope"), { target: { value: "shot" } });
-    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 24, 1));
+    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 24, 1, 1080));
     fireEvent.click(await screen.findByTestId("render-start"));
     await waitFor(() =>
-      expect(client.cinemaRenderStart).toHaveBeenCalledWith("e1", 24, 1, "Skid Weld Line"),
+      expect(client.cinemaRenderStart).toHaveBeenCalledWith("e1", 24, 1, "Skid Weld Line", null, 1080),
     );
   });
 
@@ -132,7 +132,9 @@ describe("RenderDialog", () => {
     fireEvent.click(await screen.findByTestId("render-start"));
     const ledger = await screen.findByTestId("render-ledger", undefined, { timeout: 4000 });
     await waitFor(() => expect(screen.getByTestId("render-ledger-frames").textContent).toContain("60"));
-    expect(ledger.textContent).toMatch(/1920×803/);
+    // 1080 x 2.39 = 2582 wide — the size the dialog ASKED for, not the size of the stage. Before
+    // ADR-177 this assertion read 1920x803, which was the window.
+    expect(ledger.textContent).toMatch(/2582×1080/);
     expect(screen.getByTestId("render-ledger-folder").textContent).toContain("C:/renders/skid-weld-line");
     // The options are GONE. A finished render that left the form above its result would be asking a
     // question the reader has stopped having.
@@ -150,6 +152,7 @@ describe("RenderDialog", () => {
         written: 0,
         width: 0,
         height: 0,
+        offscreen: false,
         fps: 24,
         seconds: 0,
         folder: "",
@@ -200,6 +203,80 @@ describe("RenderDialog", () => {
     expect(screen.queryByTestId("render-start")).toBeNull();
     // ...and the author is not held hostage by it: the dialog can be put away while it runs.
     expect(screen.getByTestId("render-hide")).toBeTruthy();
+  });
+
+  // ── ADR-177: the size the files are written at ────────────────────────────────────────────────
+
+  it("opens on a delivery size rather than on whatever the window happens to be", async () => {
+    // THE DEFAULT IS THE POINT. This dialog shipped writing every sequence at the size of the stage,
+    // which on a laptop with both docks open is around 400 lines — a film nobody can use, produced by
+    // a dialog that never asked. The offer it opens on is now a delivery format.
+    const { client } = open();
+    const size = (await screen.findByTestId("render-size")) as HTMLSelectElement;
+    expect(size.value).toBe("1080");
+    // ...and "the stage" is still there, because it is the right answer for a quick look.
+    expect(Array.from(size.options).map((o) => o.value)).toEqual([
+      "viewport",
+      "720",
+      "1080",
+      "1440",
+      "2160",
+    ]);
+    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 24, null, 1080));
+  });
+
+  it("re-asks the engine when the size changes, and states the pixels it answered", async () => {
+    // The width is NEVER computed here. 2160 x 2.39 = 5162, and the only way this string can appear
+    // is the engine having been asked and its answer rendered — which is what makes the size above the
+    // button the size in the file.
+    const { client } = open();
+    await waitFor(() =>
+      expect(screen.getByTestId("render-cost").textContent).toMatch(/2582x1080/),
+    );
+    fireEvent.change(screen.getByTestId("render-size"), { target: { value: "2160" } });
+    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 24, null, 2160));
+    await waitFor(() =>
+      expect(screen.getByTestId("render-cost").textContent).toMatch(/5162x2160/),
+    );
+    // The frame COUNT is unchanged by a size — a render is the same film at a different resolution,
+    // and a dialog that re-planned the frames would be saying otherwise.
+    expect(screen.getByTestId("render-start").textContent).toMatch(/Render 300 frames/);
+  });
+
+  it("renders at the size that was chosen, and says so while it runs", async () => {
+    const { client } = open();
+    fireEvent.change(await screen.findByTestId("render-size"), { target: { value: "720" } });
+    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 24, null, 720));
+    fireEvent.click(screen.getByTestId("render-start"));
+    await waitFor(() =>
+      expect(client.cinemaRenderStart).toHaveBeenCalledWith(
+        "e1",
+        24,
+        null,
+        "Skid Weld Line",
+        null,
+        720,
+      ),
+    );
+    // A size the renderer was GIVEN is known before the first frame, so the progress line carries it
+    // from the start rather than reading `0x0` until a capture returns.
+    const progress = await screen.findByTestId("render-progress");
+    await waitFor(() => expect(progress.textContent).toMatch(/1722×720/));
+    // ...and the advice matches what is true of THIS render: an offscreen one does not need the
+    // window in front, and telling the author otherwise is a false warning.
+    expect(progress.textContent).toContain("covered or minimised");
+  });
+
+  it("keeps the old warning for a render that really does read the window", async () => {
+    // NEGATIVE CONTROL for the sentence above. "As on screen" is a swapchain capture: a minimised
+    // window genuinely stops producing frames, and the render genuinely stalls on it.
+    const { client } = open();
+    fireEvent.change(await screen.findByTestId("render-size"), { target: { value: "viewport" } });
+    await waitFor(() => expect(client.cinemaRenderPlan).toHaveBeenCalledWith("e1", 24, null, null));
+    fireEvent.click(screen.getByTestId("render-start"));
+    const progress = await screen.findByTestId("render-progress");
+    await waitFor(() => expect(progress.textContent).toContain("minimised window produces no frames"));
+    expect(progress.textContent).not.toContain("covered or minimised");
   });
 
   it("names the frame it is composed for, because that is what decides the shape of the files", async () => {
