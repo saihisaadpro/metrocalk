@@ -24,6 +24,7 @@ import {
 import { STAGE_MIN } from "../../src/app/layout";
 import { CommandPalette } from "../../src/panels/CommandPalette";
 import { ContextMenu } from "../../src/panels/ContextMenu";
+import { Hierarchy } from "../../src/panels/Hierarchy";
 import { selectionCommands } from "../../src/app/selectionCommands";
 import { StageMarquee } from "../../src/app/StageMarquee";
 import { BindingGraph } from "../../src/graph/BindingGraph";
@@ -1028,6 +1029,7 @@ export const SCENES: Scene[] = [
   ...assetScenes(),
   ...modelScenes(),
   ...selectionVerbScenes(),
+  ...outlinerFindScenes(),
   ...contextMenuScenes(),
   ...shellScenes(),
   ...selectionScenes(),
@@ -1638,20 +1640,22 @@ function selectionVerbScenes(): Scene[] {
     {
       id: "palette-selection",
       looking_for:
-        "the Selection group as a user meets it: four verbs under one heading, each with a " +
-        "plain-language description; `Select all` printing its own Ctrl A on the row, which is where a " +
-        "chord is learned; and the two that need a selection DISABLED with their reasons in words — " +
-        "`Nothing is selected`, `Select an object first` — rather than silently inert. What a reader " +
-        "checks: the four labels are distinguishable at a glance, no description wraps into its " +
-        "neighbour, and the disabled rows are legible rather than merely faded",
+        "the Selection group as a user meets it: five verbs under one heading, each with a " +
+        "plain-language description; `Find objects…` and `Select all` printing their own chords on the " +
+        "row, which is where a chord is learned; and the two that need a selection DISABLED with their " +
+        "reasons in words — `Nothing is selected`, `Select an object first` — rather than silently " +
+        "inert. What a reader checks: the five labels are distinguishable at a glance, no description " +
+        "wraps into its neighbour, the two chord badges sit on their own rows rather than colliding " +
+        "with the descriptions beside them, and the disabled rows are legible rather than merely faded",
       viewport: { width: 900, height: 560 },
       expect: {
         present: [
           ["[data-testid='command-palette']", 1],
-          ["[data-testid='command-palette'] [role='option']", 4],
+          ["[data-testid='command-palette'] [role='option']", 5],
         ],
         text_present: [
           "Selection",
+          "Find objects",
           "Select all",
           "Select none",
           "Invert selection",
@@ -1672,6 +1676,7 @@ function selectionVerbScenes(): Scene[] {
           commands={selectionCommands({
             apply: () => {},
             say: () => {},
+            find: () => {},
             // The state a fresh shell is in, which is when a user is most likely to be looking for
             // these — and therefore the state whose refusals have to be readable.
             hasSelection: false,
@@ -1679,6 +1684,138 @@ function selectionVerbScenes(): Scene[] {
           })}
         />
       ),
+    },
+  ];
+}
+
+/** THE LIST THAT COULD NAME A SET AND COULD NOT SELECT IT (ADR-185).
+ *
+ *  Two claims here are exactly the kind a capture answers and a unit test cannot. The first is whether
+ *  the chips READ as a vocabulary — five of them, wrapped inside a 340 px dock, each carrying a count
+ *  in a second treatment — or as a wall of small grey buttons a person scans past on the way to the
+ *  rows. The second is whether `Select all 6` reads as a verb on the result rather than as one more
+ *  chip: it is the control that turns a search into a selection, and if the eye does not find it, the
+ *  capability is exactly as unreachable as it was before it existed.
+ *
+ *  A vitest case already asserts every count, every token and every id. Only a picture says whether a
+ *  person meeting this panel for the first time learns that `kind:` is a thing they can type. */
+function outlinerFindScenes(): Scene[] {
+  // An industrial assembly at a believable mix — mostly one repeated part, a handful of lights, and a
+  // few of everything else. The digits matter: chips reading `171` and `2` side by side are what a
+  // reader is judging, not chips reading `3` and `2`.
+  const seedPlant = () => {
+    const rows: unknown[] = [];
+    for (let i = 0; i < 171; i += 1) {
+      rows.push({
+        id: `part-${i}`,
+        name: i % 3 === 0 ? "Bolt M12 — Hex Head, Zinc" : `Skid Frame Member ${i}`,
+        parentId: null,
+        components: { Transform: {}, MeshRenderer: { mesh: "mtkasset:bolt-m12" } },
+      });
+    }
+    for (let i = 0; i < 6; i += 1) {
+      rows.push({
+        id: `bay-light-${i}`,
+        name: `Bay Light ${i + 1}`,
+        parentId: null,
+        components: { Transform: {}, Light: { intensity: 60 } },
+      });
+    }
+    rows.push({ id: "cam-line", name: "Line Camera", parentId: null, components: { Transform: {}, Camera: {} } });
+    rows.push({ id: "cam-cell", name: "Cell Camera", parentId: null, components: { Transform: {}, Camera: {} } });
+    for (let i = 0; i < 5; i += 1) {
+      rows.push({
+        id: `drive-${i}`,
+        name: `Conveyor Drive ${i + 1}`,
+        parentId: null,
+        components: { Transform: {}, RigidBody: { mass: 40 }, MeshRenderer: { mesh: "mtkasset:drive" } },
+      });
+    }
+    rows.push({
+      id: "extractor",
+      name: "Extractor Fan",
+      parentId: null,
+      components: { Transform: {}, AudioSource: { gain: 0.4 } },
+    });
+    projectionStore.getState().bulkLoad(rows as never);
+  };
+
+  const outlinerClient = () =>
+    ({
+      selectEntities: (ids: string[]) => Promise.resolve(ids),
+      gizmoSelect: () => Promise.resolve(),
+      reparentPart: () => {},
+    }) as unknown as EditorClient;
+
+  // THE WIDTH THIS PANEL SHIPS IN, not a comfortable one. The left track is 340 px (`layout.ts`) and
+  // `.mtk-shell-track--left` spends 4 + 8 px of it on the shell gutter, so the card is 328 px and the
+  // panel fills it. A chip row photographed at 380 cannot wrap the way the shipped one wraps, and a
+  // scene that cannot fail the way the product fails is not evidence. The dock also gives the panel its
+  // HEIGHT: in an auto-height frame this list would be five rows under a caption about 185 objects.
+  const inDock = (children: ReactNode) => (
+    <div style={{ width: 328, height: 560, display: "flex", flexDirection: "column" }}>{children}</div>
+  );
+
+  return [
+    {
+      id: "outliner-find",
+      looking_for:
+        "the outliner as a user meets it on a 185-object import: a search box that says what else it " +
+        "accepts, and beneath it the kinds THIS scene contains, each with its count. What a reader " +
+        "checks: the five chips wrap inside the 340 px dock without clipping or overlapping, the " +
+        "count on each chip is distinguishable from its label rather than reading as part of the " +
+        "name, and the row of chips reads as a vocabulary to pick from rather than as five more " +
+        "buttons competing with the object rows below it",
+      width: 380,
+      expect: {
+        present: [
+          ["[data-testid='hierarchy']", 1],
+          ["[data-testid='scene-facets']", 1],
+          // Five kinds present, none of them the whole scene — the facets this scene can offer.
+          ["[data-testid='scene-facets'] [data-facet]", 5],
+          ["[data-facet='kind:mesh']", 1],
+          ["[data-facet='kind:light']", 1],
+          ["[data-facet='kind:camera']", 1],
+          ["[data-facet='kind:physics']", 1],
+          ["[data-facet='kind:audio']", 1],
+          // No verb yet, because nothing has been asked: the button appears with the result.
+          ["[data-testid='select-matches']", 0],
+        ],
+        text_present: ["185 entities", "Meshes", "171", "Lights", "Physics bodies", "Cameras", "Audio sources"],
+        text_absent: ["null", "undefined", "NaN"],
+        // A chip whose count ran outside the dock would still satisfy `text_present`, because
+        // `textContent` does not know where anything is.
+        unclipped: ["[data-testid='scene-facets']", "[data-testid='hierarchy']"],
+      },
+      setup: seedPlant,
+      render: () => inDock(<Hierarchy client={outlinerClient()} />),
+    },
+    {
+      id: "outliner-find-result",
+      looking_for:
+        "the same panel once a question has been asked — `kind:light` over 185 objects. What a reader " +
+        "checks: the header states 6 of 185 rather than only 6; the Lights chip is visibly PRESSED, " +
+        "so the way back out is the control that got you in; and `Select all 6` reads as a verb on " +
+        "the result rather than as a sixth chip — this is the control that turns a search into a " +
+        "selection every other verb in the editor already acts on, and if the eye does not find it " +
+        "the capability is as unreachable as it was before it existed",
+      width: 380,
+      type: [["input[aria-label='Search scene objects']", "kind:light"]],
+      expect: {
+        present: [
+          ["[data-testid='hierarchy'] [data-testid='hrow']", 6],
+          // The scope is a STRUCTURED signal, not copy — a test keyed on the sentence would break the
+          // first time the wording changed, and a wording change is not a scope change.
+          ["[data-testid='select-matches'][data-count='6']", 1],
+          ["[data-facet='kind:light'][aria-pressed='true']", 1],
+          ["[data-facet='kind:mesh'][aria-pressed='false']", 1],
+        ],
+        text_present: ["6 of 185 entities", "Select all 6", "Bay Light 1", "Bay Light 6"],
+        text_absent: ["null", "undefined", "NaN", "Bolt M12"],
+        unclipped: ["[data-testid='select-matches']", "[data-testid='scene-facets']"],
+      },
+      setup: seedPlant,
+      render: () => inDock(<Hierarchy client={outlinerClient()} />),
     },
   ];
 }
