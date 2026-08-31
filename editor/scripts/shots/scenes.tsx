@@ -609,6 +609,29 @@ const cutsceneClient = () =>
           : SUBJECT_CATALOG,
       ),
     cinemaList: () => Promise.resolve(CUTSCENE),
+    // ADR-190 - the render settings are a DOCUMENT EDIT, so a fixture that answers `cinemaList` and
+    // not this one is a client the dialog can read from and not write to. It reached the harness as a
+    // `console.error` on the LEDGER scene, which never touches a picker: starting a render adopts the
+    // folder the picker returned, and adopting is a commit. Echoing the request keeps the reply
+    // consistent with what the caller just asked for, which is what the engine does.
+    cinemaSetRender: (
+      entity: string,
+      format: "movie" | "sequence",
+      fps: number,
+      height: number | null,
+      name: string,
+      folder: string,
+    ) =>
+      Promise.resolve({
+        ...CUTSCENE,
+        entity,
+        render: { format, fps, height, name, folder },
+        message: `Delivering ${format === "movie" ? "Movie (MP4)" : "PNG sequence"} at ${height ?? "as on screen"}, ${fps} fps`,
+      }),
+    // A cancelled picker: no entity, no reason, nothing changed. The harness cannot open a native
+    // dialog, and a stub that pretended one had returned a path would photograph a state no click in
+    // this scene produced.
+    cinemaPickRenderFolder: () => Promise.resolve({ ...CUTSCENE, entity: null, message: "" }),
     // The pose a shot solver would answer with. A capture cannot show the wgpu frame — the harness
     // runs on a box with no GPU — so what is photographed here is the AUTHORING surface around it:
     // the toggle in its pressed state and the read-out naming the moment. The live composite is the
@@ -725,6 +748,27 @@ const renderingCutsceneClient = () =>
     },
     cinemaRenderStatus: () => Promise.resolve(RENDER_DONE),
     cinemaRenderCancel: () => Promise.resolve(RENDER_DONE),
+  }) as unknown as EditorClient;
+
+/** ADR-190 — the same cutscene with the five render answers ALREADY AUTHORED.
+ *
+ *  NOT ONE OF THEM IS A DEFAULT, and that is the entire point of the scene it feeds: before this pass
+ *  the dialog's four pickers were `useState` initialisers, so a fixture holding a stored answer and a
+ *  fixture holding nothing photographed the same dialog. The folder is the fifth, and it was never a
+ *  field at all — the operating system asked for it after the click. */
+const REMEMBERED_RENDER = {
+  format: "sequence" as const,
+  fps: 60,
+  height: 1440,
+  name: "weld-line-master",
+  folder: "D:/Deliveries/Skid Weld Line/2026-08-31 master",
+};
+
+const rememberedRenderClient = () =>
+  ({
+    ...renderingCutsceneClient(),
+    cinemaList: () =>
+      Promise.resolve({ ...CUTSCENE, delivery: "scope" as const, render: REMEMBERED_RENDER }),
   }) as unknown as EditorClient;
 
 /** The same client, one click further on: the render has finished and the dialog is its ledger. */
@@ -1407,6 +1451,84 @@ export const SCENES: Scene[] = [
       same_line: [["[data-testid='render-cancel']", "[data-testid='render-start']"]],
     },
     render: () => <CutscenePanel client={renderingCutsceneClient()} />,
+  },
+  {
+    id: "cutscene-render-remembered",
+    looking_for:
+      "THE DIALOG THAT REMEMBERS WHAT THIS CUT DELIVERS. ADR-190: every one of these answers used " +
+      "to be a `useState` seeded from a constant, re-asked on every single render - an author who " +
+      "had decided their cut delivers a 1440 scope sequence called 'weld-line-master' re-decided " +
+      "it, four controls at a time, every time, and none of the four survived closing the dialog. " +
+      "They live on the CUTSCENE now, beside its delivery frame, written as ordinary undoable " +
+      "commits and saved with the project. Compare this capture against 'cutscene-render', which " +
+      "is the same dialog over a cut nobody has answered for: THAT one opens on a movie at 1080 " +
+      "with an empty name, and this one opens on the sequence, 60 fps, 1440 and the stored name - " +
+      "because the document said so, not because this component did. " +
+      "The fifth answer is the one that was never a field at all: 'Where' was asked for by the " +
+      "operating system AFTER the click, and the only surface that ever named it was the ledger " +
+      "at the end - so a dialog whose whole argument is that the cost is stated before the button " +
+      "that pays it never stated the destination. Check that the row is there, that it names a " +
+      "real folder read from its END (a path identifies itself by its last segment, not its drive " +
+      "letter), and that 'Choose...' sits beside it. Check too that 'As on screen' IS offered " +
+      "here, because this cut delivers a SEQUENCE - the option is absent only while a movie is " +
+      "selected, which is ADR-182's refusal turned into a picker that cannot express it",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-render']"],
+    expect: {
+      present: [
+        ["[data-testid='render-dialog']", 1],
+        ["[data-testid='render-format']", 1],
+        ["[data-testid='render-fps']", 1],
+        ["[data-testid='render-size']", 1],
+        ["[data-testid='render-stem']", 1],
+        // ADR-190 - the destination, said before the click, for the first time.
+        ["[data-testid='render-folder']", 1],
+        ["[data-testid='render-folder-choose']", 1],
+        ["[data-testid='render-cost']", 1],
+        ["[data-testid='render-start']", 1],
+      ],
+      text_present: [
+        // The stored answers, on screen. The name is the one a person typed, not the object's.
+        "Where",
+        "2026-08-31 master",
+        "Remembered on this cut",
+        // ...and the cost sentence is computed FROM them: 13.3s at 60 fps is 798 frames, and 1440
+        // lines of a 2.39:1 delivery is 3442 wide. A dialog that painted the stored answers and then
+        // planned against the defaults would show 319 and 2582.
+        "798 frames",
+        "3442x1440",
+        "60 fps",
+        // ADR-182's refusal, expressed as a picker rather than a sentence: the stage IS offered while
+        // a sequence is selected, and disappears the moment a movie is. `cutscene-render` is the
+        // other half of that pair and asserts its ABSENCE over the same control.
+        "As on screen",
+      ],
+      text_absent: [
+        "null",
+        "undefined",
+        "NaN",
+        "0 frames",
+        // The defaults this cut is NOT on - the whole claim in three absences.
+        "319 frames",
+        "You'll be asked when you render",
+      ],
+      unclipped: [
+        "[data-testid='render-folder']",
+        "[data-testid='render-folder-choose']",
+        "[data-testid='render-start']",
+        "[data-testid='render-cost']",
+      ],
+      // The destination is a field like the others, above the cost that is above the button.
+      stacked: [
+        ["[data-testid='render-stem']", "[data-testid='render-folder']"],
+        ["[data-testid='render-folder']", "[data-testid='render-cost']"],
+      ],
+      // The path and the button that changes it are one row: a "Choose..." that wrapped below the
+      // path is the field having run out of width.
+      same_line: [["[data-testid='render-folder']", "[data-testid='render-folder-choose']"]],
+    },
+    render: () => <CutscenePanel client={rememberedRenderClient()} />,
   },
   {
     id: "cutscene-render-ledger",
@@ -2955,8 +3077,24 @@ const gameplayClient = (roster: RoleRow[] = []) =>
     roleStatus: () =>
       Promise.resolve({ roster, score: 0, scoreEntity: null, remaining: 0, companions: [], won: false, health: null, blocked: null }),
     cinemaCatalog: () => Promise.resolve(GAMEPLAY_SHOTS),
+    // THE WHOLE REPLY SHAPE, and not the fields this scene happens to read. It is cast through
+    // `unknown`, so nothing type-checks it, and a stub short of a field the panel reads is a
+    // `TypeError` in the page rather than a compile error here: `rows` and `render` were both absent
+    // and `cut.rows.length` took the whole harness down with `undefined`.
     cinemaList: () =>
-      Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: null }),
+      Promise.resolve({
+        entity: null,
+        shots: 0,
+        seconds: 0,
+        mood: "normal",
+        delivery: "viewport",
+        render: DEFAULT_RENDER_SETTINGS,
+        reads: [],
+        rows: [],
+        problems: [],
+        message: "",
+        reason: null,
+      } satisfies CinemaReply),
     cameraProbe: () => Promise.resolve({ eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 45, cinematic: false, distance: 0 }),
     vfxCatalog: () => Promise.resolve(GAMEPLAY_EFFECTS),
     vfxList: () => Promise.resolve({ entity: null, layers: 0, particles: 0, reads: [], problems: [], message: "", reason: null }),

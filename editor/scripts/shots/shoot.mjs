@@ -252,9 +252,42 @@ function installFingerprint() {
     const sel = 'button, a[href], input, select, textarea, [role="button"]';
     const rows = [...frame.querySelectorAll(sel)].map((el) => {
       const r = el.getBoundingClientRect();
-      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
+      // HEIGHT AS WELL AS THE OTHER THREE, and it is not symmetry. The failure this was missing is a
+      // dock whose `height` is mid-transition while every control inside it is momentarily at the
+      // same left/top/width — which is most of a 180 ms ease, because a box growing downwards from a
+      // fixed bottom edge moves its own top and leaves its children's tops where they were relative
+      // to it for whole frames at a time.
+      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)},${Math.round(r.height)}`;
     });
-    return `${Math.round(box.width)}×${Math.round(box.height)}|${rows.length}|${rows.join(" ")}`;
+    // THE PANELS THAT HAVE NO CONTROLS IN THEM ARE STILL MOVING. A dock, a disclosure and a sheet all
+    // animate a box that may contain nothing focusable at all while it opens, and a fingerprint built
+    // only from controls is blind to exactly that stretch. These are the boxes whose size the
+    // invariants below actually measure.
+    const boxes = [...frame.querySelectorAll("[data-testid]")].map((el) => {
+      const r = el.getBoundingClientRect();
+      return `${el.getAttribute("data-testid")}:${Math.round(r.width)}x${Math.round(r.height)}`;
+    });
+    // ...AND THE BROWSER'S OWN ANSWER TO "IS ANYTHING STILL ANIMATING". Two identical readings can
+    // both be taken during a pause in a sequence — a transition that has not started because its
+    // lazily-loaded content is still being fetched, and then starts. `getAnimations()` says so
+    // directly rather than being inferred from two samples, and it costs one call.
+    let running = 0;
+    try {
+      running = document.getAnimations().filter((a) => {
+        if (a.playState !== "running") return false;
+        // ONLY THE ONES THAT WILL END. A spinner and an indeterminate progress bar are `iterations:
+        // Infinity` by design, and waiting for them is waiting forever: the first version of this
+        // line took the whole suite down with "the layout never settled" on the first scene that
+        // draws one. A layout settling is a question about transitions and one-shot animations —
+        // the box moving INTO place — and a thing that is deliberately still moving when it gets
+        // there is not that.
+        const iterations = a.effect?.getTiming?.().iterations;
+        return iterations !== Infinity;
+      }).length;
+    } catch {
+      running = 0; // an engine without the API is no worse off than before this line existed
+    }
+    return `${Math.round(box.width)}×${Math.round(box.height)}|anim:${running}|${rows.length}|${rows.join(" ")}|${boxes.join(" ")}`;
   };
 }
 
@@ -269,7 +302,9 @@ function installFingerprint() {
  *
  *  `QUIET_MS` is longer than the 180 ms `--mtk-motion-base` used by the disclosure and dock
  *  transitions, so a section mid-open cannot read as settled between two frames of its own
- *  animation. */
+ *  animation. That was not sufficient on its own — see the bar in `settle` and the fingerprint it
+ *  reads, both of which were widened after `shell-dock-model` was measured failing 4 of 6 runs on a
+ *  tree nobody had changed. */
 const QUIET_MS = 220;
 const SETTLE_MS = 5000;
 
@@ -278,7 +313,13 @@ async function settle(page) {
   let previous = null;
   for (;;) {
     const now = await page.evaluate(() => window.__mtkFingerprint());
-    if (now === previous) return;
+    // TWO IDENTICAL READINGS **AND** NOTHING RUNNING. Either alone is a coin flip: two readings can
+    // straddle a pause, and an animation count of zero is true for the whole gap between a click and
+    // the transition its lazily-mounted content triggers. `shell-dock-model` failed 4 of 6 runs on an
+    // unmodified tree with the two-reading bar alone — measured, after a single-run "bisect" had
+    // blamed a nine-line accessibility change and a container query in turn, which is what a flaky
+    // gate costs the next person to read it.
+    if (now === previous && now.includes("|anim:0|")) return;
     if (Date.now() - started > SETTLE_MS) {
       throw new Error(
         `the layout never settled: it was still moving ${SETTLE_MS} ms after the scene reached its ` +

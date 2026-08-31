@@ -66,8 +66,11 @@ const HEIGHTS = [
  *  MOVIE, in its own sentence, on a machine or at a size whose H.264 encoder will not take it, which
  *  is the one refusal a sequence never has. */
 const FORMATS = [
-  { value: "movie", label: "Movie — one MP4 file" },
-  { value: "sequence", label: "PNG sequence — one file per frame" },
+  // NAMES, NOT SENTENCES — the same words `RenderFormat::label()` uses, and for the same reason: the
+  // `help` line under this control already says what each one costs, and the longer labels these
+  // replace did not fit the picker. See that function for what the author actually read.
+  { value: "movie", label: "Movie (MP4)" },
+  { value: "sequence", label: "PNG sequence" },
 ] as const;
 
 
@@ -201,12 +204,6 @@ export function RenderDialog({
     // looking at right now. A dialog that reopened on "shot 3 only" a week later would render two
     // seconds of a film and say it had rendered the film.
     setScope("cut");
-    // ADR-190 — THE DOCUMENT'S ANSWERS, not four constants. `cut` is the reply the panel above is
-    // already holding, so these are settled before the first paint rather than arriving after it.
-    setFps(cut.render.fps);
-    setSizeChoice(sizeValueOf(cut.render));
-    setFormat(cut.render.format);
-    setStem(cut.render.name);
     let live = true;
     void client
       .cinemaRenderStatus()
@@ -219,10 +216,32 @@ export function RenderDialog({
     return () => {
       live = false;
     };
-    // `cut.render` and not `cut`: this effect SEEDS the draft, and re-running it on every reply would
-    // reset the author's half-made choice each time an unrelated cinematics edit refreshed the cut.
+    // OPENING ONLY, and this separation is a defect repair rather than tidiness. While the seeding
+    // below shared this effect, its `cut.render` dependency dragged the job with it: adopting the
+    // folder a picker returned changes `cut`, which re-ran this, which read a FINISHED job's status
+    // and set it to `null` — so the ledger the author had just earned ("Rendered 319 frames … into
+    // …") was wiped and the settings form came back over it. That is exactly the "where did my film
+    // go" the ledger exists to answer, caused by the code that answers it.
+  }, [open, client]);
+
+  // ADR-190 — THE DOCUMENT'S ANSWERS, not four constants. `cut` is the reply the panel above is
+  // already holding, so these are settled before the first paint rather than arriving after it.
+  //
+  // KEYED ON THE VALUES AND NOT ON THE OBJECT. Every `cinema_list` reply is freshly deserialised, so
+  // `cut.render` is a new identity on every refresh even when nothing about it changed — and an
+  // effect keyed on that identity resets a half-typed name each time an unrelated cinematics edit
+  // lands. A signature re-seeds when an answer actually moves, which is also what makes an undo
+  // arriving while this dialog is open move the pickers with it.
+  const storedRender = `${cut.render.format}|${cut.render.fps}|${cut.render.height ?? "viewport"}|${cut.render.name}`;
+  useEffect(() => {
+    if (!open) return;
+    setFps(cut.render.fps);
+    setSizeChoice(sizeValueOf(cut.render));
+    setFormat(cut.render.format);
+    setStem(cut.render.name);
+    // `storedRender` IS `cut.render`, flattened — see above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, client, cut.render]);
+  }, [open, storedRender]);
 
   // THE COST, FROM THE ENGINE. Asked again whenever the choice changes, because the frame count is
   // `plan_render`'s answer and not this component's arithmetic — the same function the job runs, so

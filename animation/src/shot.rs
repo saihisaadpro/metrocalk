@@ -342,11 +342,19 @@ impl RenderFormat {
     }
 
     /// What a user calls it.
+    ///
+    /// A NAME AND NOT A SENTENCE. These are the words a picker draws, and the picker sits in a
+    /// three-column field grid beside a help line that already says what the format costs -- so a
+    /// label carrying the explanation too is the stutter ADR-175 found in the render ledger, and it
+    /// was one worse than that: `PNG sequence -- one file per frame` does not fit the control, so the
+    /// engine's own vocabulary reached the author as `PNG sequence - one file per fran`. A `<select>`
+    /// clips its option text natively, inside its own box, which is why no `unclipped` claim over
+    /// that control could see it and only the capture did.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Movie => "Movie -- one MP4 file",
-            Self::Sequence => "PNG sequence -- one file per frame",
+            Self::Movie => "Movie (MP4)",
+            Self::Sequence => "PNG sequence",
         }
     }
 

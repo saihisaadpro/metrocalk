@@ -578,6 +578,76 @@ describe("RenderDialog", () => {
     expect(onSettingsSaved.mock.calls.at(-1)?.[1]).toBe(false);
   });
 
+  it("keeps the finished ledger when the panel above adopts the folder it just remembered", async () => {
+    // THE DEFECT THIS LOCKS, found by a CAPTURE and not by an assertion. Adopting the picker's folder
+    // hands a new `CinemaReply` up to `CutscenePanel`, which sets it, which re-renders this dialog
+    // with a NEW `cut` — and while the seeding effect carried `cut.render` in its dependency list, that
+    // re-render also re-read `cinemaRenderStatus`, found a job that was finished rather than running,
+    // and set the job to `null`. The ledger naming where the film went vanished the instant the film
+    // was written, and the settings form came back over it.
+    //
+    // Every other test in this file passes a FIXED `cut` prop, which is why none of them could see it:
+    // the panel's own re-render is the whole mechanism.
+    const client = fakeClient();
+    const onSettingsSaved = vi.fn();
+    const props = {
+      open: true,
+      onClose: vi.fn(),
+      client,
+      entity: "e1",
+      name: "Skid Weld Line",
+      cut: CUT,
+      activeShotIndex: 1,
+      deliveryLabel: "2.39:1 scope",
+      onSettingsSaved,
+    };
+    const { rerender } = render(<RenderDialog {...props} />);
+
+    fireEvent.click(await screen.findByTestId("render-start"));
+    await screen.findByTestId("render-ledger", undefined, { timeout: 4000 });
+
+    // The adoption the dialog itself asked for, played back the way the panel plays it back.
+    await waitFor(() => expect(onSettingsSaved).toHaveBeenCalled());
+    const adopted = onSettingsSaved.mock.calls.at(-1)?.[0] as CinemaReply;
+    expect(adopted.render.folder).toBe("C:/renders/skid-weld-line");
+    rerender(<RenderDialog {...props} cut={adopted} />);
+
+    // STILL THERE. And still naming the file, which is the whole answer to "where is my film".
+    expect(await screen.findByTestId("render-ledger")).toBeTruthy();
+    expect(screen.getByTestId("render-ledger-files").textContent).toBe("Skid Weld Line.mp4");
+    expect(screen.queryByTestId("render-fps")).toBeNull();
+  });
+
+  it("re-seeds a picker when the stored answer really changes, and not when a reply is merely fresh", async () => {
+    // The other half of the same repair. A `cinema_list` reply is deserialised anew every time, so
+    // `cut.render` is a new object on every refresh; an effect keyed on that identity resets a
+    // half-typed name whenever an unrelated cinematics edit lands. Keyed on the VALUES, a refresh
+    // carrying the same answers changes nothing — and an undo that really moves one moves the picker.
+    const props = {
+      open: true,
+      onClose: vi.fn(),
+      client: fakeClient(),
+      entity: "e1",
+      name: "Skid Weld Line",
+      cut: CUT,
+      activeShotIndex: 1,
+      deliveryLabel: "2.39:1 scope",
+      onSettingsSaved: vi.fn(),
+    };
+    const { rerender } = render(<RenderDialog {...props} />);
+    const stem = await screen.findByTestId("render-stem");
+
+    fireEvent.change(stem, { target: { value: "half-typed-nam" } });
+    // A REFRESH WITH THE SAME ANSWERS, new object identity throughout.
+    rerender(<RenderDialog {...props} cut={{ ...CUT, render: { ...CUT.render } }} />);
+    expect((stem as HTMLInputElement).value).toBe("half-typed-nam");
+
+    // ...and an answer that actually moved — an undo landing while the dialog is open.
+    rerender(<RenderDialog {...props} cut={{ ...CUT, render: { ...CUT.render, fps: 60, name: "weld-line-master" } }} />);
+    await waitFor(() => expect((screen.getByTestId("render-fps") as HTMLSelectElement).value).toBe("60"));
+    expect((screen.getByTestId("render-stem") as HTMLInputElement).value).toBe("weld-line-master");
+  });
+
   it("stores what the folder picker returned, as one undoable change", async () => {
     const { client, onSettingsSaved } = open();
     fireEvent.click(await screen.findByTestId("render-folder-choose"));
