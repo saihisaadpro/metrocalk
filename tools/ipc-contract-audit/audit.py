@@ -134,6 +134,13 @@ RUST_TREES = (
     ("editor-shell", "src"),
     ("editor-shell", "src-tauri", "src"),
     ("core", "src"),  # `CatalogSearch` and friends: a reply type can come from any crate the shell re-exports
+    # THE SHOT VOCABULARY, and a blind spot proved before it was closed. `CinemaReply.rows[].size`
+    # is `metrocalk_animation::shot::ShotSize`, declared two crates away, so the `variants` check had
+    # no Rust side to compare the `ShotSize` string union against — and renaming `"extreme_wide"` to
+    # `"extremeWide"` in `protocol.ts` left this gate at `0 blocking` and never named the type.
+    # A reply type really can come from any crate; the tree list is the statement of which ones, and
+    # it was three commits behind the code.
+    ("animation", "src"),
 )
 # Files that CALL invoke. Splitting this from the type sources keeps a stray `.invoke(` in a test
 # helper from being read as production UI.

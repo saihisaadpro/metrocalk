@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildCalmShotAssignments,
+  CONTEXT_FRAMED_KINDS,
   buildKeysForProfile,
   buildRevolutionKeys,
   chooseFilmedSubjects,
@@ -196,10 +197,17 @@ test("the film opens on the whole assembly and pulls back out to it at the end",
     { kind: "pullback", subject: assemblyId },
   ], "leave the last mechanism by pulling back out to the whole factory");
 
-  // Exactly two shots may frame the assembly; the middle of the film stays on its mechanisms.
+  // The middle of the film stays on its MECHANISMS, at every framing a mechanism can carry.
+  //
+  // This used to require exactly two assembly-framed shots and that no middle subject framed anything
+  // but itself. The second half of that was the defect, not the guarantee: it also required a small part
+  // to carry `vista` and `birdseye`, framings that stand the camera far enough back to make a motor a
+  // speck on an empty floor. What must hold is that no shot of a MECHANISM was taken from the plant —
+  // i.e. every non-wide card still frames its own subject.
   const onAssembly = assignments.flatMap(({ kinds }) => kinds).filter(({ subject }) => subject === assemblyId);
-  assert.equal(onAssembly.length, 2);
-  assert.ok(assignments.slice(1, -1).every(({ id, kinds }) => kinds.every(({ subject }) => subject === id)));
+  assert.ok(onAssembly.length >= 2, `${onAssembly.length} assembly-framed shots`);
+  assert.ok(assignments.slice(1, -1).every(({ id, kinds }) => kinds.every(
+    ({ kind, subject }) => subject === id || CONTEXT_FRAMED_KINDS.includes(kind))));
 
   const seconds = assignments.reduce((total, assignment) => total + assignment.plannedSeconds, 0);
   assert.ok(seconds > FACTORY_ACCEPTANCE.minimumCinematicSeconds, `only ${seconds}s`);
@@ -209,4 +217,43 @@ test("a single-subject direction is left alone rather than losing its only shots
   const solo = buildCalmShotAssignments([{ id: "1_7", name: "Lone motor" }], { assemblyId: "1_0" });
   assert.equal(solo.length, 1);
   assert.ok(solo[0].kinds.every(({ subject }) => subject === "1_7"));
+});
+
+/**
+ * A wide card frames the plant; the part keeps the closer card of its pair.
+ *
+ * The failure this pins is not an obstruction and no occlusion test can reject it: the camera is placed
+ * correctly, the subject is in shot, and the picture is of an empty floor, because at `extreme_wide` a
+ * 30 cm motor is a speck. Measured on the first film taken with a sound legibility metric, five of the
+ * thirty shots gave a wide or extreme-wide card to a small part, and the sampled stills at those moments
+ * measured an interdecile luma range of 14 to 29 against a floor of 40.
+ */
+test("wide cards frame the assembly, and no subject loses its own shot to the rule", () => {
+  const subjects = Array.from({ length: 15 }, (_, index) => ({ id: `part-${index}`, name: `Part ${index}` }));
+  const assignments = buildCalmShotAssignments(subjects, { assemblyId: "1_1" });
+  const everyShot = assignments.flatMap(({ kinds }) => kinds);
+
+  const wideOnAPart = everyShot.filter(
+    ({ kind, subject }) => CONTEXT_FRAMED_KINDS.includes(kind) && subject !== "1_1");
+  assert.deepEqual(wideOnAPart, [], "a wide card framed on one part is a picture of the floor it stands on");
+
+  // The rule must not quietly cost a subject its coverage: every subject still has a shot of its own,
+  // and the runtime asserts that all fifteen were visited.
+  for (const assignment of assignments) {
+    assert.ok(
+      assignment.kinds.some(({ subject }) => subject === assignment.id),
+      `${assignment.id} kept no shot of its own: ${JSON.stringify(assignment.kinds)}`,
+    );
+  }
+
+  // And the film still opens and closes on the whole factory.
+  assert.equal(everyShot.filter(({ subject }) => subject === "1_1").length >= 2, true);
+
+  // Without an assembly to frame there is nothing to redirect to, and the direction is unchanged —
+  // the rule must not silently drop the wide cards when it cannot honour them.
+  const unanchored = buildCalmShotAssignments(subjects).flatMap(({ kinds }) => kinds);
+  assert.equal(unanchored.length, everyShot.length);
+  assert.ok(unanchored.some(({ kind }) => CONTEXT_FRAMED_KINDS.includes(kind)));
+  assert.deepEqual([...new Set(unanchored.map(({ subject }) => subject))].sort(),
+    subjects.map(({ id }) => id).sort());
 });

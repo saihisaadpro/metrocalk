@@ -27,6 +27,8 @@ import { Icon, iconTokens } from "../../src/theme/icons";
 import { Inspector } from "../../src/inspector/Inspector";
 import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
+import { CutscenePanel } from "../../src/panels/CutscenePanel";
+import { SubjectAimBadge } from "../../src/panels/SubjectAimBadge";
 import { Diagnostics } from "../../src/panels/Diagnostics";
 import { ImportReport } from "../../src/panels/ImportReport";
 import { Reveal } from "../../src/panels/Reveal";
@@ -45,13 +47,17 @@ import type {
   AnimationWorkspaceInfo,
   CadReport,
   CadReportPart,
+  CinemaReply,
   EffectSpec,
+  FramingCatalog,
   MatchValidation,
   RevealResponse,
   RoleRow,
   RoleSpec,
+  ShotRow,
   ShotSpec,
   StateMachine,
+  SubjectCatalog,
   TimelineTuple,
 } from "../../src/transport/protocol";
 import { createMockSession, type EditorClient } from "../../src/transport/session";
@@ -192,6 +198,13 @@ export type Scene = {
    *  did nothing would photograph the default state under a caption claiming another, which is worse
    *  than no capture at all. */
   click?: string[];
+  /** Text typed into a control the clicks reached, as `[selector, value]` pairs, after every click.
+   *
+   *  `page.$` searches the whole document rather than the frame, so this reaches a field inside a
+   *  PORTALLED dialog — which is where a command palette's query and a dialog's search have always
+   *  lived. The driver selects the field's existing contents first, so two scenes typing into the
+   *  same selector cannot depend on which ran before. */
+  type?: [selector: string, value: string][];
   setup?: () => void;
   render: () => ReactNode;
 };
@@ -437,6 +450,294 @@ const physicsClient = () =>
     setSimRunning: () => undefined,
     physicsContacts: () => Promise.resolve([]),
     physicsCheck: () => Promise.resolve([]),
+  }) as unknown as EditorClient;
+
+/** A FIVE-SHOT CUT WITH FIVE DIFFERENT LENGTHS, one of which films something else.
+ *
+ *  The lengths are the point. A cutscene whose shots all run the same time draws five equal bars, and
+ *  five equal bars are a LIST — the exact thing this panel replaced, redrawn horizontally. 2.5s, 4.0s,
+ *  1.6s, 3.0s and 2.2s over 13.3s is a picture that can only be produced by a surface that reads
+ *  `effectiveSeconds`.
+ *
+ *  Shot 1 frames the hall rather than the gun, because that is ordinary film grammar (establish the
+ *  place, then cut in) and because until this session every line in a shot list was captioned with the
+ *  cutscene's OWNER — so a wide of the hall read back as a wide of the one part standing in it.
+ *
+ *  The jump-cut warning is real output, not a fixture string: shots 4 and 5 are framed identically
+ *  back to back, which is what `Cutscene::problems` says that about. */
+const CUTSCENE_SHOTS = [
+  { id: "sh-1", size: "wide", angle: "three_quarter", motion: "pull_out", amount: 0.3, seconds: 2.5, subject: "hall", subjectName: "Assembly Hall", reads: "a wide shot of Assembly Hall from three-quarters, pulling out — 2.5s" },
+  { id: "sh-2", size: "full", angle: "three_quarter", motion: "push_in", amount: 0.35, seconds: 4.0, subject: "rig", subjectName: "Weld Gun 7", reads: "a full shot of Weld Gun 7 from three-quarters, pushing in — 4.0s" },
+  { id: "sh-3", size: "extreme_close", angle: "profile", motion: "hold", amount: 0, seconds: 1.6, subject: "rig", subjectName: "Weld Gun 7", reads: "a very close shot of Weld Gun 7 in profile, holding still — 1.6s" },
+  { id: "sh-4", size: "medium", angle: "low", motion: "orbit", amount: 0.5, seconds: 3.0, subject: "rig", subjectName: "Weld Gun 7", reads: "a medium shot of Weld Gun 7 from below, orbiting — 3.0s" },
+  { id: "sh-5", size: "medium", angle: "low", motion: "crane_up", amount: 0.6, seconds: 2.2, subject: "rig", subjectName: "Weld Gun 7", reads: "a medium shot of Weld Gun 7 from below, craning up — 2.2s" },
+] as const;
+
+const CUTSCENE: CinemaReply = (() => {
+  let start = 0;
+  const rows: ShotRow[] = CUTSCENE_SHOTS.map((shot, index) => {
+    const row: ShotRow = {
+      id: shot.id,
+      index,
+      reads: shot.reads,
+      seconds: shot.seconds,
+      effectiveSeconds: shot.seconds,
+      startSeconds: start,
+      // `Mood::Normal.blend_seconds()` is 0.6s, capped at half the shot; the first never blends,
+      // and a shot opens one 60Hz tick past its own window (`Cutscene::opens_at`).
+      blendSeconds: index === 0 ? 0 : Math.min(0.6, shot.seconds * 0.5),
+      openSeconds: index === 0 ? start : start + Math.min(0.6, shot.seconds * 0.5) + 1 / 60,
+      size: shot.size,
+      angle: shot.angle,
+      motion: shot.motion,
+      amount: shot.amount,
+      subject: shot.subject,
+      subjectName: shot.subjectName,
+    };
+    start += shot.seconds;
+    return row;
+  });
+  return {
+    entity: "rig",
+    shots: rows.length,
+    seconds: start,
+    mood: "normal",
+    delivery: "viewport",
+    reads: rows.map((row) => row.reads),
+    rows,
+    problems: [
+      'shots on "Weld Gun 7" are framed identically back to back — that reads as a jump cut; change the size or the angle',
+    ],
+    message: "",
+    reason: null,
+  };
+})();
+
+/** The framing vocabulary with the WIRE VALUES the Rust catalogue publishes. A scene that invented a
+ *  value would photograph a dropdown whose selected option the engine would refuse. */
+const FRAMING: FramingCatalog = {
+  sizes: [
+    { value: "extreme_wide", label: "Distant", blurb: "The subject is a speck in its world" },
+    { value: "wide", label: "Wide", blurb: "The whole subject with generous air around it" },
+    { value: "full", label: "Full", blurb: "The subject fills most of the height" },
+    { value: "medium", label: "Medium", blurb: "Closer — detail starts to read" },
+    { value: "close", label: "Close", blurb: "Tight on the subject" },
+    { value: "extreme_close", label: "Very close", blurb: "One thing, very large" },
+  ],
+  angles: [
+    { value: "front", label: "Front", blurb: "Facing the subject head-on" },
+    { value: "three_quarter", label: "Three-quarter", blurb: "Off to one side, slightly above" },
+    { value: "profile", label: "Profile", blurb: "Directly to the side" },
+    { value: "behind", label: "Behind", blurb: "Looking where it looks" },
+    { value: "low", label: "From below", blurb: "The subject towers" },
+    { value: "high", label: "From above", blurb: "The subject is small" },
+  ],
+  motions: [
+    { value: "hold", label: "Hold", blurb: "Locked off — the camera does not move" },
+    { value: "push_in", label: "Push in", blurb: "Creep toward the subject" },
+    { value: "pull_out", label: "Pull out", blurb: "Drift away" },
+    { value: "orbit", label: "Orbit", blurb: "Circle the subject" },
+    { value: "crane_up", label: "Crane up", blurb: "Rise while holding the aim" },
+    { value: "crane_down", label: "Crane down", blurb: "Descend while holding the aim" },
+  ],
+  minSeconds: 0.2,
+  maxSeconds: 20,
+  maxShots: 12,
+  stillMotions: ["hold"],
+  deliveries: [
+    { value: "viewport", label: "Match viewport", blurb: "Compose for the stage as it is now - no bars" },
+    { value: "widescreen", label: "16:9 widescreen", blurb: "The broadcast and web default" },
+    { value: "scope", label: "2.39:1 scope", blurb: "Anamorphic scope - the widest frame" },
+    { value: "academy", label: "4:3 academy", blurb: "Classic" },
+    { value: "square", label: "1:1 square", blurb: "Square" },
+    { value: "vertical", label: "9:16 vertical", blurb: "Vertical" },
+  ],
+};
+
+const CUTSCENE_CARDS: ShotSpec[] = [
+  { kind: "establish", label: "Establishing", blurb: "Show where we are before we look at anything closely", adds: "a wide, slowly pulling-out shot from the front" },
+  { kind: "hero", label: "Hero shot", blurb: "The workhorse — three-quarters on, pushing in", adds: "a full-body three-quarter shot that creeps closer" },
+  { kind: "closeup", label: "Close-up", blurb: "Tight and still — for the moment that matters", adds: "a close, locked-off shot in profile" },
+  { kind: "orbit", label: "Show it off", blurb: "Circle the object so every side reads", adds: "a medium shot orbiting a quarter turn" },
+  { kind: "reveal", label: "Crane reveal", blurb: "Lift away to show the world around it", adds: "a full shot craning upward" },
+  { kind: "vista", label: "The vista", blurb: "The subject is a speck in its world", adds: "an extreme-wide, locked-off shot from the front" },
+];
+
+/** WHAT A SHOT CAN BE POINTED AT, ranked by the scene's own hierarchy — the engine's own answer,
+ *  headings and all.
+ *
+ *  The `parts` counts are the reason the list is worth reading rather than scrolling: 378 and 1 are
+ *  how the whole line and the one bracket inside it tell themselves apart when their names do not.
+ *  `Datum A` has none, which is the row that proves the picker warns BEFORE the shot is aimed — a
+ *  subject with no drawn geometry is composed by the solver on its own origin, and from outside that
+ *  looks like a camera that went somewhere plausible and filmed nothing. */
+const SUBJECT_CATALOG: SubjectCatalog = {
+  owner: "rig",
+  ownerName: "Weld Gun 7",
+  current: "hall",
+  candidates: [
+    { id: "rig", name: "Weld Gun 7", group: "This object", parts: 1, framable: true, current: false },
+    { id: "cell", name: "Weld Cell A", group: "What it is part of", parts: 46, framable: true, current: false },
+    { id: "hall", name: "Assembly Hall", group: "What it is part of", parts: 378, framable: true, current: true },
+    { id: "nozzle", name: "Nozzle", group: "What it is made of", parts: 1, framable: true, current: false },
+    { id: "loom", name: "Cable Loom", group: "What it is made of", parts: 3, framable: true, current: false },
+    { id: "fixture", name: "Fixture 3", group: "Beside it", parts: 9, framable: true, current: false },
+    { id: "datum", name: "Datum A", group: "Beside it", parts: 0, framable: false, current: false },
+  ],
+  query: "",
+  matches: 7,
+  truncated: true,
+};
+
+const cutsceneClient = () =>
+  ({
+    cinemaCatalog: () => Promise.resolve(CUTSCENE_CARDS),
+    cinemaFramingCatalog: () => Promise.resolve(FRAMING),
+    cinemaSubjectCatalog: (_id: string, _index: number | null, query: string) =>
+      Promise.resolve(
+        query
+          ? {
+              ...SUBJECT_CATALOG,
+              query,
+              truncated: false,
+              candidates: SUBJECT_CATALOG.candidates
+                .filter((c) => c.name.toLowerCase().includes(query.toLowerCase()))
+                .map((c) => ({ ...c, group: "Matches" })),
+            }
+          : SUBJECT_CATALOG,
+      ),
+    cinemaList: () => Promise.resolve(CUTSCENE),
+    // The pose a shot solver would answer with. A capture cannot show the wgpu frame — the harness
+    // runs on a box with no GPU — so what is photographed here is the AUTHORING surface around it:
+    // the toggle in its pressed state and the read-out naming the moment. The live composite is the
+    // `.exe` run's job, and these two pieces of evidence answer different questions.
+    cinemaPreview: (id: string, seconds: number, active: boolean) =>
+      Promise.resolve({
+        active,
+        entity: active ? id : null,
+        seconds,
+        shotIndex: active ? 1 : null,
+        shots: CUTSCENE.rows.length,
+        reads: CUTSCENE.rows[1].reads,
+        subjectName: CUTSCENE.rows[1].subjectName,
+        progress: 0.25,
+        blending: false,
+        eye: [6.2, 3.1, 9.4] as [number, number, number],
+        lookAt: [0, 1.4, 0] as [number, number, number],
+        fovDeg: 50,
+        message: active ? `Previewing shot 2 of 5 at ${seconds.toFixed(1)}s` : "Preview off",
+        reason: null,
+      }),
+  }) as unknown as EditorClient;
+
+/** Nothing rendered yet - the zero row every render answer in this file is built from. */
+const RENDER_IDLE = {
+  running: false,
+  done: false,
+  entity: "rig",
+  frames: 0,
+  written: 0,
+  width: 0,
+  height: 0,
+  offscreen: false,
+  // ADR-182 — a render delivers a MOVIE unless the author asks for the frames, so this is the state
+  // the dialog opens in and the one a capture has to be taken of.
+  format: "movie" as const,
+  bitrate: 0,
+  fps: 24,
+  seconds: 0,
+  folder: "",
+  stem: "Skid Weld Line",
+  bytes: 0,
+  elapsedMs: 0,
+  failures: [] as string[],
+  message: "",
+  reason: null as string | null,
+};
+
+/** A finished render, with the numbers a real one produces. ADR-177: 1080 lines of a 2.39:1 delivery
+ *  is 2582x1080 - a DELIVERY size and not the stage's, which is the whole difference this pass made.
+ *  The stage a capture of this dialog is taken on is 1400x900, and the frames are taller than it. */
+const RENDER_DONE = {
+  ...RENDER_IDLE,
+  done: true,
+  frames: 319,
+  written: 319,
+  width: 2582,
+  height: 1080,
+  offscreen: true,
+  seconds: 13.3,
+  folder: "C:/renders/skid-weld-line",
+  // ADR-182 — a movie is ONE file, so what it weighs is that file rather than 319 lossless frames.
+  // 13.3s of 2582x1080 at 8.0 Mbit/s is about 13 MB, against the ~155 MB the same cut costs as 319
+  // lossless PNGs (the number this fixture carried before ADR-182).
+  bytes: 13_337_000,
+  bitrate: 8_022_528,
+  elapsedMs: 41_800,
+  message: "Rendered 319 frames at 2582x1080 in 41.8s into Skid Weld Line.mp4",
+};
+
+/** ADR-175 - the same cutscene with a render PLAN behind it. Delivered in scope, because the frame a
+ *  cut is composed for decides the shape of every file the render writes, and a capture of the dialog
+ *  over a viewport-shaped cut could not show that.
+ *
+ *  The plan's numbers are the fixture's, and computing them is the ENGINE's job in the product: 13.3s
+ *  at 24 fps is 319 frames. A stub answering a different count would photograph a dialog whose cost
+ *  sentence and whose button disagreed - the defect the plan command exists to make impossible. */
+const renderingCutsceneClient = () =>
+  ({
+    ...cutsceneClient(),
+    cinemaList: () => Promise.resolve({ ...CUTSCENE, delivery: "scope" as const }),
+    cinemaRenderPlan: (
+      id: string,
+      fps: number,
+      shot: number | null,
+      height: number | null = null,
+      format: "movie" | "sequence" | null = null,
+    ) => {
+      const seconds = shot === null ? CUTSCENE.seconds : (CUTSCENE.rows[shot]?.effectiveSeconds ?? 0);
+      const frames = Math.max(1, Math.round(seconds * fps));
+      // ADR-177 - the size is the ENGINE's answer in the product; here it is the same arithmetic over
+      // this fixture's scope delivery, so the sentence photographed is the one a real plan produces.
+      const width = height === null ? 1920 : Math.round((height * 2.39) / 2) * 2;
+      const tall = height ?? 803;
+      // ADR-182 — the bit rate is the ENGINE's `bitrate_for` in the product; here it is the same
+      // arithmetic over this fixture, so the sentence photographed is one a real plan produces.
+      const chosen = format ?? "movie";
+      const bitrate =
+        chosen === "movie"
+          ? Math.min(120_000_000, Math.max(2_000_000, Math.floor((width * tall * fps * 12) / 100)))
+          : 0;
+      return Promise.resolve({
+        ...RENDER_IDLE,
+        entity: id,
+        fps,
+        frames,
+        seconds,
+        width,
+        height: tall,
+        format: chosen,
+        bitrate,
+        message: `${frames} frames \u00b7 ${seconds.toFixed(1)}s at ${fps} fps \u00b7 ${width}x${tall}`,
+      });
+    },
+    cinemaRenderStatus: () => Promise.resolve(RENDER_DONE),
+    cinemaRenderCancel: () => Promise.resolve(RENDER_DONE),
+  }) as unknown as EditorClient;
+
+/** The same client, one click further on: the render has finished and the dialog is its ledger. */
+const renderedCutsceneClient = () =>
+  ({
+    ...renderingCutsceneClient(),
+    cinemaRenderStart: () => Promise.resolve(RENDER_DONE),
+  }) as unknown as EditorClient;
+
+/** The same cutscene, delivered in scope. One field differs, and it changes what every shot in the
+ *  list is composed for — which is why it belongs to the CUT and not to a shot. */
+const deliveredCutsceneClient = () =>
+  ({
+    ...cutsceneClient(),
+    cinemaList: () => Promise.resolve({ ...CUTSCENE, delivery: "scope" as const }),
   }) as unknown as EditorClient;
 
 const selectAnimatedEntity = () => {
@@ -960,6 +1261,430 @@ export const SCENES: Scene[] = [
       text_absent: ["null", "undefined", "NaN"],
     },
     render: () => <AnimationWorkspace client={animationClient()} />,
+  },
+  {
+    id: "cutscene-timeline",
+    looking_for:
+      "A CUTSCENE AS A SEQUENCE IN TIME. What this panel replaced was a bulleted list of five " +
+      "sentences with a × beside each: no length on screen anywhere, no way to reorder, and no way " +
+      "to change a shot without deleting it and re-authoring everything after it — while the engine " +
+      "had carried a per-shot `seconds`, an ordered list and a six-by-six-by-six framing vocabulary " +
+      "the whole time. Check that the five bars are five DIFFERENT widths in the ratio 2.5 : 4.0 : " +
+      "1.6 : 3.0 : 2.2 — equal bars would mean the panel is drawing a list again — that each carries " +
+      "its own duration, and that the ruler above them is labelled in seconds with a playhead that " +
+      "has a handle. The first bar reads Assembly Hall, not Weld Gun 7: a shot may film something " +
+      "other than the object its cutscene hangs on, and every line in the old list was captioned " +
+      "with the owner. Below, the shot inspector: length, size, angle, move and strength, each one " +
+      "a control from the shared field family and each one edit landing as a single undoable commit. " +
+      "The jump-cut warning is the engine's own continuity check, shown where the shots are",
+    // The WINDOW, not a frame cap. `width` leaves the window at 620px and merely caps the frame, so
+    // a panel that measures its own container to decide how wide to draw a lane gets photographed
+    // fitting a 620px box under a caption about a full-window dock. Found by this scene: the last
+    // two shots of a five-shot cut were scrolled off the right-hand edge of the capture.
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    // Without the click this photographs the timeline with no shot inspector under it — a capture of
+    // half the panel under a caption describing all of it.
+    click: ["[data-testid='cutscene-clip']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-clip']", 5],
+        ["[data-testid='cutscene-shot-editor']", 1],
+        ["[data-testid='cutscene-problem']", 1],
+        // The framing vocabulary is on screen as three real selects, not as prose.
+        ["[data-testid='cutscene-size']", 1],
+        ["[data-testid='cutscene-angle']", 1],
+        ["[data-testid='cutscene-motion']", 1],
+        // ...and the catalogue is still one click away from the timeline it feeds.
+        ["[data-testid='shot-catalogue'] .mtk-btn", 6],
+      ],
+      text_present: [
+        "Assembly Hall",
+        "Weld Gun 7",
+        "Shot 1 of 5",
+        // The total, and the one number the old list could not show at all.
+        "13.3",
+        "jump cut",
+      ],
+      // The empty states this scene must NOT be photographing.
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      // A bar you cannot see is a shot you cannot select, and the shortest one here is 1.6s of 13.3.
+      min_width: [["[data-testid='cutscene-clip']", 24]],
+      unclipped: [
+        "[data-testid='cutscene-clip']",
+        "[data-testid='cutscene-shot-editor'] .mtk-select",
+        "[data-testid='cutscene-shot-editor'] .mtk-btn",
+        "[data-testid='cutscene-panel'] > .mtk-toolbar .mtk-btn",
+      ],
+      // The ruler labels sit ABOVE the lane they measure, and the inspector under the timeline.
+      stacked: [["[data-testid='cutscene-timeline']", "[data-testid='cutscene-shot-editor']"]],
+      // Earlier/Later/Remove are one row, not three: an order control that wrapped onto its own line
+      // is the toolbar having run out of width.
+      same_line: [["[data-testid='cutscene-earlier']", "[data-testid='cutscene-remove']"]],
+    },
+    render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-render",
+    looking_for:
+      "THE WAY A PICTURE GETS OUT OF THIS ENGINE. Until this dialog existed there was none: the " +
+      "shell wrote no image file anywhere, and every still of this project's own benchmark film was " +
+      "an operating-system screenshot taken by a script outside the engine - while the renderer had " +
+      "been reading its own frames back to PNG since M14.2 and the shot solver could pose the " +
+      "camera at any instant. Check that all three moments of the task are here and in this order: " +
+      "WHAT will be written (the scope, the FRAME SIZE, the rate, the name), WHAT IT COSTS stated " +
+      "above the button that pays it - a frame count AND a pixel size that are the ENGINE's own " +
+      "plan, not this dialog's arithmetic - and what that choice means, said before the click " +
+      "rather than discovered after it. ADR-177: the size used to be the one thing this dialog " +
+      "could not change, because every frame came off the window's own swapchain and was therefore " +
+      "as tall as whatever the docks had left; it is now a delivery format, and the dialog opens " +
+      "on 1080 rather than on the stage. Check that the size control offers 'As on screen' as well, " +
+      "because the stage is still the right answer for a quick look. The description names the " +
+      "delivery frame the cut is composed for, because that is what decides the SHAPE of every " +
+      "file - and the width follows from it, which is why the picker asks for a HEIGHT and not a " +
+      "resolution. ADR-182: the dialog now opens on a MOVIE - one H.264 MP4 - because a render is the "
+      + "thing that leaves the editor and 319 numbered PNGs are not something anybody can watch. "
+      + "Check that the delivery sits beside WHAT is being filmed and ahead of the rate, the size "
+      + "and the name, because it changes what all three of those mean; that the cost line states "
+      + "the bit rate the encoder is handed (about 8.0 Mbit/s) "
+      + "beside the frame count; and that 'As on screen' is NOT offered here - a movie declares its "
+      + "frame size once, before the first sample, and the stage's size is a measurement that moves. "
+      + "The lossless sequence is one control away and is still the right answer for a compositor. "
+      + "The primary button says the number: 'Render 319 frames', never a bare 'Render'",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-render']"],
+    expect: {
+      present: [
+        ["[data-testid='render-dialog']", 1],
+        ["[data-testid='render-format']", 1],
+        ["[data-testid='render-scope']", 1],
+        ["[data-testid='render-fps']", 1],
+        ["[data-testid='render-size']", 1],
+        ["[data-testid='render-stem']", 1],
+        ["[data-testid='render-cost']", 1],
+        ["[data-testid='render-start']", 1],
+      ],
+      text_present: [
+        // The frame the cut is composed for - the fixture delivers in scope, and the shape of every
+        // written file follows from it.
+        "2.39:1 scope",
+        // The cost, and the fact that it is a count of FRAMES.
+        "319 frames",
+        // ADR-182 - what the render DELIVERS, and what one costs, stated above the button that pays
+        // for it. The bit rate is the engine's `bitrate_for`, never a multiplication done here.
+        "Deliver as",
+        "MP4",
+        "8.0 Mbit/s",
+        // ADR-177 - the size is a choice, and the pixels it comes to are stated before the click.
+        "Frame size",
+        "2582 × 1080",
+      ],
+      text_absent: [
+        "null",
+        "undefined",
+        "NaN",
+        "0 frames",
+        // The sentence this dialog used to end on, before a size could be chosen.
+        "the size of the composed picture on screen",
+        // ADR-182 - a movie has ONE size for its whole length, so the stage is not one of its
+        // options. Present-and-refused would be worse than absent: the author would pick it, read a
+        // sentence, and undo what they just did.
+        "As on screen",
+      ],
+      unclipped: [
+        "[data-testid='render-start']",
+        "[data-testid='render-cost']",
+        "[data-testid='render-format']",
+        "[data-testid='render-scope']",
+        "[data-testid='render-size']",
+      ],
+      // The cost sits ABOVE the button that pays it. Below it, it is a receipt.
+      stacked: [["[data-testid='render-cost']", "[data-testid='render-start']"]],
+      // Cancel and Render share the footer row rather than stacking into two full-width bars.
+      same_line: [["[data-testid='render-cancel']", "[data-testid='render-start']"]],
+    },
+    render: () => <CutscenePanel client={renderingCutsceneClient()} />,
+  },
+  {
+    id: "cutscene-render-ledger",
+    looking_for:
+      "WHERE THE MOVIE WENT. 'Done' is not an answer to 'where is it' - which is exactly what a " +
+      "status-bar toast could say and no more. ADR-182: the delivery is one H.264 MP4, so this " +
+      "ledger names ONE file rather than a numbered range; check that it does, and that a reader " +
+      "can answer 'where is my film' without leaving this dialog. " +
+      "A render is 319 frames, and 'done' is not an answer to " +
+      "'where are they' - which is exactly what a status-bar toast could say and no more. The " +
+      "options are GONE and their space is the ledger: how many frames exist, the pixel size they " +
+      "were actually written at (2582x1080 - the delivery the author chose, not the shape of the " +
+      "1400x900 stage this capture was taken on), what they weigh, how long it took, and the " +
+      "destination path in mono, whole, " +
+      "wrapping rather than truncating. Check that the reader can answer 'where are my files' " +
+      "without leaving this dialog, and that no settings control is still on screen asking a " +
+      "question the reader has stopped having",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-render']", "[data-testid='render-start']"],
+    expect: {
+      present: [
+        ["[data-testid='render-ledger']", 1],
+        ["[data-testid='render-ledger-frames']", 1],
+        ["[data-testid='render-ledger-folder']", 1],
+        ["[data-testid='render-done']", 1],
+      ],
+      // The settings are gone, not merely disabled.
+      absent: ["[data-testid='render-fps']", "[data-testid='render-scope']"],
+      text_present: [
+        "319",
+        "2582",
+        "1080",
+        "Rendered",
+        "renders",
+        // ADR-182 - ONE file, named, rather than `take.0000.png … take.0318.png` over a folder
+        // holding a single movie.
+        "Skid Weld Line.mp4",
+        "encoded as one H.264 movie",
+      ],
+      text_absent: ["null", "undefined", "NaN"],
+      unclipped: ["[data-testid='render-ledger-folder']", "[data-testid='render-done']"],
+    },
+    render: () => <CutscenePanel client={renderedCutsceneClient()} />,
+  },
+  {
+    id: "cutscene-shot-subject",
+    looking_for:
+      "WHAT THIS SHOT FRAMES — the control that was missing while the engine already had the " +
+      "capability. A `ShotRecipe` has carried its own `subject` since cutscenes shipped, and the " +
+      "runtime resolves it as the union of every rendered instance in that object's HIERARCHY " +
+      "SUBTREE — so 'film the whole assembly' was always solvable, the editor simply sent no " +
+      "subject and offered no way to change one, which made the most ordinary cinematic sequence " +
+      "there is (hold on the whole line, then cut in to one machine) impossible to author. Shot 1 " +
+      "here films the hall the gun stands in. Check that the LANE says so — clip 1 carries " +
+      "'Assembly Hall' beside its duration and the other four carry only a duration, because " +
+      "captioning all five with the same name is the heading repeated five times — and that the " +
+      "shot inspector's first framing control is 'Frames', reading back Assembly Hall with a help " +
+      "line naming the difference. Frames sits before Size, Angle and Move because all three of " +
+      "those are stated RELATIVE to the subject, so every one of them means something else once it " +
+      "changes. THE OPEN LIST IS NOT ASSERTED HERE: it is a `theme/Popover`, portalled to " +
+      "`document.body` by design, and this gate evaluates claims inside the scene's own frame. Its " +
+      "contents — the ranked groups, the parts counts, the nothing-drawn warning — are measured on " +
+      "the packaged .exe by `specs-subjectpicker`, against the real engine's own ranking",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    // Open shot 1 — the one that films something other than the object its cutscene hangs on.
+    click: ["[data-testid='cutscene-clip']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-shot-editor']", 1],
+        ["[data-testid='cutscene-subject']", 1],
+        ["[data-testid='cutscene-subject-name']", 1],
+        ["[data-testid='cutscene-clip']", 5],
+      ],
+      text_present: [
+        "Frames",
+        "Assembly Hall",
+        // The help line under the control, which is where the difference is explained.
+        "This shot films Assembly Hall, not Weld Gun 7",
+      ],
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      // A control whose value is ellipsised is a control that does not answer its own question.
+      unclipped: ["[data-testid='cutscene-subject']", "[data-testid='cutscene-subject-name']"],
+      // The sentence names the subject, and the control that changes it is under the sentence.
+      stacked: [["[data-testid='cutscene-shot-reads']", "[data-testid='cutscene-subject']"]],
+      // Frames and Size are one row of the framing grid: what a shot is OF and how it is framed
+      // belong to the same decision and are read together.
+      same_line: [["[data-testid='cutscene-subject']", "[data-testid='cutscene-size']"]],
+    },
+    render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-aim-badge",
+    looking_for:
+      "AIMING A SHOT BY POINTING AT THE THING. The stage while an aim is in flight. Three engine " +
+      "capabilities existed and had never met: `viewport_peek` names what is under the cursor " +
+      "WITHOUT changing the selection (and was called by nothing in the editor), " +
+      "`cinema_subject_chain` answers with the object and every assembly it belongs to, and " +
+      "`cinema_set_shot_subject` re-aims a shot as one undoable edit. What a user could reach was a " +
+      "search box, so in a 15,711-part import 'film THAT one' meant knowing its name. Check that " +
+      "the badge says which shot is being aimed (shot 2 of 5), that the cursor's object and the " +
+      "machine it belongs to are BOTH offered as buttons with their drawn-part counts — 1 part vs " +
+      "42 vs 378 is the whole reason a click on one bolt does not have to become a shot of one " +
+      "bolt — that the first rung is the emphasised one because it is what the stage click itself " +
+      "would take, and that the way out is named on the badge (Esc, and a Cancel beside it). It " +
+      "sits at the BOTTOM of the stage on purpose: the preview badge holds the top, and re-aiming a " +
+      "shot while previewing it is the loop this closes",
+    viewport: { width: 1400, height: 620 },
+    expect: {
+      present: [
+        ["[data-testid='subjectAimBadge']", 1],
+        ["[data-testid='subjectAimRungs']", 1],
+        ["[data-testid='subjectAimRung-bolt']", 1],
+        ["[data-testid='subjectAimRung-rig']", 1],
+        ["[data-testid='subjectAimRung-hall']", 1],
+        ["[data-testid='subjectAimCancel']", 1],
+      ],
+      text_present: [
+        "AIMING",
+        "shot 2 of 5",
+        "Bolt M8",
+        "1 part",
+        "Weld Gun 7",
+        "42 parts",
+        "Assembly Hall",
+        "378 parts",
+        "Esc",
+      ],
+      // The badge is the read-out for a gesture in progress; a hint left standing beside a named
+      // ladder would be two answers to the same question.
+      text_absent: ["click what this shot should film", "looking", "null", "undefined", "NaN"],
+      unclipped: [
+        "[data-testid='subjectAimRung-bolt']",
+        "[data-testid='subjectAimRung-rig']",
+        "[data-testid='subjectAimRung-hall']",
+        "[data-testid='subjectAimCancel']",
+      ],
+      // One pill. A ladder that wrapped its rungs onto a second line under the word AIMING is a
+      // badge that has run out of width, and the widen-to-the-assembly choice is the half that goes.
+      same_line: [
+        ["[data-testid='subjectAimShot']", "[data-testid='subjectAimRung-bolt']"],
+        ["[data-testid='subjectAimRung-bolt']", "[data-testid='subjectAimRung-hall']"],
+        ["[data-testid='subjectAimRung-hall']", "[data-testid='subjectAimCancel']"],
+      ],
+    },
+    render: () => (
+      // The stage, at the size the badge actually stands in: absolutely positioned against the
+      // viewport region, bottom-centre.
+      <div style={{ position: "relative", height: 560, background: "var(--mtk-bg-inset)" }}>
+        <SubjectAimBadge
+          shotIndex={1}
+          shots={5}
+          looking={false}
+          rungs={[
+            { id: "bolt", name: "Bolt M8", parts: 1, group: "This object" },
+            { id: "rig", name: "Weld Gun 7", parts: 42, group: "What it is part of" },
+            { id: "hall", name: "Assembly Hall", parts: 378, group: "What it is part of" },
+          ]}
+          onPick={() => {}}
+          onPreview={() => {}}
+          onCancel={() => {}}
+        />
+      </div>
+    ),
+  },
+  {
+    id: "cutscene-preview",
+    looking_for:
+      "THE PLAYHEAD ANSWERING WITH A PICTURE. `solve_shot` has been pure in (recipe, subject, t) " +
+      "since cutscenes shipped, so the engine could always produce the camera at any instant — and " +
+      "the only way to see one was to press Play and watch the cut from its start. Here the second " +
+      "clip has been clicked and Preview turned on. Check that the Preview control reads as PRESSED " +
+      "(filled, not outlined — an accent border alone would be a toggle whose state you have to " +
+      "know already), that it sits in its own toolbar group rather than crowding the pacing run, " +
+      "and that the playhead read-out beside it names the same shot the timeline is highlighting: " +
+      "3.1s, shot 2 of 5 — where shot 2 BECOMES ITSELF (its 2.5s start plus its 0.6s opening blend), not where it starts and not how long it runs. This is the toggle's whole job — the author says WHEN, and the viewport " +
+      "answers with the frame Play would film at that moment",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    // In order: open the second shot, then take the camera. Clicking the toggle first would preview
+    // 0.0s and photograph a caption that disagrees with its own picture.
+    click: ["[data-testid='cutscene-clip']:nth-of-type(2)", "[data-testid='cutscene-preview']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-clip']", 5],
+        ["[data-testid='cutscene-preview']", 1],
+        ["[data-testid='cutscene-shot-editor']", 1],
+        // The pose read-out is the expert half of this control and appears ONLY while a preview is
+        // standing somewhere - a scene that did not assert it would photograph the beginner half.
+        ["[data-testid='cutscene-preview-pose']", 1],
+      ],
+      text_present: [
+        "Preview",
+        "3.1s · shot 2 of 5",
+        "Weld Gun 7",
+        // Three world coordinates, not a promise of them.
+        "6.20, 3.10, 9.40",
+        "0.00, 1.40, 0.00",
+        "50° lens",
+      ],
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      unclipped: [
+        "[data-testid='cutscene-preview']",
+        "[data-testid='cutscene-preview-pose']",
+        "[data-testid='cutscene-panel'] > .mtk-toolbar .mtk-btn",
+      ],
+      // The read-out sits between the lane it describes and the inspector for the selected shot.
+      stacked: [
+        ["[data-testid='cutscene-timeline']", "[data-testid='cutscene-preview-pose']"],
+        ["[data-testid='cutscene-preview-pose']", "[data-testid='cutscene-shot-editor']"],
+      ],
+      // The control that takes the viewport is on the same row as the pacing it sits beside; a
+      // Preview button that wrapped onto its own line is the toolbar having run out of width.
+      same_line: [["[data-testid='cutscene-mood-calm']", "[data-testid='cutscene-preview']"]],
+    },
+    render: () => <CutscenePanel client={cutsceneClient()} />,
+  },
+  {
+    id: "cutscene-delivery-frame",
+    looking_for:
+      "THE FRAME THE SHOTS ARE COMPOSED FOR. A shot solver fits a subject against an ASPECT RATIO — " +
+      "it is how far back the camera stands — and until this control the only ratio available was " +
+      "whatever shape the author's stage happened to be, so opening a dock silently re-composed the " +
+      "film. Check that the delivery picker sits in the toolbar beside pacing (both are properties " +
+      "of the whole cut, not of one shot), that it reads '2.39:1 scope' rather than a number, and " +
+      "that the pose read-out under the lane now ends with the frame those three coordinates were " +
+      "solved for. Match viewport is the ABSENCE of a delivery frame and prints nothing there: this " +
+      "capture is the one where it is on",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-clip']:nth-of-type(2)", "[data-testid='cutscene-preview']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-delivery']", 1],
+        ["[data-testid='cutscene-preview-pose']", 1],
+      ],
+      text_present: ["2.39:1 scope", "composed for"],
+      text_absent: ["No object selected", "has no cutscene yet", "null", "undefined", "NaN"],
+      unclipped: [
+        "[data-testid='cutscene-delivery']",
+        "[data-testid='cutscene-preview-pose']",
+      ],
+      // The frame is chosen in the toolbar and reported under the lane - a control and its
+      // consequence, in that order down the panel.
+      stacked: [["[data-testid='cutscene-delivery']", "[data-testid='cutscene-preview-pose']"]],
+      // ...and it is on the pacing row, not on a line of its own.
+      same_line: [["[data-testid='cutscene-mood-calm']", "[data-testid='cutscene-delivery']"]],
+    },
+    render: () => <CutscenePanel client={deliveredCutsceneClient()} />,
+  },
+  {
+    id: "cutscene-empty",
+    looking_for:
+      "THE STATE EVERY NEW CUTSCENE STARTS IN, and the one a capture is most likely to skip. An " +
+      "object is selected and has no shots: the panel says so in the object's own name, says what " +
+      "the first click will do, and puts the whole card catalogue right there. No timeline is drawn " +
+      "— a ruler over an empty lane is a clock with nothing on it — and no shot inspector, because " +
+      "there is no shot. Nothing here is a dark control waiting to be understood",
+    viewport: { width: 1000, height: 700 },
+    setup: selectAnimatedEntity,
+    expect: {
+      present: [["[data-testid='shot-catalogue'] .mtk-btn", 6]],
+      absent: ["[data-testid='cutscene-clip']", "[data-testid='cutscene-shot-editor']"],
+      text_present: ["Weld Gun 7 has no cutscene yet", "Add a shot"],
+      text_absent: ["null", "undefined", "NaN", "0.0s"],
+      unclipped: ["[data-testid='shot-catalogue'] .mtk-btn"],
+    },
+    render: () => (
+      <CutscenePanel
+        client={
+          ({
+            cinemaCatalog: () => Promise.resolve(CUTSCENE_CARDS),
+            cinemaFramingCatalog: () => Promise.resolve(FRAMING),
+            cinemaList: () =>
+              Promise.resolve({ ...CUTSCENE, shots: 0, seconds: 0, reads: [], rows: [], problems: [] }),
+          }) as unknown as EditorClient
+        }
+      />
+    ),
   },
   {
     id: "animation-curve-editor",

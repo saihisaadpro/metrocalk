@@ -44,3 +44,21 @@ test("auto-dismiss pauses while a notification is being inspected", () => {
   act(() => vi.advanceTimersByTime(TOAST_TTL_MS));
   expect(screen.queryByText("Imported mesh")).toBeNull();
 });
+
+test("a notification is capped against the stage it is centred on, never against the window", () => {
+  act(() =>
+    pushToast(
+      "Shot 1 is now a wide shot of Assembly Hall from three-quarters, pulling out — 2.5s · Ctrl-Z to undo",
+      "success",
+    ),
+  );
+  render(<ToastHost />);
+
+  // jsdom performs no layout, so this pins the DECLARED cap — which is where the defect was. The host
+  // is absolutely positioned INSIDE `#viewport` and centred on it, and the row was capped at
+  // `100vw - 96px`: at a 1296px window with two docks open the stage is ~508px, so a long message was
+  // sized for 1200 and clipped at BOTH edges by the stage's own `overflow: hidden`. Seen on an `.exe`
+  // capture, where a cutscene re-aim toast read "s now a wide shot of Assembly Hall…".
+  expect(screen.getByTestId("toastHost").style.maxWidth).toBe("calc(100% - 24px)");
+  expect(screen.getByTestId("toast").style.maxWidth).toBe("100%");
+});

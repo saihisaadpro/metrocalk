@@ -14,12 +14,14 @@
 //! transaction (north-star test #1).
 
 mod diag;
+mod hall;
 mod ibl;
 mod moba;
 mod native_drop_import;
 mod render;
 mod scene_pick;
 mod terrain;
+mod video;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Sender};
@@ -822,12 +824,33 @@ fn restore_document_shape_assets(
         }
     }
     if restored > 0 {
-        eprintln!("[shell] rebuilt {restored} shape mesh(es) from their document recipes");
+        diag_log!("assets: rebuilt {restored} shape mesh(es) from their document recipes");
     }
     for e in &errors {
-        eprintln!("[shell] shape asset NOT restorable — {e}");
+        diag_log!("assets: shape asset NOT restorable - {e}");
     }
     (restored, errors)
+}
+
+/// What a document's CAD mesh references amounted to at the moment it was opened.
+///
+/// Three numbers rather than one, because a single "queued" count conflates the two ways it can be
+/// zero: a document with no CAD geometry in it at all, and a document whose every part happens to be
+/// resident already. That conflation is the same defect shape as a placement report whose `rejected: 0`
+/// meant both "nothing needed rejecting" and "everything was rejected" — one number answering two
+/// questions, read as whichever answer the reader expected.
+///
+/// Kept apart, they make an empty viewport legible: `referenced` large, `resident` zero, `queued`
+/// large, and a subsequent restore that prepares none of them says "the geometry cache is gone", which
+/// is a different repair from "this project has no geometry in it".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CadRestoreQueue {
+    /// Distinct `mtkcad:` handles the document's entities reference.
+    referenced: usize,
+    /// Of those, the ones already registered with the viewport, which need no restore.
+    resident: usize,
+    /// Of those, the ones handed to the background loader.
+    queued: usize,
 }
 
 /// Queue only the persisted CAD meshes referenced by the active document. Deserializing and preparing
@@ -838,8 +861,8 @@ fn queue_document_cad_assets(
     engine: &Engine<FlecsWorld>,
     assets: &AssetsRuntime,
     self_tx: &Sender<EngineCmd>,
-) -> usize {
-    let handles: BTreeSet<String> = engine
+) -> CadRestoreQueue {
+    let referenced: BTreeSet<String> = engine
         .entity_ids()
         .into_iter()
         .filter_map(|entity| {
@@ -850,13 +873,22 @@ fn queue_document_cad_assets(
             else {
                 return None;
             };
-            (handle.starts_with("mtkcad:") && !assets.handle_to_slot.contains_key(handle))
-                .then(|| handle.clone())
+            handle.starts_with("mtkcad:").then(|| handle.clone())
         })
         .collect();
+    let handles: BTreeSet<String> = referenced
+        .iter()
+        .filter(|handle| !assets.handle_to_slot.contains_key(*handle))
+        .cloned()
+        .collect();
     let expected = handles.len();
+    let tally = CadRestoreQueue {
+        referenced: referenced.len(),
+        resident: referenced.len() - expected,
+        queued: expected,
+    };
     if expected == 0 {
-        return 0;
+        return tally;
     }
 
     let directory = sidecar("metrocalk-cad-meshes");
@@ -878,10 +910,10 @@ fn queue_document_cad_assets(
             })
             .is_err()
         {
-            eprintln!("[shell] CAD asset restore finished after the engine closed");
+            diag_log!("assets: CAD mesh restore finished after the engine closed");
         }
     });
-    expected
+    tally
 }
 
 fn asset_lab_source<'a>(
@@ -2824,10 +2856,136 @@ enum EngineCmd {
         mood: String,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
     },
+    /// Cinematics - set the frame the cutscene is composed and delivered in (one undoable commit).
+    CinemaSetDelivery {
+        id: String,
+        delivery: String,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - set one shot's authored length (one undoable commit).
+    CinemaSetShotSeconds {
+        id: String,
+        index: usize,
+        seconds: f32,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - move one shot to another position in the list (one undoable commit).
+    CinemaMoveShot {
+        id: String,
+        from: usize,
+        to: usize,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - re-frame one shot in place (one undoable commit).
+    CinemaSetShotFraming {
+        id: String,
+        index: usize,
+        edit: metrocalk_editor_shell::FramingEdit,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - point one shot at a different object (one undoable commit).
+    CinemaSetShotSubject {
+        id: String,
+        index: usize,
+        /// The object the shot should FRAME, as a loro key.
+        subject: String,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - the ranked, bounded list of objects a shot could frame. A read; changes nothing.
+    CinemaSubjectCatalog {
+        id: String,
+        /// The shot whose subject is being edited, so its current object can be marked. `None` while
+        /// the picker is being used to aim a shot that does not exist yet.
+        index: Option<usize>,
+        /// A name filter. Empty means the ranked default list.
+        query: String,
+        reply: Sender<metrocalk_editor_shell::SubjectCatalog>,
+    },
+    /// Cinematics - the object under the cursor and the chain it hangs from. A read; changes nothing.
+    CinemaSubjectChain {
+        /// The object a viewport peek resolved to.
+        id: String,
+        reply: Sender<metrocalk_editor_shell::SubjectCatalog>,
+    },
+    /// What the cursor is over, as a render projection. Never document state and never undoable —
+    /// the same class as the camera pose, and it is gone the moment the cursor leaves.
+    ViewportHover {
+        /// The subjects being pointed at. Every DRAWN instance under one of them lights up, so a rung
+        /// naming an assembly lights the whole assembly. Empty clears the hover.
+        ids: Vec<String>,
+        reply: Sender<usize>,
+    },
     /// Cinematics - read an object's cutscene back as sentences.
     CinemaList {
         id: String,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
+    /// Cinematics - pose the viewport camera at one moment of a cutscene, or hand it back.
+    ///
+    /// Changes NOTHING in the document: this is the render projection ADR-021 already sanctions, and
+    /// it is deliberately not an undoable commit because moving a preview playhead is not an edit.
+    CinemaPreview {
+        id: String,
+        /// Where on the cutscene clock to stand, seconds. Clamped into the cut.
+        seconds: f32,
+        /// `false` gives the editor its camera back.
+        active: bool,
+        reply: Sender<metrocalk_editor_shell::CinemaPreviewReply>,
+    },
+    /// Cinematics (ADR-175) — start writing a cutscene out as a numbered PNG sequence.
+    ///
+    /// The job then advances on the engine's own heartbeat, one frame per capture round-trip, and is
+    /// polled with [`EngineCmd::CinemaRenderStatus`]. It is NOT a blocking command: a render of a
+    /// twelve-shot cut is minutes of work, and a reply that arrives at the end of it is a frozen editor
+    /// with a spinner in it.
+    CinemaRenderStart {
+        id: String,
+        /// Frames per second — one of [`metrocalk_editor_shell::RENDER_RATES`].
+        fps: u32,
+        /// `Some(index)` renders that shot alone; `None` renders the whole cut.
+        shot: Option<usize>,
+        /// The folder the user chose. Already picked by the time this arrives, because a native dialog
+        /// must not be opened from the engine thread.
+        folder: String,
+        /// The name the frames share, before the number.
+        stem: String,
+        /// ADR-177 — the output height the author chose, one of
+        /// [`metrocalk_editor_shell::RENDER_HEIGHTS`]. `None` writes the composed picture at whatever
+        /// size the window is making it, which is what every render before ADR-177 did.
+        height: Option<u32>,
+        /// ADR-182 — what this render delivers: one movie, or one file per frame.
+        format: metrocalk_editor_shell::RenderFormat,
+        reply: Sender<metrocalk_editor_shell::RenderReply>,
+    },
+    /// Cinematics — what a render WOULD produce, without producing it.
+    ///
+    /// The dialog's cost sentence is this reply, not a second copy of the arithmetic in TypeScript.
+    /// Frames-per-second times seconds is exactly the kind of one-line relation that gets restated
+    /// and then rounds differently on the two sides, and the first symptom is a user counting files.
+    CinemaRenderPlan {
+        id: String,
+        fps: u32,
+        shot: Option<usize>,
+        /// The output height being considered. The plan answers with the pixel size it implies, so the
+        /// dialog states the size above the button rather than multiplying an aspect in TypeScript.
+        height: Option<u32>,
+        /// ADR-182 — the delivery being considered. It changes the ANSWER: a movie carries a bit rate
+        /// and has an encoder ceiling over it, and both of those are refusals the author must read
+        /// before the click rather than after four minutes of rendering.
+        format: metrocalk_editor_shell::RenderFormat,
+        reply: Sender<metrocalk_editor_shell::RenderReply>,
+    },
+    /// Cinematics — how far the running render has got. The one read a progress bar polls.
+    CinemaRenderStatus {
+        reply: Sender<metrocalk_editor_shell::RenderReply>,
+    },
+    /// Cinematics — stop the running render and keep the frames already written.
+    ///
+    /// Keeping them is deliberate: half a sequence is a usable thing (it is the first half of the cut),
+    /// and deleting an author's files because they changed their mind is a bigger surprise than leaving
+    /// them. The ledger says how many there are.
+    CinemaRenderCancel {
+        reply: Sender<metrocalk_editor_shell::RenderReply>,
     },
     /// Conditionals - add one "only if" clause to an object (one undoable commit).
     ConditionAdd {
@@ -5586,6 +5744,129 @@ fn entity_display_name(engine: &Engine<FlecsWorld>, id: EntityId) -> String {
         .unwrap_or_else(|| id.to_loro_key())
 }
 
+/// The display name behind a shot's `subject` key, or `None` when it names nothing in this scene.
+///
+/// A shot may film something other than the object its cutscene hangs on, so the sentences in a shot
+/// list cannot all be captioned with the owner's name. `None` (rather than the raw loro key) lets the
+/// reply fall back to the owner, which is what the shot actually does.
+/// How many DRAWN parts sit under each entity, answered for the whole scene in one pass.
+///
+/// The subject picker needs this number for every row it offers, and asking per row is
+/// `O(rows x instances)`: the imported production line publishes 15,711 instances, so a twenty-row
+/// list would re-scan a quarter of a million keys to draw one dropdown. Walking each instance UP its
+/// ancestor chain instead visits every instance once and answers for every one of its ancestors at
+/// the same time — which is exactly the set the picker offers.
+///
+/// This is the same question [`cinematic_subject_sample`] asks when it decides what the camera is
+/// fitted to, asked of the same published render list, so a row that says "378 parts" is a promise
+/// about what the shot solver will actually see.
+fn drawn_parts_by_entity(engine: &Engine<FlecsWorld>, ids: &[String]) -> HashMap<EntityId, usize> {
+    let mut counts: HashMap<EntityId, usize> = HashMap::new();
+    let mut parents: HashMap<EntityId, Option<EntityId>> = HashMap::new();
+    for key in ids {
+        let Some(leaf) = EntityId::from_loro_key(key) else {
+            continue;
+        };
+        let mut walker = Some(leaf);
+        // A tree cannot contain a cycle; a corrupt document is still not worth hanging the engine
+        // thread for, and 64 is far deeper than any CAD assembly this has met.
+        for _ in 0..64 {
+            let Some(id) = walker else { break };
+            *counts.entry(id).or_default() += 1;
+            walker = *parents.entry(id).or_insert_with(|| engine.parent_of(id));
+        }
+    }
+    counts
+}
+
+/// Which drawn instances are under `hovered` — one bool per entry of `ids`, in the same order.
+///
+/// WHY A SUBTREE AND NOT A ROW. Picking is a hit test against drawn triangles, so what the cursor is
+/// over is always a LEAF — one bolt, of one weld gun, of a line that imports as 15 711 parts. The
+/// author is usually pointing at the machine, and the aim badge already offers both: `Box · 1 part`
+/// **in** `Assembly Hall · 7 parts`. Those counts were an abstraction until now — hovering the second
+/// rung lights all seven, so "7 parts" is a thing you can SEE before committing the shot to it.
+///
+/// The walk is [`drawn_parts_by_entity`]'s, memoised the same way and bounded the same way: a corrupt
+/// document is not worth hanging the engine thread for.
+///
+/// Takes no lock, on purpose. It is asked on hover-settle while the author sweeps the cursor over the
+/// scene, and 15 711 ancestor chains under the render mutex is the renderer stalling behind a read-out
+/// — the same discipline `CinemaSubjectChain` states for the same walk.
+fn hover_mask(engine: &Engine<FlecsWorld>, ids: &[String], hovered: &[String]) -> Vec<bool> {
+    if hovered.is_empty() {
+        return vec![false; ids.len()];
+    }
+    let wanted: HashSet<EntityId> = hovered
+        .iter()
+        .filter_map(|k| EntityId::from_loro_key(k))
+        .collect();
+    if wanted.is_empty() {
+        return vec![false; ids.len()];
+    }
+    // `under` memoises the ANSWER for every id the walk passes through, so the second bolt of the same
+    // weld gun is one lookup rather than a second walk to the root.
+    let mut under: HashMap<EntityId, bool> = HashMap::new();
+    ids.iter()
+        .map(|key| {
+            EntityId::from_loro_key(key)
+                .is_some_and(|leaf| entity_is_under(engine, leaf, &wanted, &mut under))
+        })
+        .collect()
+}
+
+/// Write a [`hover_mask`] into [`render::HIGHLIGHT_HOVERED`], leaving every other bit alone. Returns
+/// how many instances now carry it — the number the caller reports, and the one a test can assert on
+/// without a GPU.
+fn write_hover_mask(st: &mut render::SceneState, mask: &[bool]) -> usize {
+    let mut lit = 0usize;
+    for (index, instance) in st.instances.iter_mut().enumerate() {
+        let on = mask.get(index).copied().unwrap_or(false);
+        if on {
+            lit += 1;
+        }
+        instance.highlight =
+            render::highlight_with(instance.highlight, render::HIGHLIGHT_HOVERED, on);
+    }
+    st.revision = st.revision.wrapping_add(1);
+    lit
+}
+
+/// Is `leaf` one of `wanted`, or a descendant of one? Memoises every id on the way up.
+fn entity_is_under(
+    engine: &Engine<FlecsWorld>,
+    leaf: EntityId,
+    wanted: &HashSet<EntityId>,
+    memo: &mut HashMap<EntityId, bool>,
+) -> bool {
+    let mut chain: Vec<EntityId> = Vec::new();
+    let mut walker = Some(leaf);
+    let mut answer = false;
+    for _ in 0..64 {
+        let Some(id) = walker else { break };
+        if let Some(known) = memo.get(&id) {
+            answer = *known;
+            break;
+        }
+        chain.push(id);
+        if wanted.contains(&id) {
+            answer = true;
+            break;
+        }
+        walker = engine.parent_of(id);
+    }
+    for id in chain {
+        memo.insert(id, answer);
+    }
+    answer
+}
+
+fn shot_subject_name(engine: &Engine<FlecsWorld>, key: &str) -> Option<String> {
+    EntityId::from_loro_key(key)
+        .filter(|e| engine.entity_exists(*e))
+        .map(|e| entity_display_name(engine, e))
+}
+
 fn refresh_animation_plan(engine: &Engine<FlecsWorld>, preview: &mut AnimationPreviewState) {
     if let Some(transient) = preview.transient_clip.as_ref() {
         // Audition is an isolated render projection. Keep the exact compiled draft active and do not
@@ -8200,14 +8481,15 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
         );
     }
     for error in &pipe_restore_errors {
-        eprintln!("[shell] procedural asset recovery skipped {error}");
+        diag_log!("assets: procedural asset recovery skipped {error}");
     }
     let cad_assets_queued = queue_document_cad_assets(&engine, &assets, &self_tx);
-    if cad_assets_queued > 0 {
-        eprintln!(
-            "[shell] restoring {cad_assets_queued} CAD mesh(es) referenced by the active document in the background"
-        );
-    }
+    diag_log!(
+        "assets: active document references {} CAD mesh handle(s) - {} already resident, {} queued for restore",
+        cad_assets_queued.referenced,
+        cad_assets_queued.resident,
+        cad_assets_queued.queued
+    );
     // The Loro version vector at the last save/open/new (captured AFTER any open/seed, so a fresh session
     // starts "clean"): `dirty = current vv != saved_vv` needs no per-command instrumentation.
     let mut saved_vv: Vec<u8> = engine.version_vector();
@@ -8261,6 +8543,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // worse than that: the answer could change between two frames of one continuous move and the camera
     // would visibly jump mid-shot — an obscured shot traded for a broken one. One slot is enough because
     // `cinema_owner` guarantees exactly one cutscene holds the camera at a time.
+    // The cutscene timeline's viewport preview: the editor holding the CUTSCENE camera at a chosen
+    // moment, with Play stopped. `None` means the author has the viewport.
+    let mut cinema_preview: Option<CinemaPreviewState> = None;
+    // ADR-175 — the cutscene currently being written out to files, if any. Holds the LAST job as well
+    // as the running one: the ledger a render produces is the answer to "where did my frames go", and a
+    // status poll arriving after the final frame must still find it.
+    let mut cinema_render: Option<CinemaRenderJob> = None;
     let mut cinema_shot_plans: Option<(
         EntityId,
         HashMap<usize, metrocalk_animation::shot::ShotAdjustment>,
@@ -8471,12 +8760,18 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
                 if restored == expected {
-                    eprintln!(
-                        "[shell] restored {restored} active-document CAD mesh(es) in {elapsed_ms:.1} ms"
+                    diag_log!(
+                        "assets: restored {restored} document CAD mesh(es) in {elapsed_ms:.1} ms"
                     );
                 } else {
-                    eprintln!(
-                        "[shell] restored {restored}/{expected} active-document CAD mesh(es) in {elapsed_ms:.1} ms — unresolved parts remain explicit placeholders"
+                    // Says what is true rather than what would be reassuring. The unresolved handles
+                    // are NOT drawn as placeholders — nothing is registered with the viewport for
+                    // them, so their entities are simply absent from the picture while the outliner
+                    // count and the import report both keep reporting them. An operator reading only
+                    // those two would conclude the scene loaded.
+                    diag_log!(
+                        "assets: restored {restored}/{expected} document CAD mesh(es) in {elapsed_ms:.1} ms - {} part(s) have NO geometry and will not be drawn; the persisted mesh cache beside the executable is missing or incomplete",
+                        expected - restored
                     );
                 }
             }
@@ -9734,6 +10029,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         log.append(&Record::CinemaShot {
                             id: id.clone(),
                             shot: kind.clone(),
+                            subject: (framed != entity).then(|| framed.to_loro_key()),
                         });
                         if let Some(ch) = &channel {
                             send_proj!(ch, proj_full(&engine, &scene));
@@ -9744,11 +10040,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             .last()
                             .map(|shot| metrocalk_editor_shell::describe_shot(shot, &name))
                             .unwrap_or_default();
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply(
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
                             entity,
                             &cut,
                             &name,
                             format!("Added {last}"),
+                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(e) => {
@@ -9790,11 +10087,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             send_proj!(ch, proj_full(&engine, &scene));
                         }
                         let name = entity_display_name(&engine, entity);
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply(
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
                             entity,
                             &cut,
                             &name,
                             "Shot removed".to_string(),
+                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(e) => {
@@ -9839,11 +10137,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             metrocalk_animation::shot::Mood::Normal => "Normal",
                             metrocalk_animation::shot::Mood::Tense => "Tense",
                         };
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply(
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
                             entity,
                             &cut,
                             &name,
                             format!("Cinematic pacing set to {label}"),
+                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(error) => {
@@ -9851,16 +10150,748 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     }
                 }
             }
+            EngineCmd::CinemaSetDelivery {
+                id,
+                delivery,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - the delivery frame is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::set_delivery_ops(&engine, entity, &delivery) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-delivery", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the delivery frame was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaDelivery {
+                            id: id.clone(),
+                            delivery: delivery.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            format!("Composing for {}", cut.delivery.label()),
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSetShotSeconds {
+                id,
+                index,
+                seconds,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - shot length is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::set_shot_seconds_ops(&engine, entity, index, seconds)
+                {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-seconds", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the length change was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaShotSeconds {
+                            id: id.clone(),
+                            index,
+                            seconds,
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let shown = cut.effective_shot_seconds(index).unwrap_or_default();
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            format!("Shot {} now runs {shown:.1}s", index + 1),
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaMoveShot {
+                id,
+                from,
+                to,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - shot order is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::move_shot_ops(&engine, entity, from, to) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-move", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the reorder was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaMoveShot {
+                            id: id.clone(),
+                            from,
+                            to,
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let landed = to.min(cut.shots.len().saturating_sub(1)) + 1;
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            format!("Shot moved to position {landed}"),
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSetShotFraming {
+                id,
+                index,
+                edit,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - framing is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                match metrocalk_editor_shell::set_shot_framing_ops(&engine, entity, index, &edit) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-framing", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the framing change was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaShotFraming {
+                            id: id.clone(),
+                            index,
+                            edit: edit.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let done = cut
+                            .shots
+                            .get(index)
+                            .map(|shot| {
+                                let who = shot_subject_name(&engine, &shot.subject)
+                                    .unwrap_or_else(|| name.clone());
+                                format!(
+                                    "Shot {} is now {}",
+                                    index + 1,
+                                    metrocalk_editor_shell::describe_shot(shot, &who)
+                                )
+                            })
+                            .unwrap_or_else(|| "Shot re-framed".to_string());
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            done,
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSetShotSubject {
+                id,
+                index,
+                subject,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - what a shot frames is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                let Some(framed) =
+                    EntityId::from_loro_key(&subject).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "the object that shot should frame is no longer in the scene",
+                    ));
+                    continue;
+                };
+                match metrocalk_editor_shell::set_shot_subject_ops(&engine, entity, index, framed) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-subject", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the change was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaShotSubject {
+                            id: id.clone(),
+                            index,
+                            subject: framed.to_loro_key(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let done = cut
+                            .shots
+                            .get(index)
+                            .map(|shot| {
+                                let who = shot_subject_name(&engine, &shot.subject)
+                                    .unwrap_or_else(|| name.clone());
+                                format!(
+                                    "Shot {} is now {}",
+                                    index + 1,
+                                    metrocalk_editor_shell::describe_shot(shot, &who)
+                                )
+                            })
+                            .unwrap_or_else(|| "Shot re-aimed".to_string());
+                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            done,
+                            &|key| shot_subject_name(&engine, key),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSubjectCatalog {
+                id,
+                index,
+                query,
+                reply,
+            } => {
+                let catalog = EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .map(|entity| {
+                        // Marked "current" from the SHOT, not from the panel's own idea of it: the
+                        // picker's tick has to agree with what the document says the shot films, or
+                        // it will show a choice that was undone as still made.
+                        let current = index
+                            .and_then(|i| {
+                                metrocalk_editor_shell::cutscene_of(&engine, entity)
+                                    .shots
+                                    .get(i)
+                                    .map(|shot| shot.subject.clone())
+                            })
+                            .and_then(|key| EntityId::from_loro_key(&key))
+                            .filter(|e| engine.entity_exists(*e))
+                            .or(index.map(|_| entity));
+                        // CLONED, AND HELD FOR AS SHORT A TIME AS POSSIBLE. The alternative is
+                        // holding the render state's lock across a walk of every published
+                        // instance's ancestor chain, which on the imported production line is
+                        // 15,711 chains — with the renderer waiting behind it for a dropdown.
+                        let ids = shared.lock().unwrap().ids.clone();
+                        let drawn = drawn_parts_by_entity(&engine, &ids);
+                        metrocalk_editor_shell::subject_catalog(
+                            &engine,
+                            entity,
+                            current,
+                            &query,
+                            &|e| entity_display_name(&engine, e),
+                            &|e| drawn.get(&e).copied().unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or_default();
+                let _ = reply.send(catalog);
+            }
+            EngineCmd::CinemaSubjectChain { id, reply } => {
+                let chain = EntityId::from_loro_key(&id)
+                    .filter(|e| engine.entity_exists(*e))
+                    .map(|entity| {
+                        // Same clone-and-release discipline as the catalog above, and for the same
+                        // reason: this is asked on hover-settle while the author sweeps the cursor
+                        // over the scene, and holding the render lock across 15,711 ancestor chains
+                        // would stall the renderer behind a read-out.
+                        let ids = shared.lock().unwrap().ids.clone();
+                        let drawn = drawn_parts_by_entity(&engine, &ids);
+                        metrocalk_editor_shell::subject_chain(
+                            &engine,
+                            entity,
+                            &|e| entity_display_name(&engine, e),
+                            &|e| drawn.get(&e).copied().unwrap_or(0),
+                        )
+                    })
+                    .unwrap_or_default();
+                let _ = reply.send(chain);
+            }
+            EngineCmd::ViewportHover { ids, reply } => {
+                // Clone and release, then walk, then take the lock again to write: the walk is over
+                // every drawn instance and the render loop must not queue behind it.
+                let (drawn, hovered, at) = {
+                    let mut st = shared.lock().unwrap();
+                    st.hovered = ids;
+                    (st.ids.clone(), st.hovered.clone(), st.ids_revision)
+                };
+                let mask = hover_mask(&engine, &drawn, &hovered);
+                let lit = {
+                    let mut st = shared.lock().unwrap();
+                    if st.ids_revision == at {
+                        write_hover_mask(&mut st, &mask)
+                    } else {
+                        // A rebuild landed inside the walk, so this mask indexes a list that no
+                        // longer exists. Dropped rather than written at the wrong rows — the rebuild
+                        // re-derived the hover from `st.hovered`, which this set before releasing the
+                        // lock, so the answer on screen is already the right one.
+                        mask.iter().filter(|on| **on).count()
+                    }
+                };
+                let _ = reply.send(lit);
+            }
             EngineCmd::CinemaList { id, reply } => {
                 let info = EntityId::from_loro_key(&id)
                     .filter(|e| engine.entity_exists(*e))
                     .map(|entity| {
                         let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
                         let name = entity_display_name(&engine, entity);
-                        metrocalk_editor_shell::cinema_reply(entity, &cut, &name, String::new())
+                        metrocalk_editor_shell::cinema_reply_named(
+                            entity,
+                            &cut,
+                            &name,
+                            String::new(),
+                            &|key| shot_subject_name(&engine, key),
+                        )
                     })
                     .unwrap_or_default();
                 let _ = reply.send(info);
+            }
+            EngineCmd::CinemaPreview {
+                id,
+                seconds,
+                active,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaPreviewReply;
+                // Leaving is unconditional and always succeeds. It has to be: the ONE way out of a
+                // held camera cannot itself be refusable, or a preview that started before some
+                // other refusal condition arose would strand the viewport.
+                if !active {
+                    let released = end_cinema_preview(&shared, &mut cinema_preview);
+                    let _ = reply.send(CinemaPreviewReply {
+                        message: if released {
+                            "Preview off — the editor camera is back.".into()
+                        } else {
+                            "Preview was already off.".into()
+                        },
+                        ..CinemaPreviewReply::default()
+                    });
+                    continue;
+                }
+                if play_mode {
+                    let _ = reply.send(CinemaPreviewReply::refusal(
+                        "Play is driving the camera — stop Play to preview a shot.",
+                    ));
+                    continue;
+                }
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    end_cinema_preview(&shared, &mut cinema_preview);
+                    let _ = reply.send(CinemaPreviewReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
+                if cut.shots.is_empty() {
+                    end_cinema_preview(&shared, &mut cinema_preview);
+                    let _ = reply.send(CinemaPreviewReply::refusal(
+                        "There is nothing to preview — this object has no shots yet.",
+                    ));
+                    continue;
+                }
+                let at = metrocalk_editor_shell::preview_time(&cut, seconds);
+                let Some(playback) = cut.playback_at(at) else {
+                    // Unreachable while `preview_time` holds `at` inside the cut, which is exactly
+                    // why it is a refusal with a sentence rather than an `expect`: the two live in
+                    // different crates and only this line notices if they ever stop agreeing.
+                    end_cinema_preview(&shared, &mut cinema_preview);
+                    let _ = reply.send(CinemaPreviewReply::refusal(
+                        "that moment is past the end of the cutscene",
+                    ));
+                    continue;
+                };
+                // Take the camera if this is a new preview, and re-plan if the cutscene changed
+                // under one already running. A placement is negotiated against the scene per shot;
+                // holding a plan across an edit would preview the shot as it used to be framed.
+                let preview = hold_cinema_preview(&shared, &mut cinema_preview, entity, &cut);
+                let cam = present_cinematic_moment(
+                    &engine,
+                    &shared,
+                    entity,
+                    &id,
+                    &preview.cut,
+                    playback,
+                    &mut preview.plans,
+                );
+                let name = entity_display_name(&engine, entity);
+                let listing = metrocalk_editor_shell::cinema_reply_named(
+                    entity,
+                    &cut,
+                    &name,
+                    String::new(),
+                    &|key| shot_subject_name(&engine, key),
+                );
+                let row = listing.rows.get(playback.index);
+                let _ = reply.send(CinemaPreviewReply {
+                    active: true,
+                    entity: Some(id),
+                    seconds: at,
+                    shot_index: Some(playback.index),
+                    shots: cut.shots.len(),
+                    reads: row.map(|r| r.reads.clone()).unwrap_or_default(),
+                    subject_name: row.map(|r| r.subject_name.clone()).unwrap_or_default(),
+                    progress: playback.progress,
+                    blending: playback.blend_from.is_some(),
+                    eye: cam.pos,
+                    look_at: cam.look_at.unwrap_or(cam.pos),
+                    fov_deg: cam.fov_deg,
+                    message: format!(
+                        "Previewing shot {} of {} at {at:.1}s",
+                        playback.index + 1,
+                        cut.shots.len()
+                    ),
+                    reason: None,
+                });
+            }
+            EngineCmd::CinemaRenderStart {
+                id,
+                fps,
+                shot,
+                folder,
+                stem,
+                height,
+                format,
+                reply,
+            } => {
+                use metrocalk_editor_shell::{plan_render, RenderFormat, RenderReply, RenderScope};
+                if matches!(cinema_render.as_ref(), Some(job) if !job.finished) {
+                    let _ = reply.send(RenderReply::refusal(
+                        "A render is already running — wait for it, or stop it first.",
+                    ));
+                    continue;
+                }
+                if play_mode {
+                    let _ = reply.send(RenderReply::refusal(
+                        "Play is driving the camera — stop Play to render a cutscene.",
+                    ));
+                    continue;
+                }
+                // Asked BEFORE anything is created on disk, so a machine that cannot produce a single
+                // frame says so instead of leaving an empty folder and a stalled progress bar.
+                //
+                // ADR-177 — ONLY THE WINDOW PATH DEPENDS ON THIS. `frame_capture_supported` is about
+                // the SURFACE allowing `COPY_SRC`; a render at a chosen size reads back a texture this
+                // process created, with that usage set unconditionally. Refusing it here would deny an
+                // adapter the one route it can actually take.
+                if height.is_none() && !shared.lock().unwrap().frame_capture_supported {
+                    let _ = reply.send(RenderReply::refusal(
+                        "This graphics adapter does not let the viewport be copied, so frames cannot be written at the size on screen. Choose an output height instead.",
+                    ));
+                    continue;
+                }
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(RenderReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
+                let scope = shot.map_or(RenderScope::WholeCut, RenderScope::Shot);
+                let sizing = render_sizing(&shared, &cut, height);
+                let plan = match plan_render(&cut, fps, scope, sizing, format) {
+                    Ok(plan) => plan,
+                    Err(why) => {
+                        let _ = reply.send(RenderReply::refusal(why));
+                        continue;
+                    }
+                };
+                let folder = std::path::PathBuf::from(&folder);
+                if let Err(e) = std::fs::create_dir_all(&folder) {
+                    let _ = reply.send(RenderReply::refusal(format!(
+                        "{} could not be opened for writing: {e}",
+                        folder.display()
+                    )));
+                    continue;
+                }
+                // ADR-182 — OPEN THE MOVIE FIRST, before the camera is taken and before a single
+                // instant is posed. An encoder that will not start is a refusal, and a refusal after
+                // the camera has been taken is an editor stuck inside a shot; a refusal after the
+                // first pose is a viewport that flickered into a cutscene and back for nothing. Every
+                // reason this can fail — no Media Foundation, a size the encoder will not accept, a
+                // folder that cannot be written — is knowable here.
+                let stem = metrocalk_editor_shell::sanitise_stem(&stem);
+                let movie_path = folder.join(metrocalk_editor_shell::render_movie_name(&stem));
+                let movie = if plan.format == RenderFormat::Movie {
+                    let spec = video::MovieSpec {
+                        width: plan.width,
+                        height: plan.height,
+                        fps: plan.fps,
+                        bitrate: plan.bitrate,
+                    };
+                    match video::MovieWriter::create(&movie_path, spec) {
+                        Ok(writer) => Some(writer),
+                        Err(why) => {
+                            let _ = reply.send(RenderReply::refusal(why));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Take the camera through the SAME door the timeline preview uses, and pose the first
+                // instant immediately — so the viewport shows frame 1 the moment the render starts
+                // rather than staying on the editor view until the first capture returns.
+                // ADR-177 — TELL THE RENDERER WHAT SIZE THE PICTURE IS, before the first pose. From
+                // here every frame is drawn into targets of exactly this shape and the file is the
+                // whole of them; the window becomes a preview of it. Set only when a height was
+                // chosen, so "as on screen" is the swapchain path it has always been.
+                if height.is_some() {
+                    shared.lock().unwrap().render_size = Some((plan.width, plan.height));
+                }
+                let state = hold_cinema_preview(&shared, &mut cinema_preview, entity, &cut);
+                let first = metrocalk_editor_shell::preview_time(&state.cut, plan.instant(0));
+                let Some(playback) = state.cut.playback_at(first) else {
+                    // Nothing was started, so nothing may be left behind: an offscreen size that
+                    // outlived its refusal would leave the viewport drawing into a texture forever,
+                    // and an opened movie would leave a zero-frame `.mp4` beside a sentence saying
+                    // nothing was rendered.
+                    shared.lock().unwrap().render_size = None;
+                    drop(movie);
+                    let _ = std::fs::remove_file(&movie_path);
+                    let _ = reply.send(RenderReply::refusal(
+                        "the first frame of that render is past the end of the cutscene",
+                    ));
+                    continue;
+                };
+                present_cinematic_moment(
+                    &engine,
+                    &shared,
+                    entity,
+                    &id,
+                    &state.cut,
+                    playback,
+                    &mut state.plans,
+                );
+                // ADR-182 — A MOVIE ASKS FOR PIXELS, NOT A PNG. Same request, same `pose_epoch`
+                // rule, same rectangle; only the last step of the readback differs, and a PNG on the
+                // way to an encoder is a deflate of every frame that the next line decodes and drops.
+                let pending = {
+                    let mut st = shared.lock().unwrap();
+                    if movie.is_some() {
+                        st.request_raw_frame()
+                    } else {
+                        st.request_frame()
+                    }
+                };
+                let offscreen = height.is_some();
+                let job = CinemaRenderJob {
+                    owner: entity,
+                    key: id.clone(),
+                    folder,
+                    stem,
+                    movie,
+                    movie_path,
+                    next: 0,
+                    written: 0,
+                    bytes: 0,
+                    // Stated from the start when the renderer was told what to draw, and left at zero
+                    // when it was not — see `CinemaRenderJob::width`.
+                    width: if offscreen { plan.width } else { 0 },
+                    height: if offscreen { plan.height } else { 0 },
+                    offscreen,
+                    plan,
+                    pending: Some(pending),
+                    failures: Vec::new(),
+                    consecutive_failures: 0,
+                    started: std::time::Instant::now(),
+                    last_progress: std::time::Instant::now(),
+                    finished: false,
+                    outcome: None,
+                };
+                diag_log!(
+                    "cinema: rendering {} frame(s) of {id} at {} fps, {}x{}, into {}",
+                    job.plan.frames,
+                    job.plan.fps,
+                    job.plan.width,
+                    job.plan.height,
+                    job.folder.display()
+                );
+                let _ = reply.send(job.reply());
+                cinema_render = Some(job);
+            }
+            EngineCmd::CinemaRenderPlan {
+                id,
+                fps,
+                shot,
+                height,
+                format,
+                reply,
+            } => {
+                use metrocalk_editor_shell::{plan_render, RenderFormat, RenderReply, RenderScope};
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(RenderReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
+                let scope = shot.map_or(RenderScope::WholeCut, RenderScope::Shot);
+                let sizing = render_sizing(&shared, &cut, height);
+                // ADR-182 — ASK THE MACHINE, not a table about machines. `plan_render` has already
+                // refused a size no H.264 encoder takes; what is left is THIS device's own answer,
+                // which differs between the software encoder Windows falls back to and the hardware
+                // one on the GPU that just drew the frames — and the only honest way to have it is to
+                // build the encoder at the real size and throw it away. Cheap, and it runs once per
+                // change of a control rather than once per frame.
+                let answer =
+                    match plan_render(&cut, fps, scope, sizing, format).and_then(|plan| match plan
+                        .format
+                    {
+                        RenderFormat::Movie => video::probe(video::MovieSpec {
+                            width: plan.width,
+                            height: plan.height,
+                            fps: plan.fps,
+                            bitrate: plan.bitrate,
+                        })
+                        .map(|()| plan),
+                        RenderFormat::Sequence => Ok(plan),
+                    }) {
+                        Ok(plan) => RenderReply {
+                            entity: Some(id),
+                            frames: plan.frames,
+                            fps: plan.fps,
+                            seconds: plan.seconds,
+                            // The SAME two numbers the files will carry, from the same function the job
+                            // runs — so the size above the button is the size in the IHDR.
+                            width: plan.width,
+                            height: plan.height,
+                            format: plan.format,
+                            bitrate: plan.bitrate,
+                            message: format!(
+                                "{} frames · {:.1}s at {} fps · {}x{}",
+                                plan.frames, plan.seconds, plan.fps, plan.width, plan.height
+                            ),
+                            ..RenderReply::default()
+                        },
+                        Err(why) => RenderReply::refusal(why),
+                    };
+                let _ = reply.send(answer);
+            }
+            EngineCmd::CinemaRenderStatus { reply } => {
+                let _ = reply.send(
+                    cinema_render
+                        .as_ref()
+                        .map_or_else(metrocalk_editor_shell::RenderReply::idle, |job| job.reply()),
+                );
+            }
+            EngineCmd::CinemaRenderCancel { reply } => {
+                let answer = match cinema_render.as_mut() {
+                    Some(job) if !job.finished => {
+                        let written = job.written;
+                        job.finish(
+                            &shared,
+                            format!("Render stopped — {written} frame(s) kept."),
+                        );
+                        end_cinema_preview(&shared, &mut cinema_preview);
+                        job.reply()
+                    }
+                    // Cancelling a finished job is not an error: it is the ledger being dismissed, and
+                    // the honest answer is the ledger it dismissed.
+                    Some(job) => job.reply(),
+                    None => metrocalk_editor_shell::RenderReply::idle(),
+                };
+                let _ = reply.send(answer);
             }
             EngineCmd::ConditionAdd { id, request, reply } => {
                 use metrocalk_editor_shell::RoleReply;
@@ -10789,19 +11820,19 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // camera block) — a projection, never Loro/undo (ADR-021). `on=false` → back to the fly-cam.
                 let found = if on {
                     if let Some((p, fov, near, far)) = capscene::active_camera(&engine) {
-                        shared.lock().unwrap().cam_override = Some(render::CamView {
+                        shared.lock().unwrap().publish_camera(Some(render::CamView {
                             pos: p,
                             look_at: None,
                             fov_deg: fov,
                             near,
                             far,
-                        });
+                        }));
                         true
                     } else {
                         false
                     }
                 } else {
-                    shared.lock().unwrap().cam_override = None;
+                    shared.lock().unwrap().publish_camera(None);
                     true
                 };
                 let _ = reply.send(found);
@@ -14421,11 +15452,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             );
                         }
                         let cad_queued = queue_document_cad_assets(&engine, &assets, &self_tx);
-                        if cad_queued > 0 {
-                            eprintln!(
-                                "[shell] restoring {cad_queued} CAD mesh(es) referenced by the opened project in the background"
-                            );
-                        }
+                        diag_log!(
+                            "assets: opened project references {} CAD mesh handle(s) - {} already resident, {} queued for restore",
+                            cad_queued.referenced,
+                            cad_queued.resident,
+                            cad_queued.queued
+                        );
                         rebuild(&engine, &shared, &mut positions, &assets);
                         if let Some(ch) = &channel {
                             send_proj!(ch, proj_full(&engine, &scene));
@@ -14513,17 +15545,21 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     // pre-Play editor view so Stop restores it; if no camera is active, keep the current
                     // view (fly-cam or a manual look-through). Render-only — never touches the doc.
                     let active = capscene::active_camera(&engine);
+                    // Hand back a held preview FIRST. `pre_play_cam` is what Stop restores, and a
+                    // preview pose captured there would end Play by putting the author back inside
+                    // a shot they were only looking at.
+                    end_cinema_preview(&shared, &mut cinema_preview);
                     {
                         let mut st = shared.lock().unwrap();
                         pre_play_cam = st.cam_override;
                         if let Some((p, fov, near, far)) = active {
-                            st.cam_override = Some(render::CamView {
+                            st.publish_camera(Some(render::CamView {
                                 pos: p,
                                 look_at: None,
                                 fov_deg: fov,
                                 near,
                                 far,
-                            });
+                            }));
                         }
                     }
                     (recording, rec_entities, sim, body_of) =
@@ -14839,7 +15875,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         st.fx_revision = st.fx_revision.wrapping_add(1);
                     }
                     if let Some(saved) = cinema_saved_cam.take() {
-                        shared.lock().unwrap().cam_override = saved;
+                        shared.lock().unwrap().publish_camera(saved);
                     }
                     player_axis = [0.0, 0.0];
                     dying_enemies.clear();
@@ -14851,7 +15887,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     animation_preview.loop_policy = AnimationLoopPolicy::Once;
                     ANIMATION_POSES.with(|poses| poses.borrow_mut().clear());
                     // M11.4 — leave look-through: restore the pre-Play editor view (fly-cam or manual).
-                    shared.lock().unwrap().cam_override = pre_play_cam.take();
+                    shared.lock().unwrap().publish_camera(pre_play_cam.take());
                     recency.clear(); // ECS handles changed on the restore swap — drop stale ranking state
                     touch = 0;
                     rebuild(&engine, &shared, &mut positions, &assets);
@@ -14881,6 +15917,11 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
             EngineCmd::Tick => {
                 pending_ticks.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 let tick_started = std::time::Instant::now();
+                // ADR-175 — a render advances on the heartbeat, before anything else this tick does.
+                // First because it is the one thing here that is waiting on ANOTHER thread: the sooner
+                // the next pose is published, the sooner the render thread can draw the frame this job
+                // is going to spend the next tick waiting for.
+                advance_cinema_render(&engine, &shared, &mut cinema_render, &mut cinema_preview);
                 // One fixed-`dt` step + a delta sync of the moved bodies' transforms to the viewport, and
                 // (only if the debugger is open) a refresh of the read-only overlay. A no-op until a body
                 // exists + the sim runs. NEVER a commit/Loro write (ADR-021). Off the JS hot path (inv. 4).
@@ -15199,9 +16240,6 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 // the render projection ADR-021 already sanctions. On the falling edge — or when the
                 // shot list runs out — we hand the camera back exactly as we found it.
                 if play_mode && !play_cinematics.is_empty() {
-                    use metrocalk_animation::shot::{
-                        cinematic_clip_planes, solve_shot_adjusted, ShotAdjustment,
-                    };
                     for (entity, key, cut, started, played) in &mut play_cinematics {
                         let wants = rule_session.as_ref().is_some_and(|s| {
                             matches!(
@@ -15243,14 +16281,24 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 // rebuilds, and a rebuild during a cutscene (an undo, a delete, a door
                                 // reopening) would otherwise re-outline an unrelated object when the
                                 // shot ended.
-                                cinema_dimmed =
-                                    st.instances.iter().position(|i| i.selected > 0.5).and_then(
-                                        |i| {
-                                            let was = st.instances[i].selected;
-                                            st.instances[i].selected = 0.0;
-                                            st.ids.get(i).map(|k| (k.clone(), was))
-                                        },
-                                    );
+                                cinema_dimmed = st
+                                    .instances
+                                    .iter()
+                                    .position(|i| {
+                                        render::highlight_has(
+                                            i.highlight,
+                                            render::HIGHLIGHT_SELECTED,
+                                        )
+                                    })
+                                    .and_then(|i| {
+                                        let was = st.instances[i].highlight;
+                                        st.instances[i].highlight = render::highlight_with(
+                                            was,
+                                            render::HIGHLIGHT_SELECTED,
+                                            false,
+                                        );
+                                        st.ids.get(i).map(|k| (k.clone(), was))
+                                    });
                                 st.revision = st.revision.wrapping_add(1);
                                 drop(st);
                                 cinema_owner = Some(*entity);
@@ -15266,7 +16314,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 cinema_shot_plans = None;
                                 let mut st = shared.lock().unwrap();
                                 if let Some(saved) = cinema_saved_cam.take() {
-                                    st.cam_override = saved;
+                                    st.publish_camera(saved);
                                 }
                                 restore_editor_chrome(&mut st, &mut cinema_dimmed);
                             }
@@ -15294,119 +16342,30 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             cinema_shot_plans = None;
                             let mut st = shared.lock().unwrap();
                             if let Some(saved) = cinema_saved_cam.take() {
-                                st.cam_override = saved;
+                                st.publish_camera(saved);
                             }
                             restore_editor_chrome(&mut st, &mut cinema_dimmed);
                             continue;
                         };
-                        let shot = &cut.shots[playback.index];
-                        // Sample both sides of an intra-cutscene transition LIVE. A previous shot may
-                        // film a different subject, so reusing the current bounds would make the blend
-                        // aim between a correct pose and a pose solved around the wrong object.
-                        let (sample, previous_sample, aspect, plan, previous_plan) = {
-                            let mut st = shared.lock().unwrap();
-                            // The subject sampler reads per-instance mesh bounds; make sure it reads
-                            // them from the memo rather than re-walking every vertex of every part in
-                            // the subject's subtree, once per tick, at 60 Hz.
-                            st.sync_mesh_bounds();
-                            let sample =
-                                cinematic_shot_subject_sample(&engine, &mut st, *entity, shot);
-                            let previous_sample = playback.blend_from.map(|(previous, _)| {
-                                cinematic_shot_subject_sample(
-                                    &engine,
-                                    &mut st,
-                                    *entity,
-                                    &cut.shots[previous],
-                                )
-                            });
-                            let aspect = if st.surface_aspect.is_finite() && st.surface_aspect > 0.1
-                            {
-                                st.surface_aspect
-                            } else {
-                                16.0 / 9.0
-                            };
-                            // Negotiate this shot's placement against the rest of the scene, ONCE,
-                            // the first tick it is live. Every later tick reads the answer back out.
-                            let plans = match &mut cinema_shot_plans {
-                                Some((owner, plans)) if owner == entity => plans,
-                                slot => {
-                                    *slot = Some((*entity, HashMap::new()));
-                                    &mut slot.as_mut().expect("just assigned").1
-                                }
-                            };
-                            let plan = *plans.entry(playback.index).or_insert_with(|| {
-                                plan_cinematic_shot(&engine, &mut st, *entity, shot, sample, aspect)
-                            });
-                            // The shot being blended FROM was live a moment ago, so its placement is
-                            // already decided; falling back to the authored one would make a blend
-                            // start from a pose the planner had rejected.
-                            let previous_plan = playback.blend_from.map(|(previous, _)| {
-                                plans.get(&previous).copied().unwrap_or_else(|| {
-                                    ShotAdjustment::authored(&cut.shots[previous])
-                                })
-                            });
-                            (sample, previous_sample, aspect, plan, previous_plan)
+                        // ONE SOLVER, TWO CALLERS — see `present_cinematic_moment`. The cutscene
+                        // timeline's preview runs the same function at the playhead, so the frame an
+                        // author composes before pressing Play is the frame Play films.
+                        let plans = match &mut cinema_shot_plans {
+                            Some((owner, plans)) if owner == entity => plans,
+                            slot => {
+                                *slot = Some((*entity, HashMap::new()));
+                                &mut slot.as_mut().expect("just assigned").1
+                            }
                         };
-                        let current_pose = solve_shot_adjusted(
-                            shot,
-                            plan,
-                            sample,
-                            playback.progress,
-                            aspect,
-                            50.0,
+                        present_cinematic_moment(
+                            &engine,
+                            &shared,
+                            *entity,
+                            key.as_str(),
+                            cut,
+                            playback,
+                            plans,
                         );
-                        let previous_pose = playback.blend_from.zip(previous_sample).map(
-                            |((previous, _), previous_sample)| {
-                                solve_shot_adjusted(
-                                    &cut.shots[previous],
-                                    previous_plan.unwrap_or_else(|| {
-                                        ShotAdjustment::authored(&cut.shots[previous])
-                                    }),
-                                    previous_sample,
-                                    1.0,
-                                    aspect,
-                                    50.0,
-                                )
-                            },
-                        );
-                        // Both endpoints already stand on or above `CAMERA_FLOOR` (`solve_shot_adjusted`
-                        // applies it), and a blend is a linear mix of two poses, so the blended eye
-                        // cannot be lower than the lower of them. The floor moved into the solve because
-                        // the shot PLANNER has to judge the pose that is actually filmed: clamping after
-                        // the fact meant a low-angle candidate was validated at a position under the
-                        // floor and then filmed from somewhere else.
-                        let pose = playback.blend_camera(previous_pose, current_pose);
-                        let planes_for = |subject: metrocalk_animation::shot::SubjectSample| {
-                            let camera_distance = pose
-                                .eye
-                                .iter()
-                                .zip(subject.center)
-                                .map(|(eye, center)| (eye - center).powi(2))
-                                .sum::<f32>()
-                                .sqrt();
-                            cinematic_clip_planes(subject.radius(), camera_distance)
-                        };
-                        let (mut near, mut far) = planes_for(sample);
-                        if let Some(previous_sample) = previous_sample {
-                            let (previous_near, previous_far) = planes_for(previous_sample);
-                            near = near.min(previous_near);
-                            far = far.max(previous_far);
-                        }
-                        let mut st = shared.lock().unwrap();
-                        st.cinematic_subject_id = Some(key.clone());
-                        st.cinematic_shot_index = Some(playback.index);
-                        st.cam_override = Some(render::CamView {
-                            pos: pose.eye,
-                            look_at: Some(pose.look_at),
-                            fov_deg: pose.fov_deg,
-                            near,
-                            far,
-                        });
-                        // NOT a revision bump. `revision` means "the scene changed": it re-partitions
-                        // every instance, re-uploads every buffer and RECREATES every submesh and LOD
-                        // bind group - a per-frame cost the render loop explicitly documents as never
-                        // happening per frame. `cam_override` is read outside that gate, so a camera
-                        // move needs nothing here at all.
                     }
                 }
                 // ── VFX: resolve every live effect into the render projection ───────────────────
@@ -15491,7 +16450,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 center: p.position,
                                 scale: p.radius,
                                 color: p.color,
-                                selected: p.alpha,
+                                // The particle carrier reuses this lane as OPACITY, exactly as it reuses `color`
+                                // as HDR radiance and `scale` as a radius.
+                                highlight: p.alpha,
                                 rotation: render::IDENTITY_QUAT,
                                 material: [0.0; 4],
                             };
@@ -15535,7 +16496,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 center: p.position,
                                 scale: p.radius,
                                 color: p.color,
-                                selected: p.alpha,
+                                // The particle carrier reuses this lane as OPACITY, exactly as it reuses `color`
+                                // as HDR radiance and `scale` as a radius.
+                                highlight: p.alpha,
                                 rotation: render::IDENTITY_QUAT,
                                 material: [0.0; 4],
                             };
@@ -16899,7 +17862,7 @@ fn push_overlay(
             center: a,
             scale: 0.0,
             color,
-            selected: 0.0,
+            highlight: 0.0,
             rotation: render::IDENTITY_QUAT,
             material: [0.0; 4],
         });
@@ -16907,7 +17870,7 @@ fn push_overlay(
             center: b,
             scale: 0.0,
             color,
-            selected: 0.0,
+            highlight: 0.0,
             rotation: render::IDENTITY_QUAT,
             material: [0.0; 4],
         });
@@ -17542,7 +18505,7 @@ fn glyph_pt(center: [f32; 3], color: [f32; 3]) -> Instance {
         center,
         scale: 0.0,
         color,
-        selected: 0.0,
+        highlight: 0.0,
         rotation: render::IDENTITY_QUAT,
         material: [0.0; 4],
     }
@@ -18754,7 +19717,7 @@ fn rebuild(
             center: p,
             scale,
             color: c,
-            selected: 0.0,
+            highlight: 0.0,
             rotation: rot,
             material: mat_override,
         });
@@ -18777,7 +19740,7 @@ fn rebuild(
             center,
             scale: 0.0,
             color: TRACK_LINE_COLOR,
-            selected: 0.0,
+            highlight: 0.0,
             rotation: render::IDENTITY_QUAT,
             material: [0.0; 4],
         })
@@ -18809,8 +19772,14 @@ fn rebuild(
     st.lights_revision = st.lights_revision.wrapping_add(1);
     st.selected = prev_sel_id.and_then(|id| st.ids.iter().position(|k| *k == id));
     if let Some(i) = st.selected {
-        st.instances[i].selected = 1.0;
+        st.instances[i].highlight =
+            render::highlight_with(st.instances[i].highlight, render::HIGHLIGHT_SELECTED, true);
     }
+    // A hover is a fact about the CURSOR, and a rebuild is a fact about the DOCUMENT: the instance
+    // list has just been rewritten, so every hover bit on it names a row that may no longer exist.
+    // Re-applied from the surviving hover set rather than carried by index.
+    let mask = hover_mask(engine, &st.ids, &st.hovered);
+    write_hover_mask(&mut st, &mask);
     // Keep an active gizmo drag pinned to its entity by ID; if the dragged entity is gone (deleted
     // elsewhere), end the drag cleanly rather than freezing it on a stale index.
     st.gizmo_sel = prev_gizmo_id.and_then(|id| st.ids.iter().position(|k| *k == id));
@@ -19939,7 +20908,8 @@ fn viewport_pick(
     }
     let camera = scene_pick::camera_for(&st);
     let viewport = scene_pick::viewport_for(&st, dpi);
-    let ray = camera.ray_through_fraction(&viewport, f64::from(x), f64::from(y));
+    let (fx, fy) = scene_pick::frame_fraction(&st, f64::from(x), f64::from(y));
+    let ray = camera.ray_through_fraction(&viewport, fx, fy);
 
     let mut cache = state.picking.lock().unwrap();
     cache.sync(&st);
@@ -19984,11 +20954,41 @@ fn viewport_peek(
     // object and selecting another.
     let camera = scene_pick::camera_for(&st);
     let viewport = scene_pick::viewport_for(&st, dpi);
-    let ray = camera.ray_through_fraction(&viewport, f64::from(x), f64::from(y));
+    let (fx, fy) = scene_pick::frame_fraction(&st, f64::from(x), f64::from(y));
+    let ray = camera.ray_through_fraction(&viewport, fx, fy);
     let mut cache = state.picking.lock().unwrap();
     cache.sync(&st);
     let hit = cache.nearest(&camera, &viewport, &ray, &scene_pick::click_filter());
     hit.as_ref().and_then(|h| scene_pick::entity_of(&st, h))
+}
+
+/// Say what the cursor is over, so the STAGE can answer as well as the badge.
+///
+/// The gap this closes: `viewport_peek` has named the object under the cursor since M3.3, and nothing
+/// on screen ever lit up. Aiming a shot on an imported line therefore read as `Box · 1 part` **in**
+/// `Assembly Hall · 7 parts` over a picture in which nothing distinguished either — the author had to
+/// take the badge's word for which of 15 711 parts the click was about.
+///
+/// Each id lights its whole DRAWN SUBTREE, which is what makes an assembly rung mean something you can
+/// see. Empty clears it. Returns how many instances are lit, so the caller can tell "you are pointing
+/// at 378 parts" from "that subject has no geometry" — the same distinction the picker's rows make.
+///
+/// A RENDER PROJECTION, never document state: no transaction, no undo entry, nothing persisted, and a
+/// rebuild re-derives it from the same subjects rather than carrying stale indices. `async` because it
+/// walks the drawn set on the engine thread, and the JS only calls it when the hovered subject CHANGES
+/// (invariant 4 — never per frame).
+#[tauri::command(async)]
+fn viewport_hover(state: State<AppState>, ids: Vec<String>) -> usize {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::ViewportHover { ids, reply })
+        .is_err()
+    {
+        return 0;
+    }
+    recv_reply(&rx).unwrap_or(0)
 }
 
 /// Marquee (box) selection. The two corners are normalized `[0,1]` surface fractions, **in the order
@@ -20009,8 +21009,12 @@ fn viewport_pick_region(
     let mut st = state.shared.lock().unwrap();
     let camera = scene_pick::camera_for(&st);
     let viewport = scene_pick::viewport_for(&st, dpi);
-    let start = viewport.fraction_to_ndc(f64::from(x0), f64::from(y0));
-    let end = viewport.fraction_to_ndc(f64::from(x1), f64::from(y1));
+    let corner = |x: f32, y: f32| {
+        let (fx, fy) = scene_pick::frame_fraction(&st, f64::from(x), f64::from(y));
+        viewport.fraction_to_ndc(fx, fy)
+    };
+    let start = corner(x0, y0);
+    let end = corner(x1, y1);
     let rect = metrocalk_spatial::ScreenRect::from_drag([start.0, start.1], [end.0, end.1]);
 
     let mut cache = state.picking.lock().unwrap();
@@ -20051,7 +21055,8 @@ fn pick_diagnostics(
     let st = state.shared.lock().unwrap();
     let camera = scene_pick::camera_for(&st);
     let viewport = scene_pick::viewport_for(&st, dpi);
-    let ray = camera.ray_through_fraction(&viewport, f64::from(x), f64::from(y));
+    let (fx, fy) = scene_pick::frame_fraction(&st, f64::from(x), f64::from(y));
+    let ray = camera.ray_through_fraction(&viewport, fx, fy);
     let mut cache = state.picking.lock().unwrap();
     cache.sync(&st);
     let started = std::time::Instant::now();
@@ -20750,12 +21755,17 @@ fn gizmo_select(state: State<AppState>, id: String) -> bool {
     };
     if let Some(p) = st.selected {
         if p < st.instances.len() {
-            st.instances[p].selected = 0.0;
+            st.instances[p].highlight = render::highlight_with(
+                st.instances[p].highlight,
+                render::HIGHLIGHT_SELECTED,
+                false,
+            );
         }
     }
     st.selected = Some(i);
     if i < st.instances.len() {
-        st.instances[i].selected = 1.0;
+        st.instances[i].highlight =
+            render::highlight_with(st.instances[i].highlight, render::HIGHLIGHT_SELECTED, true);
     }
     st.revision = st.revision.wrapping_add(1);
     true
@@ -20797,7 +21807,7 @@ fn gizmo_pick_drag(
         st.orbit,
         st.elevation,
         st.distance,
-        aspect,
+        st.view_frame(aspect),
         st.cam_target,
         st.projection,
     );
@@ -20872,7 +21882,7 @@ fn gizmo_grab(window: tauri::WebviewWindow, state: State<AppState>, axis: String
         st.orbit,
         st.elevation,
         st.distance,
-        aspect,
+        st.view_frame(aspect),
         st.cam_target,
         st.projection,
     );
@@ -20899,7 +21909,7 @@ fn gizmo_set_target(
         st.orbit,
         st.elevation,
         st.distance,
-        aspect,
+        st.view_frame(aspect),
         st.cam_target,
         st.projection,
     );
@@ -20940,7 +21950,7 @@ fn gizmo_handle_screen(
         st.orbit,
         st.elevation,
         st.distance,
-        aspect,
+        st.view_frame(aspect),
         st.cam_target,
         st.projection,
     )
@@ -20979,7 +21989,7 @@ fn gizmo_drag_end(window: tauri::WebviewWindow, state: State<AppState>) {
                         st.orbit,
                         st.elevation,
                         st.distance,
-                        aspect,
+                        st.view_frame(aspect),
                         st.cam_target,
                         st.projection,
                     );
@@ -21240,7 +22250,9 @@ fn pipe_world_point_scene(
                 rotated[2] + inst.center[2],
             ]
         };
-        for triangle in mesh.indices.chunks_exact(3) {
+        // `as_chunks::<3>()` rather than `chunks_exact(3)`: it yields `&[u32; 3]`, so the compiler
+        // knows the length the code already assumed. `clippy::chunks_exact_to_as_chunks` (1.98).
+        for triangle in mesh.indices.as_chunks::<3>().0 {
             let [a, b, c] = [
                 triangle[0] as usize,
                 triangle[1] as usize,
@@ -21348,7 +22360,7 @@ fn pipe_forge_point(
             st.orbit,
             elevation,
             distance,
-            aspect,
+            st.view_frame(aspect),
             st.cam_target,
             st.projection,
         );
@@ -21686,6 +22698,7 @@ fn cinematic_subject_sample(
             center,
             half_extent,
             forward: [0.0, 0.0, 1.0],
+            stage: state.camera_stage(),
         };
     }
 
@@ -21697,6 +22710,7 @@ fn cinematic_subject_sample(
         center: fallback_transform.translation,
         half_extent: [half; 3],
         forward: [0.0, 0.0, 1.0],
+        stage: state.camera_stage(),
     }
 }
 
@@ -21727,6 +22741,133 @@ fn cinematic_shot_subject(
 ///
 /// Called ONCE per shot. The occlusion structure it needs is built on first use and then reused for the
 /// whole film, so the cost lands on one tick near the start of a cutscene rather than on all of them.
+/// Pose the viewport camera for ONE moment of ONE cutscene, and hand that pose back.
+///
+/// ONE SOLVER, TWO CALLERS. This is the entire camera solve: subject sampling on both sides of a
+/// transition, the once-per-shot placement negotiation, the eased pose, the blend, and clip planes
+/// fitted to the subject and then widened for the room it is standing in. Play calls it every tick
+/// from the replay-stamped frame counter; the cutscene timeline's preview calls it at the playhead.
+/// It is one function because a preview that solved the frame a second way would be a picture of a
+/// shot the engine does not film — the one thing a preview must never be.
+///
+/// `plans` is the caller's per-shot placement cache. A shot's placement is negotiated against the
+/// scene ONCE and then held for the shot's whole length: re-planning per tick is the same query
+/// answered sixty times a second, and worse, its answer can change between two frames of one
+/// continuous move, which the camera would show as a jump.
+///
+/// Writes `cam_override` and the two diagnostic identity fields, and deliberately does NOT bump
+/// `revision`: `revision` means "the scene changed", and re-partitioning every instance for a camera
+/// move is a per-frame cost the render loop documents as never happening.
+fn present_cinematic_moment(
+    engine: &Engine<FlecsWorld>,
+    shared: &render::Shared,
+    entity: EntityId,
+    key: &str,
+    cut: &metrocalk_animation::shot::Cutscene,
+    playback: metrocalk_animation::shot::ShotPlayback,
+    plans: &mut HashMap<usize, metrocalk_animation::shot::ShotAdjustment>,
+) -> render::CamView {
+    use metrocalk_animation::shot::{cinematic_clip_planes, solve_shot_adjusted, ShotAdjustment};
+
+    let shot = &cut.shots[playback.index];
+    // Sample both sides of an intra-cutscene transition LIVE. A previous shot may
+    // film a different subject, so reusing the current bounds would make the blend
+    // aim between a correct pose and a pose solved around the wrong object.
+    let (sample, previous_sample, aspect, plan, previous_plan) = {
+        let mut st = shared.lock().unwrap();
+        // The subject sampler reads per-instance mesh bounds; make sure it reads
+        // them from the memo rather than re-walking every vertex of every part in
+        // the subject's subtree, once per tick, at 60 Hz.
+        st.sync_mesh_bounds();
+        let sample = cinematic_shot_subject_sample(engine, &mut st, entity, shot);
+        let previous_sample = playback.blend_from.map(|(previous, _)| {
+            cinematic_shot_subject_sample(engine, &mut st, entity, &cut.shots[previous])
+        });
+        // THE FRAME THIS CUTSCENE IS DELIVERED IN, before anything reads an aspect ratio from the
+        // state. Published here because it is the same tick that poses the camera: the solver's fit,
+        // the projection the render loop shears and the bars it scissors are then all one answer.
+        st.delivery_aspect = cut.delivery.ratio();
+        let aspect = st.composition_aspect();
+        // Negotiate this shot's placement against the rest of the scene, ONCE,
+        // the first tick it is live. Every later tick reads the answer back out.
+        let plan = *plans
+            .entry(playback.index)
+            .or_insert_with(|| plan_cinematic_shot(engine, &mut st, entity, shot, sample, aspect));
+        // The shot being blended FROM was live a moment ago, so its placement is
+        // already decided; falling back to the authored one would make a blend
+        // start from a pose the planner had rejected.
+        let previous_plan = playback.blend_from.map(|(previous, _)| {
+            plans
+                .get(&previous)
+                .copied()
+                .unwrap_or_else(|| ShotAdjustment::authored(&cut.shots[previous]))
+        });
+        (sample, previous_sample, aspect, plan, previous_plan)
+    };
+    let current_pose = solve_shot_adjusted(shot, plan, sample, playback.progress, aspect, 50.0);
+    let previous_pose =
+        playback
+            .blend_from
+            .zip(previous_sample)
+            .map(|((previous, _), previous_sample)| {
+                solve_shot_adjusted(
+                    &cut.shots[previous],
+                    previous_plan.unwrap_or_else(|| ShotAdjustment::authored(&cut.shots[previous])),
+                    previous_sample,
+                    1.0,
+                    aspect,
+                    50.0,
+                )
+            });
+    // Both endpoints already stand on or above `CAMERA_FLOOR` (`solve_shot_adjusted`
+    // applies it), and a blend is a linear mix of two poses, so the blended eye
+    // cannot be lower than the lower of them. The floor moved into the solve because
+    // the shot PLANNER has to judge the pose that is actually filmed: clamping after
+    // the fact meant a low-angle candidate was validated at a position under the
+    // floor and then filmed from somewhere else.
+    let pose = playback.blend_camera(previous_pose, current_pose);
+    let planes_for = |subject: metrocalk_animation::shot::SubjectSample| {
+        let camera_distance = pose
+            .eye
+            .iter()
+            .zip(subject.center)
+            .map(|(eye, center)| (eye - center).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        cinematic_clip_planes(subject.radius(), camera_distance)
+    };
+    let (mut near, mut far) = planes_for(sample);
+    if let Some(previous_sample) = previous_sample {
+        let (previous_near, previous_far) = planes_for(previous_sample);
+        near = near.min(previous_near);
+        far = far.max(previous_far);
+    }
+    let mut st = shared.lock().unwrap();
+    // Let the shot see the room it is standing in. The planes above are fitted to
+    // the subject, which clips a presentation hall out of every close shot and
+    // slices a wall across every wide one; see `Hall::far_reach_from`. A scene with
+    // no room keeps exactly the number it had.
+    if let Some(hall) = st.hall {
+        far = far.max(hall.far_reach_from(pose.eye));
+    }
+    let cam = render::CamView {
+        pos: pose.eye,
+        look_at: Some(pose.look_at),
+        fov_deg: pose.fov_deg,
+        near,
+        far,
+    };
+    st.cinematic_subject_id = Some(key.to_string());
+    st.cinematic_shot_index = Some(playback.index);
+    // NOT a revision bump. `revision` means "the scene changed": it re-partitions
+    // every instance, re-uploads every buffer and RECREATES every submesh and LOD
+    // bind group - a per-frame cost the render loop explicitly documents as never
+    // happening per frame. `cam_override` is read outside that gate, so a camera
+    // move needs nothing here at all.
+    st.publish_camera(Some(cam));
+    cam
+}
+
 fn plan_cinematic_shot(
     engine: &Engine<FlecsWorld>,
     state: &mut render::SceneState,
@@ -21773,6 +22914,13 @@ fn plan_cinematic_shot(
     if state.cinematic_placements.len() >= MAX_RECORDED_PLACEMENTS {
         state.cinematic_placements.remove(0);
     }
+    // The oracle's own reading of the placement it settled on, taken at mid-shot. One extra ray budget
+    // (0-3 ms, the same cost the planner already pays per candidate) buys the ability to tell "the
+    // negotiation never ran" from "the negotiation ran and was satisfied by this" -- which are different
+    // faults with opposite fixes, and were indistinguishable in the previous record.
+    let filmed =
+        metrocalk_animation::shot::solve_shot_adjusted(shot, plan, sample, 0.5, aspect, 50.0);
+    let vantage = state.vantage(filmed.eye, filmed.look_at, sample.center, radius, &subject);
     state.cinematic_placements.push(render::CinematicPlacement {
         shot: shot.id.clone(),
         subject: key.clone(),
@@ -21780,6 +22928,7 @@ fn plan_cinematic_shot(
         filmed_size: name_of(plan.size),
         yaw_offset_deg: plan.yaw_offset_deg,
         rejected: plan.steps,
+        vantage,
     });
     // NEVER SILENT. A film that quietly re-aimed half its shots and a film that was directed well are
     // indistinguishable from the outside, and the difference is the whole point of the mechanism.
@@ -21838,11 +22987,128 @@ fn cinematic_shot_subject_sample(
 /// Hand the viewport back to the author: the selection outline returns and the gizmo/binding-line
 /// suppression lifts. Idempotent, because a cutscene can end down several paths (its shots run out, a
 /// rule turns it off, or the user presses Stop) and every one of them must leave the same editor.
+/// The editor holding a cutscene's camera at one chosen moment, with Play stopped.
+///
+/// Everything here exists so the preview can be UNDONE without an undo: the author's own view, the
+/// selection outline the shot suppressed, and the per-shot placements — which are cached for the
+/// same reason Play caches them, and cleared when the cutscene under them is edited.
+struct CinemaPreviewState {
+    /// The object whose cutscene is on screen.
+    owner: EntityId,
+    /// The cutscene as it was when these placements were negotiated. Compared, not trusted: an edit
+    /// while previewing must re-plan, or the preview shows the shot as it USED to be framed.
+    cut: metrocalk_animation::shot::Cutscene,
+    /// The author's camera, restored on the way out.
+    saved_cam: Option<render::CamView>,
+    /// The selection outline suppressed for the shot, and the value to put back.
+    dimmed: Option<(String, f32)>,
+    /// Per-shot placements, exactly as Play caches them.
+    plans: HashMap<usize, metrocalk_animation::shot::ShotAdjustment>,
+}
+
+/// Hand the viewport back to the author. Idempotent, and it answers whether it had anything to give
+/// back so the reply can tell the truth about which of two things happened.
+fn end_cinema_preview(shared: &render::Shared, slot: &mut Option<CinemaPreviewState>) -> bool {
+    let Some(mut preview) = slot.take() else {
+        return false;
+    };
+    let mut st = shared.lock().unwrap();
+    st.publish_camera(preview.saved_cam);
+    restore_editor_chrome(&mut st, &mut preview.dimmed);
+    true
+}
+
+/// Take the viewport camera for `entity`'s cutscene, or keep the one already held for it.
+///
+/// THE ONE PLACE THE CAMERA IS TAKEN. Both callers — the timeline's preview and a render job — need
+/// the same four things done together (hand back whoever had it, remember the author's view, turn the
+/// viewport from a workspace into a picture, and suppress the selection outline a shot must not
+/// contain), and a second copy of that sequence is a second chance to leave the author inside a shot.
+/// ADR-177 — the three facts [`metrocalk_editor_shell::render_frame_size`] turns into a pixel size.
+///
+/// The aspect comes from the CUT's own delivery frame, not from `composition_aspect()`. That reads the
+/// live composition, which only insets to the delivery while something is actually holding the camera —
+/// and at plan time, with a dialog open over the ordinary editor view, nothing is. Reading it there
+/// would have printed a 16:9 cost above a 2.39:1 render, which is the exact failure the cost sentence
+/// exists to prevent.
+fn render_sizing(
+    shared: &Shared,
+    cut: &metrocalk_animation::shot::Cutscene,
+    height: Option<u32>,
+) -> metrocalk_editor_shell::FrameSizing {
+    let st = shared.lock().unwrap();
+    let [vw, vh] = st.composed_pixels;
+    let stage = if vh > 0 {
+        vw as f32 / vh as f32
+    } else {
+        st.known_surface_aspect()
+    };
+    metrocalk_editor_shell::FrameSizing {
+        height,
+        viewport: (vw, vh),
+        aspect: cut.delivery.ratio().unwrap_or(stage),
+        max_dimension: st.max_render_dimension,
+    }
+}
+
+fn hold_cinema_preview<'a>(
+    shared: &render::Shared,
+    slot: &'a mut Option<CinemaPreviewState>,
+    entity: EntityId,
+    cut: &metrocalk_animation::shot::Cutscene,
+) -> &'a mut CinemaPreviewState {
+    if matches!(slot.as_ref(), Some(state) if state.owner == entity) {
+        let state = slot.as_mut().expect("just matched");
+        // An edit while previewing must re-plan, or the preview shows the shot as it USED to be framed.
+        if state.cut != *cut {
+            state.cut = cut.clone();
+            state.plans.clear();
+        }
+        return state;
+    }
+    // A different object: hand the first one's camera back before taking a second, so the saved view
+    // stays the AUTHOR's view rather than a shot.
+    end_cinema_preview(shared, slot);
+    let (saved_cam, dimmed) = {
+        let mut st = shared.lock().unwrap();
+        let saved_cam = st.cam_override;
+        // The viewport stops being a workspace: editor helpers and the selection outline are exactly
+        // what a shot must not contain.
+        st.cinematic = true;
+        st.revision = st.revision.wrapping_add(1);
+        let dimmed = st
+            .instances
+            .iter()
+            .position(|i| render::highlight_has(i.highlight, render::HIGHLIGHT_SELECTED))
+            .and_then(|i| {
+                let was = st.instances[i].highlight;
+                st.instances[i].highlight =
+                    render::highlight_with(was, render::HIGHLIGHT_SELECTED, false);
+                st.ids.get(i).map(|k| (k.clone(), was))
+            });
+        (saved_cam, dimmed)
+    };
+    *slot = Some(CinemaPreviewState {
+        owner: entity,
+        cut: cut.clone(),
+        saved_cam,
+        dimmed,
+        plans: HashMap::new(),
+    });
+    slot.as_mut().expect("just assigned")
+}
+
 fn restore_editor_chrome(st: &mut render::SceneState, dimmed: &mut Option<(String, f32)>) {
     if let Some((key, was)) = dimmed.take() {
         if let Some(i) = st.ids.iter().position(|k| *k == key) {
             if let Some(inst) = st.instances.get_mut(i) {
-                inst.selected = was;
+                // Only the bit that was suppressed. Restoring the whole code would resurrect a hover
+                // the cursor left while the shot was playing.
+                inst.highlight = render::highlight_with(
+                    inst.highlight,
+                    render::HIGHLIGHT_SELECTED,
+                    render::highlight_has(was, render::HIGHLIGHT_SELECTED),
+                );
             }
         }
     }
@@ -21852,6 +23118,367 @@ fn restore_editor_chrome(st: &mut render::SceneState, dimmed: &mut Option<(Strin
     }
     st.cinematic_subject_id = None;
     st.cinematic_shot_index = None;
+    // The delivery frame belongs to the shot, not to the editor. Leaving it set would letterbox the
+    // author's own viewport after the preview handed the camera back.
+    st.delivery_aspect = None;
+}
+
+/// ADR-175 — a cutscene being written out to files, one frame at a time.
+///
+/// It is a state machine and not a loop for one reason: a frame is only real once the render thread has
+/// DRAWN it, and the render thread runs on its own clock. So the job poses frame *n*, asks for a
+/// capture, and then does nothing at all until that capture comes back — which is what makes a render
+/// of 600 frames cost one IPC to start, one to finish, and however many the progress bar polls, rather
+/// than one per frame (invariant 4, product principle 2).
+///
+/// It borrows the PREVIEW's camera rather than taking its own. There is one viewport camera and one way
+/// to hold it; a second holder would need its own release-on-Play, release-on-selection-change and
+/// release-on-panel-close, and the day one of those was missed the author's view would be stuck inside
+/// a shot with no way out.
+struct CinemaRenderJob {
+    /// The object whose cutscene is being filmed.
+    owner: EntityId,
+    /// Its Loro key, for the reply and for `present_cinematic_moment`.
+    key: String,
+    /// What is being filmed, decided once, before anything was written.
+    plan: metrocalk_editor_shell::RenderPlan,
+    /// Where the frames go.
+    folder: std::path::PathBuf,
+    /// The name they share.
+    stem: String,
+    /// ADR-182 — the movie being encoded, or `None` for a PNG sequence.
+    ///
+    /// OPENED BEFORE THE CAMERA IS TAKEN and finalised in [`CinemaRenderJob::finish`] — the same one
+    /// exit `render_size` is cleared on, for the same reason: a render ends six ways, and a container
+    /// closed on five of them is a file that plays on five of them.
+    movie: Option<video::MovieWriter>,
+    /// Where that movie is. Held even for a sequence, so the ledger has one place to name the output
+    /// from and the refusal paths have one file to remove.
+    movie_path: std::path::PathBuf,
+    /// The next frame index to pose. Advances on a written frame AND on a failed one, so a job can
+    /// never sit on one bad frame forever.
+    next: u32,
+    /// How many files exist.
+    written: u32,
+    bytes: u64,
+    /// The size the frames are actually being written at: seeded from the plan when the renderer was
+    /// GIVEN a size (there is nothing to measure — it either draws at that size or fails), and
+    /// otherwise `0 x 0` until the first capture arrives, because the window can move under a render.
+    width: u32,
+    height: u32,
+    /// ADR-177 — whether this job put the renderer into targets of its own.
+    offscreen: bool,
+    /// The capture this job is waiting on, if any.
+    pending: Option<u64>,
+    /// Every frame that did not make it, each with its own sentence.
+    failures: Vec<String>,
+    /// Consecutive failures. A render whose every frame fails must stop and say so rather than write
+    /// twelve thousand sentences about the same broken adapter.
+    consecutive_failures: u32,
+    started: std::time::Instant,
+    /// When this job last did anything at all — collected a frame, or asked for one.
+    ///
+    /// A capture is answered by a DRAWN frame, and a minimised or occluded window can stop vending
+    /// swapchain textures entirely (`get_current_texture` returns `Outdated`, the loop `continue`s and
+    /// nothing is drawn). Without a deadline the job then waits forever, the progress bar holds at the
+    /// frame it reached, and nothing anywhere says why — the inert state `<ux_quality>` 6 forbids,
+    /// wearing a spinner.
+    last_progress: std::time::Instant,
+    /// Set when the job is over. The job STAYS in its slot after this, because the ledger is the whole
+    /// point of the thing and a status poll a second later must still be able to read it.
+    finished: bool,
+    /// The closing sentence, once there is one.
+    outcome: Option<String>,
+}
+
+/// How many frames in a row may fail before the render gives up.
+const RENDER_FAILURE_LIMIT: u32 = 5;
+
+/// How long a render may wait for one frame before it stops and says why.
+///
+/// Generous, because a single frame of a large imported assembly can genuinely take seconds on the
+/// low-end target, and a deadline that fires on a slow machine is a worse failure than no deadline at
+/// all. It is not a performance budget — it is the difference between "this is taking a while" and "no
+/// frame is ever going to arrive".
+const RENDER_STALL_SECONDS: u64 = 30;
+
+impl CinemaRenderJob {
+    /// This job as the one reply shape every render command answers with.
+    fn reply(&self) -> metrocalk_editor_shell::RenderReply {
+        metrocalk_editor_shell::RenderReply {
+            running: !self.finished,
+            done: self.finished,
+            entity: Some(self.key.clone()),
+            frames: self.plan.frames,
+            written: self.written,
+            width: self.width,
+            height: self.height,
+            offscreen: self.offscreen,
+            format: self.plan.format,
+            bitrate: self.plan.bitrate,
+            fps: self.plan.fps,
+            seconds: self.plan.seconds,
+            folder: self.folder.display().to_string(),
+            stem: self.stem.clone(),
+            bytes: self.bytes,
+            elapsed_ms: u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            failures: self.failures.clone(),
+            message: self.outcome.clone().unwrap_or_else(|| {
+                // `next`, not `written`: the frame being worked on, which is what a progress line
+                // names. The BAR is `written / frames` — files that exist — and with a lost frame the
+                // two differ by exactly the number the failures list explains.
+                format!(
+                    "Rendering frame {} of {}",
+                    (self.next + 1).min(self.plan.frames),
+                    self.plan.frames
+                )
+            }),
+            reason: None,
+        }
+    }
+
+    /// ADR-182 — the movie this job delivers, by file name, or `None` for a sequence.
+    ///
+    /// Keyed on the PLAN's format rather than on whether the writer is still held: `finish` takes the
+    /// writer to close it, so a sentence built after that point would stop naming the file exactly
+    /// when it finally exists.
+    fn movie_name(&self) -> Option<String> {
+        if self.plan.format != metrocalk_editor_shell::RenderFormat::Movie {
+            return None;
+        }
+        self.movie_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    }
+
+    /// Close the job with a sentence, let go of the capture it was waiting on, and give the viewport
+    /// its own size back.
+    ///
+    /// ONE exit, for the reason `publish_camera` is one: a render ends six ways — every frame written,
+    /// cancelled, the camera taken, the cut changed, five failures in a row, a stalled surface — and a
+    /// size cleared on five of them is a viewport left drawing into an offscreen texture forever, with
+    /// nothing on screen updating and no control anywhere to turn it off.
+    fn finish(&mut self, shared: &render::Shared, outcome: String) {
+        {
+            let mut st = shared.lock().unwrap();
+            if let Some(req) = self.pending.take() {
+                st.forget_frame(req);
+            }
+            st.render_size = None;
+        }
+        // ADR-182 — CLOSE THE CONTAINER HERE, on every one of the six endings, because an MP4 that was
+        // never finalised is a file the operating system will show at the right size and no player
+        // will open. A cancelled render keeps what it encoded, exactly as a cancelled sequence keeps
+        // the frames it wrote — so the close is unconditional and its failure is appended to the
+        // outcome rather than replacing it, which would throw away the sentence saying WHY it ended.
+        let mut outcome = outcome;
+        if let Some(movie) = self.movie.take() {
+            match movie.finish(&self.movie_path) {
+                Ok(bytes) => self.bytes = bytes,
+                Err(why) => {
+                    self.failures.push(why.clone());
+                    outcome = format!("{outcome} — but the movie could not be closed: {why}");
+                }
+            }
+        }
+        self.finished = true;
+        self.outcome = Some(outcome);
+    }
+}
+
+/// Move a render on by at most one frame. Called from the engine's heartbeat, so a job progresses
+/// whether or not anybody is polling it.
+///
+/// Returns `true` if this call did any work, so the caller can tell an idle tick from a rendering one.
+fn advance_cinema_render(
+    engine: &Engine<FlecsWorld>,
+    shared: &render::Shared,
+    job: &mut Option<CinemaRenderJob>,
+    preview: &mut Option<CinemaPreviewState>,
+) -> bool {
+    let Some(active) = job.as_mut() else {
+        return false;
+    };
+    if active.finished {
+        return false;
+    }
+    // THE CAMERA IS THE PREVIEW'S. If something took it — Play started, the author selected another
+    // object, the panel closed — the frames from here on would be of whatever is on screen now, which
+    // is a sequence that looks nearly right and is not the cut. Stop, and say why.
+    let holding = matches!(preview.as_ref(), Some(state) if state.owner == active.owner);
+    if !holding {
+        let written = active.written;
+        active.finish(
+            shared,
+            format!(
+                "Render stopped after {written} frame(s) — something else took the viewport camera."
+            ),
+        );
+        return true;
+    }
+    // 1. Collect the frame asked for last time, if it has been drawn yet.
+    //
+    // The take is BOUND before the match rather than being its scrutinee, so the lock is released
+    // before the disk write below. A `match shared.lock()…` holds the guard for the whole statement,
+    // and the render thread takes that same lock at the top of every frame — so writing half a
+    // megabyte of PNG inside the arm would stall the very thread this job is waiting on.
+    if let Some(req) = active.pending {
+        let taken = shared.lock().unwrap().take_frame(req);
+        match taken {
+            render::FrameTake::Pending => {
+                // NOT FOREVER. A window that has stopped vending swapchain textures never draws the
+                // frame this is waiting for, and a job with no deadline holds its progress bar at the
+                // frame it reached with nothing anywhere saying why.
+                if active.last_progress.elapsed()
+                    >= std::time::Duration::from_secs(RENDER_STALL_SECONDS)
+                {
+                    let written = active.written;
+                    active.finish(
+                        shared,
+                        format!(
+                            "Render stopped after {written} frame(s) — the viewport produced no frame for {RENDER_STALL_SECONDS}s. It may be minimised or hidden."
+                        ),
+                    );
+                    return true;
+                }
+                return false;
+            }
+            render::FrameTake::Ready {
+                pixels,
+                width,
+                height,
+            } => {
+                active.pending = None;
+                active.width = width;
+                active.height = height;
+                // ADR-182 — ONE FRAME, TWO DELIVERIES, ONE ACCOUNT OF WHAT HAPPENED TO IT. Both arms
+                // advance `next`, both count a success in `written` and both put their own sentence in
+                // `failures`, so the ledger, the progress bar and the five-in-a-row stop rule read the
+                // same numbers whichever one ran. The movie's `bytes` is the file's own size, taken
+                // once at `finish` — a running total of encoded frame sizes would be a number nobody
+                // can check against the thing on disk.
+                let outcome = match active.movie.as_mut() {
+                    Some(movie) => movie
+                        .push_rgba(&pixels)
+                        .map_err(|why| format!("frame {}: {why}", active.next + 1)),
+                    None => {
+                        let path = active
+                            .folder
+                            .join(metrocalk_editor_shell::render_frame_name(
+                                &active.stem,
+                                active.next,
+                            ));
+                        std::fs::write(&path, &pixels)
+                            .map(|()| active.bytes += pixels.len() as u64)
+                            .map_err(|e| {
+                                format!(
+                                    "frame {} could not be written to {}: {e}",
+                                    active.next + 1,
+                                    path.display()
+                                )
+                            })
+                    }
+                };
+                match outcome {
+                    Ok(()) => {
+                        active.written += 1;
+                        active.consecutive_failures = 0;
+                    }
+                    Err(why) => {
+                        active.failures.push(why);
+                        active.consecutive_failures += 1;
+                    }
+                }
+                active.next += 1;
+                active.last_progress = std::time::Instant::now();
+            }
+            render::FrameTake::Failed(why) => {
+                active.pending = None;
+                active
+                    .failures
+                    .push(format!("frame {}: {why}", active.next + 1));
+                active.consecutive_failures += 1;
+                active.next += 1;
+                active.last_progress = std::time::Instant::now();
+            }
+        }
+        if active.consecutive_failures >= RENDER_FAILURE_LIMIT {
+            let last = active
+                .failures
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "the frames could not be captured".into());
+            let written = active.written;
+            active.finish(
+                shared,
+                format!("Render stopped after {written} frame(s) — {last}"),
+            );
+            return true;
+        }
+    }
+    // 2. Every frame accounted for: close the ledger and hand the camera back.
+    if active.next >= active.plan.frames {
+        let written = active.written;
+        let lost = active.failures.len();
+        let seconds = active.started.elapsed().as_secs_f32();
+        let outcome = if lost == 0 {
+            // ADR-182 — A SEQUENCE'S OUTPUT IS THE FOLDER, A MOVIE'S IS ONE FILE. "Rendered 120
+            // frames" is the whole answer for a folder of 120 files and only half of it for a movie,
+            // where the next question is which of the things in that folder is the film.
+            match active.movie_name() {
+                Some(name) => format!(
+                    "Rendered {written} frames at {}x{} in {seconds:.1}s into {name}",
+                    active.width, active.height
+                ),
+                None => format!(
+                    "Rendered {written} frames at {}x{} in {seconds:.1}s",
+                    active.width, active.height
+                ),
+            }
+        } else {
+            format!(
+                "Rendered {written} of {} frames — {lost} could not be written",
+                active.plan.frames
+            )
+        };
+        active.finish(shared, outcome);
+        end_cinema_preview(shared, preview);
+        return true;
+    }
+    // 3. Pose the next instant and ask for its picture. The order matters and is the whole reason
+    //    `pose_epoch` exists: the request must record the camera it is asking about, so the frame
+    //    already in flight — drawn at the PREVIOUS instant — cannot answer it.
+    let Some(state) = preview.as_mut() else {
+        return false;
+    };
+    let at = metrocalk_editor_shell::preview_time(&state.cut, active.plan.instant(active.next));
+    let Some(playback) = state.cut.playback_at(at) else {
+        let written = active.written;
+        active.finish(
+            shared,
+            format!("Render stopped after {written} frame(s) — the cutscene changed while it ran."),
+        );
+        return true;
+    };
+    present_cinematic_moment(
+        engine,
+        shared,
+        active.owner,
+        &active.key,
+        &state.cut,
+        playback,
+        &mut state.plans,
+    );
+    active.pending = Some({
+        let mut st = shared.lock().unwrap();
+        if active.movie.is_some() {
+            st.request_raw_frame()
+        } else {
+            st.request_frame()
+        }
+    });
+    active.last_progress = std::time::Instant::now();
+    true
 }
 
 /// Fire an object's ONE-SHOT effect layers as a detached burst, anchored where the object currently is.
@@ -21975,7 +23602,8 @@ fn step_parts_from_scene(
 
         let mut triangles = Vec::new();
         for prim in &mesh.primitives {
-            for tri in prim.indices.chunks_exact(3) {
+            // Same as above: a fixed-size chunk the type system can see.
+            for tri in prim.indices.as_chunks::<3>().0 {
                 let (Some(a), Some(b), Some(c)) = (
                     prim.positions.get(tri[0] as usize),
                     prim.positions.get(tri[1] as usize),
@@ -22437,6 +24065,12 @@ fn camera_probe(state: State<AppState>) -> serde_json::Value {
         "fovDeg": fov,
         "cinematic": cinematic,
         "distance": distance,
+        // THE RECTANGLE THE PICTURE IS COMPOSED FOR, and the one the viewer can see, in surface
+        // fractions. Two rectangles rather than one because their DIFFERENCE is the letterbox: a
+        // reader (or a test) can say both "the framing followed the dock" and "the bars are real"
+        // from the same probe, without either being a claim about a screenshot.
+        "frame": st.composition_rect(),
+        "visibleRect": st.adopted_visible_rect(),
         "subjectId": st.cinematic_subject_id.clone(),
         "shotIndex": st.cinematic_shot_index,
         "visitedSubjects": st.cinematic_visited_subjects.clone(),
@@ -22456,6 +24090,17 @@ fn camera_probe(state: State<AppState>) -> serde_json::Value {
                     "rejected": placement.rejected,
                     "asDirected": placement.directed_size == placement.filmed_size
                         && placement.yaw_offset_deg == 0.0,
+                    // What the negotiation saw at the placement it settled on. `rejected: 0` with an
+                    // acceptable vantage and an illegible frame is the oracle disagreeing with the
+                    // picture, which is a different fault from the mechanism not running.
+                    "vantage": {
+                        "eyeInside": placement.vantage.eye_inside,
+                        "clear": placement.vantage.clear,
+                        "backing": placement.vantage.backing,
+                        "crowded": placement.vantage.crowded,
+                        "acceptable": placement.vantage.acceptable(),
+                        "score": placement.vantage.score(),
+                    },
                 })
             })
             .collect::<Vec<_>>(),
@@ -22543,6 +24188,209 @@ fn cinema_set_mood(
     })
 }
 
+/// Set the frame the cutscene is composed and delivered in (one undoable commit).
+#[tauri::command(async)]
+fn cinema_set_delivery(
+    state: State<AppState>,
+    id: String,
+    delivery: String,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetDelivery {
+            id,
+            delivery,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The delivery frame did not finish in time")
+    })
+}
+
+/// The framing vocabulary and the bounds a shot must respect. Static data.
+///
+/// Published by the side that VALIDATES it, so the shot inspector's three dropdowns cannot offer a
+/// word `set_shot_framing_ops` will refuse.
+#[tauri::command(async)]
+fn cinema_framing_catalog() -> metrocalk_editor_shell::FramingCatalog {
+    ipc();
+    metrocalk_editor_shell::framing_catalog()
+}
+
+/// Set one shot's authored length in seconds (one undoable commit).
+#[tauri::command(async)]
+fn cinema_set_shot_seconds(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+    seconds: f32,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetShotSeconds {
+            id,
+            index,
+            seconds,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The length change did not finish in time")
+    })
+}
+
+/// Move one shot to another position in the list (one undoable commit).
+#[tauri::command(async)]
+fn cinema_move_shot(
+    state: State<AppState>,
+    id: String,
+    from: usize,
+    to: usize,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaMoveShot {
+            id,
+            from,
+            to,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The reorder did not finish in time")
+    })
+}
+
+/// Re-frame one shot in place — size, angle, move, strength — without losing its place or its length.
+#[tauri::command(async)]
+fn cinema_set_shot_framing(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+    edit: metrocalk_editor_shell::FramingEdit,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetShotFraming {
+            id,
+            index,
+            edit,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The framing change did not finish in time")
+    })
+}
+
+/// Point one shot at a different object, without losing its place, its length or its framing.
+///
+/// The command the subject picker commits through. Separate from `cinema_set_shot_framing` because a
+/// subject is an entity that can leave the scene, not a word from a closed vocabulary: it is checked
+/// against the live document and refused by name rather than silently redirected at the cutscene's
+/// own owner.
+#[tauri::command(async)]
+fn cinema_set_shot_subject(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+    subject: String,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetShotSubject {
+            id,
+            index,
+            subject,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The subject change did not finish in time")
+    })
+}
+
+/// The objects a shot could frame, ranked by the scene's own hierarchy — or searched by name.
+///
+/// A READ. Published by the side that validates the choice, and carrying the two facts the author
+/// needs to make it: what each candidate is called, and how many DRAWN parts are under it. The second
+/// is why this cannot be computed in the editor from the projection: whether a subject has geometry
+/// under it is a question about the render list, and a subject with none is framed by the solver at
+/// its own origin — a plausible camera pointed at nothing.
+#[tauri::command(async)]
+fn cinema_subject_catalog(
+    state: State<AppState>,
+    id: String,
+    index: Option<usize>,
+    query: Option<String>,
+) -> metrocalk_editor_shell::SubjectCatalog {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSubjectCatalog {
+            id,
+            index,
+            query: query.unwrap_or_default(),
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::SubjectCatalog::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
+/// The object under the cursor and the chain it hangs from — what a click on the stage could mean.
+///
+/// A READ, and the second half of aiming a shot by pointing at it. `viewport_peek` answers WHICH
+/// object without touching the selection; this answers what that object IS — its name, how many drawn
+/// parts sit under it, and the same for every assembly it belongs to. A click on an imported line
+/// lands on one bolt, and the shot the author meant is usually the machine that bolt is part of; the
+/// chain is what lets the badge offer both without guessing.
+#[tauri::command(async)]
+fn cinema_subject_chain(
+    state: State<AppState>,
+    id: String,
+) -> metrocalk_editor_shell::SubjectCatalog {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSubjectChain { id, reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::SubjectCatalog::default();
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
 /// An object's cutscene, read back as sentences plus any continuity warnings.
 #[tauri::command(async)]
 fn cinema_list(state: State<AppState>, id: String) -> metrocalk_editor_shell::CinemaReply {
@@ -22552,6 +24400,275 @@ fn cinema_list(state: State<AppState>, id: String) -> metrocalk_editor_shell::Ci
         return metrocalk_editor_shell::CinemaReply::default();
     }
     recv_reply(&rx).unwrap_or_default()
+}
+
+/// Pose the viewport camera at one moment of a cutscene, or hand it back.
+///
+/// The single largest distance this closes: `solve_shot` has always been pure in
+/// `(recipe, subject, t)`, so the engine could produce the camera at ANY instant, and the only way a
+/// user could see one was to press Play and watch the cut from its start. The playhead now answers
+/// "what does this look like" as well as "which shot is this".
+#[tauri::command(async)]
+fn cinema_preview(
+    state: State<AppState>,
+    id: String,
+    seconds: f32,
+    active: bool,
+) -> metrocalk_editor_shell::CinemaPreviewReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaPreview {
+            id,
+            seconds,
+            active,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaPreviewReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaPreviewReply::refusal("The preview did not finish in time")
+    })
+}
+
+/// ADR-182 — the delivery a render command was asked for.
+///
+/// `None` on the wire is the DEFAULT and not an error: every caller that predates this asked for a
+/// render without naming a delivery, and the honest answer to "render this" is the engine's own
+/// default one. A name that is not one of the two IS an error, for the reason an unoffered frame rate
+/// is — a render that quietly became something else would deliver the wrong thing and say nothing.
+fn render_format(name: Option<&str>) -> Option<metrocalk_editor_shell::RenderFormat> {
+    match name {
+        None => Some(metrocalk_editor_shell::RenderFormat::default()),
+        Some(key) => metrocalk_editor_shell::RenderFormat::from_key(key),
+    }
+}
+
+/// The sentence for a delivery this build does not offer, naming the ones it does.
+fn unknown_format(name: Option<&str>) -> String {
+    format!(
+        "{} is not a delivery this build renders - choose {}.",
+        name.unwrap_or_default(),
+        metrocalk_editor_shell::RenderFormat::all()
+            .iter()
+            .map(|f| f.key())
+            .collect::<Vec<_>>()
+            .join(" or ")
+    )
+}
+
+/// ADR-175 — the folder a rendered sequence goes into, chosen by the author.
+///
+/// A folder and not a file, because a render writes a numbered SEQUENCE: asking for one file name and
+/// then writing 600 files beside it is the surprise a picker exists to prevent. `None` means the dialog
+/// was dismissed, which is a decision and not an error.
+fn pick_render_folder(app: &tauri::AppHandle) -> Option<String> {
+    app.dialog()
+        .file()
+        .set_title("Choose a folder for the rendered frames")
+        .blocking_pick_folder()
+        .and_then(|folder| folder.into_path().ok())
+        .map(|path| path.display().to_string())
+}
+
+/// ADR-175 — start writing a cutscene out as a numbered PNG sequence.
+///
+/// Returns as soon as the job is accepted, carrying the plan it accepted: how many frames, at what
+/// rate, into which folder. The progress is read with [`cinema_render_status`], because a render is
+/// minutes of work and a command that returned at the end of it would be a frozen editor.
+#[tauri::command(async)]
+// A Tauri command's parameters ARE its wire shape: each one is a separate named field the UI sends,
+// and grouping them into a struct here would only move the same eight names one level down while
+// making the invoke payload a nested object nothing else in this file uses.
+#[allow(clippy::too_many_arguments)]
+fn cinema_render_start(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    id: String,
+    fps: u32,
+    shot: Option<usize>,
+    folder: Option<String>,
+    stem: String,
+    height: Option<u32>,
+    format: Option<String>,
+) -> metrocalk_editor_shell::RenderReply {
+    ipc();
+    use metrocalk_editor_shell::RenderReply;
+    let Some(delivery) = render_format(format.as_deref()) else {
+        return RenderReply::refusal(unknown_format(format.as_deref()));
+    };
+    let Some(folder) = folder.or_else(|| pick_render_folder(&app)) else {
+        return RenderReply::refusal("Render canceled — no folder was chosen.");
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaRenderStart {
+            id,
+            fps,
+            shot,
+            folder,
+            stem,
+            height,
+            format: delivery,
+            reply,
+        })
+        .is_err()
+    {
+        return RenderReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| RenderReply::refusal("The render did not start in time"))
+}
+
+/// ADR-175 — what a render would produce, without producing it. The dialog's cost sentence.
+#[tauri::command(async)]
+fn cinema_render_plan(
+    state: State<AppState>,
+    id: String,
+    fps: u32,
+    shot: Option<usize>,
+    height: Option<u32>,
+    format: Option<String>,
+) -> metrocalk_editor_shell::RenderReply {
+    ipc();
+    let Some(delivery) = render_format(format.as_deref()) else {
+        return metrocalk_editor_shell::RenderReply::refusal(unknown_format(format.as_deref()));
+    };
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaRenderPlan {
+            id,
+            fps,
+            shot,
+            height,
+            format: delivery,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::RenderReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::RenderReply::refusal("The render plan did not arrive in time")
+    })
+}
+
+/// ADR-175 — how far the running render has got, or the ledger of the last one.
+#[tauri::command(async)]
+fn cinema_render_status(state: State<AppState>) -> metrocalk_editor_shell::RenderReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaRenderStatus { reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::RenderReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::RenderReply::refusal("The render did not answer in time")
+    })
+}
+
+/// ADR-175 — stop the running render. The frames already written stay.
+#[tauri::command(async)]
+fn cinema_render_cancel(state: State<AppState>) -> metrocalk_editor_shell::RenderReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaRenderCancel { reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::RenderReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::RenderReply::refusal("The render did not answer in time")
+    })
+}
+
+/// ADR-175 — write the picture currently on the stage to a PNG the author names.
+///
+/// The engine thread is not involved at all: this asks the RENDER thread for its next frame and writes
+/// what comes back. Nothing is posed, so what lands in the file is what was on screen — including a
+/// held cutscene preview, which is what makes "get me a still of this shot" one click rather than a
+/// render of one frame into a folder.
+#[tauri::command(async)]
+fn viewport_capture(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    path: Option<String>,
+) -> metrocalk_editor_shell::RenderReply {
+    ipc();
+    use metrocalk_editor_shell::RenderReply;
+    if !state.shared.lock().unwrap().frame_capture_supported {
+        return RenderReply::refusal(
+            "This graphics adapter does not let the viewport be copied, so a frame cannot be saved.",
+        );
+    }
+    let Some(path) = path.or_else(|| {
+        app.dialog()
+            .file()
+            .add_filter("PNG image", &["png"])
+            .set_file_name("frame.png")
+            .blocking_save_file()
+            .and_then(|file| file.into_path().ok())
+            .map(|p| p.display().to_string())
+    }) else {
+        return RenderReply::refusal("Save canceled — no file was chosen.");
+    };
+    let started = std::time::Instant::now();
+    let req = state.shared.lock().unwrap().request_frame();
+    // Poll rather than block on a condvar: the render thread may be mid-frame, and at 60 Hz the answer
+    // is at most two frames away. The deadline is generous because a first frame after a large import
+    // can take much longer than a steady-state one — and it is a DEADLINE, so a stalled surface
+    // produces a sentence instead of a command that never returns.
+    let deadline = std::time::Duration::from_secs(10);
+    loop {
+        // Bound, not a scrutinee: the guard would otherwise live across the `fs::write` below, and the
+        // render thread takes that same lock at the top of every frame.
+        let taken = state.shared.lock().unwrap().take_frame(req);
+        match taken {
+            render::FrameTake::Ready {
+                pixels,
+                width,
+                height,
+            } => {
+                // A still is asked for with `request_frame`, so these bytes are a PNG. The raw door is
+                // `request_raw_frame`, and only a movie render goes through it.
+                let bytes = pixels.len() as u64;
+                if let Err(e) = std::fs::write(&path, &pixels) {
+                    return RenderReply::refusal(format!("{path} could not be written: {e}"));
+                }
+                return RenderReply {
+                    done: true,
+                    frames: 1,
+                    written: 1,
+                    width,
+                    height,
+                    folder: path.clone(),
+                    bytes,
+                    elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+                    message: format!("Saved {width}x{height} to {path}"),
+                    ..RenderReply::default()
+                };
+            }
+            render::FrameTake::Failed(why) => return RenderReply::refusal(why),
+            render::FrameTake::Pending => {
+                if started.elapsed() > deadline {
+                    state.shared.lock().unwrap().forget_frame(req);
+                    return RenderReply::refusal(
+                        "The viewport did not produce a frame to save — it may be minimised or hidden.",
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        }
+    }
 }
 
 /// The conditional catalogue: every "only if" card the Behaviour block offers. Static data.
@@ -23091,6 +25208,83 @@ fn look_through_camera(state: State<AppState>, on: bool) -> bool {
     recv_reply(&rx).unwrap_or(false)
 }
 
+/// Stand the viewport camera at an explicit eye and aim it at an explicit target — a look-dev vantage.
+///
+/// Render-only, exactly like [`look_through_camera`]: it writes the camera override and creates no
+/// entity, changes no component and enters no undo. What it adds is the ability to say where to STAND
+/// and where to LOOK in one call.
+///
+/// # Why this did not already exist, and what its absence cost
+///
+/// Neither existing way to move a camera can express a vantage. `view_preset` and `frame_all` choose the
+/// vantage FOR you out of the scene's bounds. `add_camera` places a scene camera carrying a position, a
+/// field of view and **no aim at all** — [`render::CamView::look_at`] is left `None`, which means "keep
+/// aiming at the editor's orbit target". So every camera it creates looks at the same point, and only
+/// its position differs.
+///
+/// That is not a theoretical gap. The presentation lab places its four vantages with `add_camera`, and in
+/// its own recorded notes THREE of them report the same eye, the same target and the same distance; an
+/// earlier run wrote two of the stills as byte-identical files. The vantage described in that lab as
+/// "looking up: the half of the frame that is void in every film so far" — the only one that would show
+/// whether the room has a roof — has never once been captured, in any run, because it was not sayable.
+///
+/// # Clip planes
+///
+/// Near and far come from the same solver the cutscene uses rather than from a second opinion, so a
+/// look-dev frame has the cutscene's depth precision. At this scene's scale that is the difference
+/// between a clean floor and z-fighting across a 400 m slab.
+///
+/// Returns the pose actually adopted so a caller can ASSERT the camera went where it was sent. A lab that
+/// assumes its own camera moved is how three vantages became one.
+#[tauri::command]
+fn set_look_dev_camera(
+    state: State<AppState>,
+    eye: [f32; 3],
+    look_at: [f32; 3],
+    fov: f32,
+) -> serde_json::Value {
+    ipc();
+    if !eye.iter().chain(look_at.iter()).all(|v| v.is_finite()) || !fov.is_finite() {
+        return serde_json::json!({
+            "error": "a non-finite eye, target or field of view would put a NaN in the view matrix"
+        });
+    }
+    let offset = [
+        eye[0] - look_at[0],
+        eye[1] - look_at[1],
+        eye[2] - look_at[2],
+    ];
+    let distance = offset.iter().map(|c| c * c).sum::<f32>().sqrt();
+    if distance < 1.0e-4 {
+        return serde_json::json!({
+            "error": "the eye and the target are the same point, so there is no direction to look in"
+        });
+    }
+    let fov_deg = fov.clamp(5.0, 120.0);
+    // The clip solver's first argument is "how big is the thing being looked at". At look-dev the caller
+    // has not said, so the stand-off is the only scale available; a tenth of it is the radius a subject
+    // filling a normal frame at that distance would have.
+    let (near, far) = metrocalk_animation::shot::cinematic_clip_planes(distance * 0.1, distance);
+    {
+        let mut st = state.shared.lock().unwrap();
+        st.publish_camera(Some(render::CamView {
+            pos: eye,
+            look_at: Some(look_at),
+            fov_deg,
+            near,
+            far,
+        }));
+    }
+    serde_json::json!({
+        "eye": eye,
+        "lookAt": look_at,
+        "fovDeg": fov_deg,
+        "near": near,
+        "far": far,
+        "distance": distance,
+    })
+}
+
 /// M11.4 — non-mutating SCENE-camera read for the gate: (authored Camera entities, an active one present,
 /// the active fov in degrees or -1). Distinct from `camera_debug`, which reports the editor fly-cam state.
 #[tauri::command(async)]
@@ -23266,6 +25460,57 @@ fn set_working_space(state: State<AppState>, space: String) -> String {
     };
     state.shared.lock().unwrap().working_space = w;
     w.wire().to_string()
+}
+
+/// Choose the room the scene is presented in — open studio ground, or an industrial hall around it.
+///
+/// A presentation choice, with exactly the standing of the view transform beside it: it creates no
+/// entity, changes no component, moves no count in the import report, and never enters the document or
+/// undo. What it changes is what a camera standing in the scene can SEE, and on a large imported plant
+/// that turns out to be the difference between a well-presented machine in an empty field and an
+/// industrial visualisation.
+///
+/// Returns the wire name of the set that is now live, so a caller can tell "applied" from "the word I
+/// sent was not a set" without a second round trip. An unknown name is refused rather than defaulted:
+/// silently presenting the studio for a caller that asked for the hall would be a wrong picture
+/// reported as a right one.
+#[tauri::command]
+fn set_presentation_set(state: State<AppState>, set: String) -> String {
+    ipc();
+    let Some(chosen) = render::PresentationSet::parse(&set) else {
+        return format!("unknown: {set}");
+    };
+    let mut st = state.shared.lock().unwrap();
+    st.presentation_set = chosen;
+    // The room's memo is keyed on what is IN the scene, and this changed the answer without changing
+    // the scene — the one case that key cannot see.
+    st.invalidate_stage();
+    chosen.wire().to_string()
+}
+
+/// Which room the scene is being presented in, and how big it came out.
+///
+/// Reports the SIZED room rather than the setting, because those answer different questions: a scene
+/// with nothing in it yet is set to the hall and has no hall, and a report that said "factoryHall"
+/// with nothing on screen would be describing an intention as if it were a picture.
+#[tauri::command]
+fn presentation_set_state(state: State<AppState>) -> serde_json::Value {
+    ipc();
+    let mut st = state.shared.lock().unwrap();
+    st.sync_stage();
+    let hall = st.hall;
+    serde_json::json!({
+        "set": st.presentation_set.wire(),
+        "label": st.presentation_set.label(),
+        "built": hall.is_some(),
+        "hall": hall.map(|h| serde_json::json!({
+            "lengthMetres": h.half_x * 2.0,
+            "widthMetres": h.half_z * 2.0,
+            "clearHeightMetres": h.height,
+            "bayMetres": h.bay,
+            "centre": h.centre,
+        })),
+    })
 }
 
 /// Declare what the loaded environment map's values MEAN — the per-asset colour override, for the one
@@ -25259,6 +27504,7 @@ fn main() {
             thumbnail,
             viewport_pick,
             viewport_peek,
+            viewport_hover,
             viewport_pick_region,
             pick_diagnostics,
             focus_entity,
@@ -25400,10 +27646,24 @@ fn main() {
             vfx_probe,
             camera_probe,
             cinema_catalog,
+            cinema_framing_catalog,
             cinema_add_shot,
             cinema_remove_shot,
+            cinema_set_shot_seconds,
+            cinema_move_shot,
+            cinema_set_shot_framing,
+            cinema_set_shot_subject,
+            cinema_subject_catalog,
+            cinema_subject_chain,
             cinema_set_mood,
+            cinema_set_delivery,
             cinema_list,
+            cinema_preview,
+            cinema_render_plan,
+            cinema_render_start,
+            cinema_render_status,
+            cinema_render_cancel,
+            viewport_capture,
             condition_catalog,
             condition_add,
             condition_remove,
@@ -25419,6 +27679,7 @@ fn main() {
             lighting_debug,
             add_camera,
             look_through_camera,
+            set_look_dev_camera,
             scene_camera_debug,
             rename_entity,
             group_entities,
@@ -25447,6 +27708,8 @@ fn main() {
             render_profile_debug,
             set_working_space,
             working_space_debug,
+            set_presentation_set,
+            presentation_set_state,
             set_environment_colour_space,
             environment_colour_space_debug,
             snap_ghost,
@@ -25750,7 +28013,7 @@ mod cinematic_subject_tests {
             center,
             scale,
             color: [1.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: render::IDENTITY_QUAT,
             material: [0.0; 4],
         }
@@ -25928,7 +28191,7 @@ mod pipe_viewport_tests {
             center: [0.0, 1.0, 0.0],
             scale: 2.0,
             color: [0.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: [0.0, 0.0, 0.0, 1.0],
             material: [0.0; 4],
         };
@@ -25966,7 +28229,7 @@ mod pipe_viewport_tests {
             center: [2.0, 0.0, 0.0],
             scale: 2.0,
             color: [0.0; 3],
-            selected: 0.0,
+            highlight: 0.0,
             rotation: [0.0, 0.0, 0.0, 1.0],
             material: [0.0; 4],
         };
@@ -28679,6 +30942,225 @@ mod imported_assembly_pose_publication_tests {
             neutral.scale,
             restored.center,
             restored.scale
+        );
+    }
+}
+
+#[cfg(test)]
+mod stage_hover_tests {
+    use super::{entity_display_name, hover_mask, write_hover_mask};
+    use crate::render;
+    use metrocalk_core::{Engine, EntityId, Op};
+    use metrocalk_ecs::FlecsWorld;
+
+    fn engine() -> Engine<FlecsWorld> {
+        Engine::new(FlecsWorld::new(), 0x40E)
+    }
+
+    fn spawn(engine: &mut Engine<FlecsWorld>, parent: Option<EntityId>) -> EntityId {
+        let id = engine.alloc_entity_id();
+        engine
+            .commit("spawn", vec![Op::CreateEntity { id, parent }])
+            .expect("spawns");
+        id
+    }
+
+    /// The shape a CAD import has, small enough to assert on: a line, one cell, one gun with two
+    /// drawn parts, and a fixture beside it. Only the LEAVES are drawn — which is the whole reason a
+    /// pick lands on a bolt and the shot the author meant is the machine.
+    struct Rig {
+        line: EntityId,
+        cell: EntityId,
+        gun: EntityId,
+        fixture: EntityId,
+        nozzle: EntityId,
+        bracket: EntityId,
+    }
+
+    fn assembly(engine: &mut Engine<FlecsWorld>) -> Rig {
+        let line = spawn(engine, None);
+        let cell = spawn(engine, Some(line));
+        let gun = spawn(engine, Some(cell));
+        let fixture = spawn(engine, Some(cell));
+        let nozzle = spawn(engine, Some(gun));
+        let bracket = spawn(engine, Some(gun));
+        Rig {
+            line,
+            cell,
+            gun,
+            fixture,
+            nozzle,
+            bracket,
+        }
+    }
+
+    /// The published render list: the drawn leaves, in draw order.
+    fn drawn(rig: &Rig) -> Vec<String> {
+        vec![
+            rig.nozzle.to_loro_key(),
+            rig.bracket.to_loro_key(),
+            rig.fixture.to_loro_key(),
+        ]
+    }
+
+    fn scene(count: usize) -> render::SceneState {
+        render::SceneState {
+            instances: (0..count)
+                .map(|_| render::Instance {
+                    center: [0.0; 3],
+                    scale: 1.0,
+                    color: [1.0; 3],
+                    highlight: 0.0,
+                    rotation: render::IDENTITY_QUAT,
+                    material: [0.0; 4],
+                })
+                .collect(),
+            ..render::SceneState::default()
+        }
+    }
+
+    #[test]
+    fn pointing_at_a_leaf_lights_that_leaf_and_nothing_else() {
+        let mut e = engine();
+        let rig = assembly(&mut e);
+        let ids = drawn(&rig);
+        let mask = hover_mask(&e, &ids, &[rig.bracket.to_loro_key()]);
+        assert_eq!(mask, vec![false, true, false]);
+    }
+
+    #[test]
+    fn pointing_at_an_assembly_lights_its_whole_drawn_subtree() {
+        // THE CLAIM THE BADGE MAKES, MADE VISIBLE. A rung reading `Weld Gun 7 · 2 parts` is a promise
+        // about the picture; hovering it lights exactly those two and leaves the fixture beside them
+        // alone. Without this the count is a number the author has to take on trust.
+        let mut e = engine();
+        let rig = assembly(&mut e);
+        let ids = drawn(&rig);
+        assert_eq!(
+            hover_mask(&e, &ids, &[rig.gun.to_loro_key()]),
+            vec![true, true, false],
+        );
+        // And the rung above it takes everything, which is what "the establishing wide" means here.
+        assert_eq!(
+            hover_mask(&e, &ids, &[rig.line.to_loro_key()]),
+            vec![true, true, true],
+        );
+        assert_eq!(
+            hover_mask(&e, &ids, &[rig.cell.to_loro_key()]),
+            vec![true, true, true],
+        );
+    }
+
+    #[test]
+    fn nothing_hovered_lights_nothing_and_an_unknown_subject_is_not_everything() {
+        let mut e = engine();
+        let rig = assembly(&mut e);
+        let ids = drawn(&rig);
+        assert_eq!(hover_mask(&e, &ids, &[]), vec![false; 3]);
+        // An id no key parses is the empty answer, NOT a wildcard: a hover that lit the whole scene
+        // because the editor sent a stale key would read as "you are pointing at everything".
+        assert_eq!(
+            hover_mask(&e, &ids, &["not-a-key".to_string()]),
+            vec![false; 3],
+        );
+        // A real entity with nothing drawn under it lights nothing — the same fact the picker's
+        // "nothing drawn" row states in words.
+        let empty = spawn(&mut e, None);
+        assert_eq!(hover_mask(&e, &ids, &[empty.to_loro_key()]), vec![false; 3]);
+    }
+
+    #[test]
+    fn two_subjects_light_the_union() {
+        let mut e = engine();
+        let rig = assembly(&mut e);
+        let ids = drawn(&rig);
+        assert_eq!(
+            hover_mask(
+                &e,
+                &ids,
+                &[rig.nozzle.to_loro_key(), rig.fixture.to_loro_key()],
+            ),
+            vec![true, false, true],
+        );
+    }
+
+    #[test]
+    fn the_hover_bit_and_the_selection_bit_do_not_erase_each_other() {
+        // THE REASON `highlight` IS A CODE AND NOT A FLAG. An author routinely points at one part of
+        // an assembly they have already selected; with one flag, the hover's clear would deselect and
+        // the selection's clear would blank the hover. Both are asserted in both directions.
+        let mut st = scene(3);
+        st.instances[1].highlight =
+            render::highlight_with(st.instances[1].highlight, render::HIGHLIGHT_SELECTED, true);
+
+        assert_eq!(write_hover_mask(&mut st, &[false, true, true]), 2);
+        assert!(render::highlight_has(
+            st.instances[1].highlight,
+            render::HIGHLIGHT_SELECTED
+        ));
+        assert!(render::highlight_has(
+            st.instances[1].highlight,
+            render::HIGHLIGHT_HOVERED
+        ));
+        assert!(!render::highlight_has(
+            st.instances[2].highlight,
+            render::HIGHLIGHT_SELECTED
+        ));
+
+        // The hover goes; the selection stays.
+        assert_eq!(write_hover_mask(&mut st, &[false, false, false]), 0);
+        assert!(render::highlight_has(
+            st.instances[1].highlight,
+            render::HIGHLIGHT_SELECTED
+        ));
+        assert!(st
+            .instances
+            .iter()
+            .all(|i| !render::highlight_has(i.highlight, render::HIGHLIGHT_HOVERED)));
+    }
+
+    #[test]
+    fn a_write_bumps_the_revision_so_the_loop_re_uploads() {
+        // The instance buffer is uploaded on revision change. A hover that changed the bits without
+        // saying so would be a cue that appears on the next unrelated edit, or never.
+        let mut st = scene(2);
+        let before = st.revision;
+        write_hover_mask(&mut st, &[true, false]);
+        assert_ne!(st.revision, before);
+    }
+
+    #[test]
+    fn a_mask_shorter_than_the_instance_list_clears_the_rest() {
+        // The mask is built from `ids` and written to `instances`, and a rebuild between the two
+        // would leave them different lengths. The safe reading is "not hovered", never a panic and
+        // never a stale bit left lit on a row nobody asked about.
+        let mut st = scene(4);
+        write_hover_mask(&mut st, &[true, true, true, true]);
+        assert_eq!(write_hover_mask(&mut st, &[true]), 1);
+        assert!(st
+            .instances
+            .iter()
+            .skip(1)
+            .all(|i| !render::highlight_has(i.highlight, render::HIGHLIGHT_HOVERED)));
+    }
+
+    #[test]
+    fn the_named_rung_and_the_lit_subtree_come_from_one_hierarchy() {
+        // The badge names a rung with `entity_display_name` and this lights it. Reading the name from
+        // one source and the geometry from another is how a cue ends up highlighting an object the
+        // badge is not talking about.
+        let mut e = engine();
+        let rig = assembly(&mut e);
+        let ids = drawn(&rig);
+        let name = entity_display_name(&e, rig.gun);
+        assert!(!name.is_empty());
+        assert_eq!(
+            hover_mask(&e, &ids, &[rig.gun.to_loro_key()])
+                .iter()
+                .filter(|on| **on)
+                .count(),
+            2,
+            "{name} has two drawn parts, and both light",
         );
     }
 }

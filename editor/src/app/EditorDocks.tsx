@@ -55,6 +55,8 @@ export interface LeftDockProps {
   onImport: () => void;
   onCollapse?: () => void;
   onPin?: () => void;
+  /** Open the Cutscene timeline in the Animate dock (the Gameplay workspace's Cinematics block). */
+  onOpenCutscene?: () => void;
 }
 
 function DockChromeAction({ onCollapse, onPin, label }: { onCollapse?: () => void; onPin?: () => void; label: string }) {
@@ -133,7 +135,7 @@ function sideEngineChrome(active: LeftWorkspace, entities: number, selected: str
   }
 }
 
-export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport, onCollapse, onPin }: LeftDockProps) {
+export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport, onCollapse, onPin, onOpenCutscene }: LeftDockProps) {
   const entities = useEntityOrder();
   const selected = useSelectedId();
   const chrome = sideEngineChrome(active, entities.length, selected);
@@ -215,7 +217,7 @@ export function LeftDock({ client, active, onContextMenu, onStartPipe, onImport,
         hidden={active !== "gameplay"}
         className="mtk-dock-panel mtk-scroll"
       >
-        {active === "gameplay" && <LazyWorkspace label="Gameplay workspace"><MatchPanel client={client} /></LazyWorkspace>}
+        {active === "gameplay" && <LazyWorkspace label="Gameplay workspace"><MatchPanel client={client} onOpenTimeline={onOpenCutscene} /></LazyWorkspace>}
       </div>
     </WorkspacePanel>
   );

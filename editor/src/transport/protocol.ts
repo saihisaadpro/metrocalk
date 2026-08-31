@@ -1938,6 +1938,12 @@ export interface CameraProbe {
   /** True only while a cutscene owns the view. */
   cinematic: boolean;
   distance: number;
+  /** The rectangle the picture is COMPOSED for, in surface fractions `[x, y, width, height]` from
+   *  the top-left: the visible viewport, inset to the delivery frame while a cutscene composes for
+   *  one. */
+  frame: [number, number, number, number];
+  /** The rectangle the viewer can SEE. Its difference from `frame` is the letterbox. */
+  visibleRect: [number, number, number, number];
 }
 
 /** One effect card in the VFX catalogue. */
@@ -1974,6 +1980,126 @@ export interface ShotSpec {
   adds: string;
 }
 
+/** How much of the frame the subject fills. */
+export type ShotSize = "extreme_wide" | "wide" | "full" | "medium" | "close" | "extreme_close";
+/** Where the camera stands, relative to the subject's own facing. */
+export type ShotAngle = "front" | "three_quarter" | "profile" | "behind" | "low" | "high";
+/** What the camera does over the shot's length. */
+export type ShotMove = "hold" | "push_in" | "pull_out" | "orbit" | "crane_up" | "crane_down";
+
+/** One choice on one framing axis, published by the side that validates it. */
+export interface FramingOption {
+  value: string;
+  label: string;
+  blurb: string;
+}
+
+/** The frame a cutscene is composed and DELIVERED in.
+ *
+ *  Not a ratio on the wire: the author picked a frame, and a float would lose which one. The ratios
+ *  live in Rust, beside the solver that fits against them; the words the picker shows come from
+ *  `FramingCatalog.deliveries`, which is published by the same side that validates them. */
+export type DeliveryFrame = "viewport" | "widescreen" | "scope" | "academy" | "square" | "vertical";
+
+/** The whole framing vocabulary plus the bounds a shot must respect. */
+export interface FramingCatalog {
+  sizes: FramingOption[];
+  angles: FramingOption[];
+  motions: FramingOption[];
+  /** The shortest a shot may be authored, seconds. */
+  minSeconds: number;
+  /** The longest, seconds. */
+  maxSeconds: number;
+  /** The most shots one cutscene may hold. */
+  maxShots: number;
+  /** Moves for which strength does nothing — the dial is disabled, with a reason, on these. */
+  stillMotions: string[];
+  /** The frames a cutscene may be delivered in — the shape its shots are composed for. */
+  deliveries: FramingOption[];
+}
+
+/** One shot with its numbers — what the timeline draws and the shot inspector edits. */
+export interface ShotRow {
+  /** Stable across a reorder. */
+  id: string;
+  /** Position in the list, 0-based. */
+  index: number;
+  /** The sentence. */
+  reads: string;
+  /** The AUTHORED length in seconds — what the duration control edits. */
+  seconds: number;
+  /** What it runs for once the mood has scaled it. Calm is 2.5x, so these usually differ. */
+  effectiveSeconds: number;
+  /** Where the shot starts on the cutscene clock, seconds. */
+  startSeconds: number;
+  /** The first instant this shot is on screen ALONE, seconds on the cutscene clock — what the
+   *  timeline seeks to when the user opens this shot. Absolute, so no caller does arithmetic on a
+   *  boundary the solver owns: `startSeconds + blendSeconds` lands a hair BELOW the strict `local <
+   *  blend` test in f32 and reports a 99.99999% transition rather than the shot. */
+  openSeconds: number;
+  /** How long this shot takes to become itself, seconds — its opening blend, `0` on the first.
+   *
+   *  `startSeconds` is the one instant of a shot at which that shot is NOT what you see: the
+   *  transition weight there is zero, so the frame is the END of the shot before. "Open shot 3"
+   *  means `startSeconds + blendSeconds`, and the number that defines the window comes from the
+   *  side that draws it. */
+  blendSeconds: number;
+  size: ShotSize;
+  angle: ShotAngle;
+  motion: ShotMove;
+  /** How strong the move is, 0..1. Inert for `hold`. */
+  amount: number;
+  /** The object this shot FRAMES — not necessarily the cutscene's owner. */
+  subject: string;
+  /** That object's display name. */
+  subjectName: string;
+}
+
+/** One object a shot could be pointed at, with the two facts that decide whether it is the right one. */
+export interface SubjectCandidate {
+  /** The entity key `cinemaSetShotSubject` takes. */
+  id: string;
+  /** What the outliner calls it. */
+  name: string;
+  /** The heading it is listed under, in the author's language — `"This object"`, `"What it is part
+   *  of"`, `"What it is made of"`, `"Beside it"`, or `"Matches"` for a search. Sent by the engine
+   *  rather than derived here, so the ranking and its headings cannot drift apart. */
+  group: string;
+  /** How many DRAWN parts are under it — what the camera will actually be fitted to. The number that
+   *  tells a 378-part assembly apart from the one bracket that shares most of its name. */
+  parts: number;
+  /** `false` when nothing under it is drawn: the shot would be composed on its ORIGIN inside a
+   *  metre-ish fallback box — a plausible camera pointed at nothing. */
+  framable: boolean;
+  /** This is the object the shot frames right now. */
+  current: boolean;
+}
+
+/** The subject picker's list — ranked by the scene's own hierarchy, or the answer to a search. */
+export interface SubjectCatalog {
+  /** The cutscene's own object, and the default a shot frames. */
+  owner: string;
+  ownerName: string;
+  /** What the shot being edited frames right now. */
+  current: string | null;
+  /** The rows, already in the order they should be drawn. */
+  candidates: SubjectCandidate[];
+  /** The query these rows answer, trimmed by the engine. Empty for the ranked default list. */
+  query: string;
+  /** How many objects matched in total — `candidates.length` is how many fitted. */
+  matches: number;
+  /** `true` when the list was cut short, so the UI says so instead of implying completeness. */
+  truncated: boolean;
+}
+
+/** A change to one shot's framing. An absent axis means "leave it alone", never "reset it". */
+export interface FramingEdit {
+  size?: string;
+  angle?: string;
+  motion?: string;
+  amount?: number;
+}
+
 /** What a completed cinematics command answers with. */
 export interface CinemaReply {
   entity: string | null;
@@ -1981,13 +2107,118 @@ export interface CinemaReply {
   seconds: number;
   /** The authored pacing dial that drives effective shot duration and transition length. */
   mood: "calm" | "normal" | "tense";
-  /** The cutscene read back as sentences, one line per shot. */
+  /** The frame this cutscene is composed and delivered in. */
+  delivery: DeliveryFrame;
+  /** The cutscene read back as sentences, one line per shot. Flattened from `rows`. */
   reads: string[];
+  /** The same shots with their numbers. */
+  rows: ShotRow[];
   /** Continuity warnings in plain language (a jump cut, opening tight, a rushed shot). */
   problems: string[];
   message: string;
   reason: string | null;
 }
+
+/** What the cutscene timeline's viewport preview answers with — the frame now on the stage.
+ *
+ *  `eye` / `lookAt` / `fovDeg` are on the wire deliberately. They are the only externally checkable
+ *  evidence that the preview posed the camera at a PARTICULAR place rather than at any place, which
+ *  is what turns "the preview is the frame Play films" into an assertion instead of a hope. */
+export interface CinemaPreviewReply {
+  /** Whether the cutscene camera is holding the viewport right now. `false` after a successful exit
+   *  AND after any refusal, so one field answers "who has the camera" in every case. */
+  active: boolean;
+  entity: string | null;
+  /** Where on the cutscene clock this frame is, seconds — clamped into the cut, so what comes back
+   *  is the moment actually filmed rather than the moment asked for. */
+  seconds: number;
+  /** Which shot is on screen, 0-based. `null` when nothing is being previewed. */
+  shotIndex: number | null;
+  /** How many shots the cutscene holds, so a surface that never read the shot list can still say
+   *  "shot 2 of 5" — the stage badge is a long way from the panel that did. */
+  shots: number;
+  /** That shot's sentence. */
+  reads: string;
+  /** The display name of the object the shot FRAMES — not necessarily the cutscene's owner. */
+  subjectName: string;
+  /** How far through the shot this moment is, 0..1. */
+  progress: number;
+  /** True while the frame is a transition between two shots. */
+  blending: boolean;
+  /** Where the camera stands, world units. */
+  eye: [number, number, number];
+  /** The point it is aimed at. */
+  lookAt: [number, number, number];
+  /** Vertical field of view, degrees. */
+  fovDeg: number;
+  message: string;
+  /** Set iff the camera did not move, and says why. */
+  reason: string | null;
+}
+
+/** ADR-175 — a render, in progress or finished.
+ *
+ *  ONE shape for start, poll and cancel: a progress bar and a ledger are the same six numbers read at
+ *  different moments, and a surface that had to switch between two shapes is a surface that can show
+ *  the stale one. */
+export interface RenderReply {
+  /** Whether a job is running right now. */
+  running: boolean;
+  /** Whether the job this describes has finished — successfully or not. */
+  done: boolean;
+  entity: string | null;
+  /** How many frames the plan holds. */
+  frames: number;
+  /** How many files exist on disk so far. */
+  written: number;
+  /** The pixel size the frames are written at: measured from the first captured frame, or — for a
+   *  render at a chosen output height (ADR-177) — the size the renderer was instructed to draw at,
+   *  which is known before the first frame. `0` until whichever applies. */
+  width: number;
+  height: number;
+  /** ADR-177 — whether the frames are drawn into targets of their own rather than read off the window.
+   *  Changes what is true about the render: an offscreen one does not need the window in front. */
+  offscreen: boolean;
+  /** ADR-182 — what this render delivers: one movie, or one file per frame. */
+  format: RenderFormat;
+  /** ADR-182 — the bit rate a movie is encoded at, in bits per second. `0` for a sequence, which has
+   *  no such number: PNG is lossless and its size is whatever the picture costs. */
+  bitrate: number;
+  fps: number;
+  /** The span of the cutscene clock being filmed. */
+  seconds: number;
+  /** Where the files are going — or, for a single still, the file itself. */
+  folder: string;
+  /** The name the frames share, before the number. */
+  stem: string;
+  bytes: number;
+  elapsedMs: number;
+  /** Frames that could not be written, each with its own sentence. */
+  failures: string[];
+  message: string;
+  /** Set iff the request was refused, and says why. */
+  reason: string | null;
+}
+
+/** What a render is asked to film: the whole cut, or one shot of it. `null` is the whole cut. */
+export type RenderScopeIndex = number | null;
+
+/** ADR-177 — the output height a render is asked for. `null` is "whatever the window makes it".
+ *
+ *  A HEIGHT AND NOT A SIZE. The width is the delivery frame's own aspect times this, worked out by
+ *  `render_frame_size` in the engine, so a 2.39:1 cut and a 9:16 one both get their right shape from
+ *  one number and nobody can ask for a size the shot was not composed for. The engine states the four
+ *  it offers in `RENDER_HEIGHTS` and refuses anything else by name. */
+export type RenderHeight = number | null;
+
+/** ADR-182 — what a render delivers.
+ *
+ *  A MOVIE OR A SEQUENCE, and nothing in between. `"movie"` is one H.264 MP4 the author can double-
+ *  click; `"sequence"` is the numbered PNG per frame ADR-175 shipped, which is lossless and is what a
+ *  compositor wants. The engine states the same two in `RenderFormat` and refuses anything else by
+ *  name — and refuses `"movie"` itself, in a sentence, on a machine or at a size whose encoder will
+ *  not take it, so the author reads that BEFORE the render rather than after it. */
+export type RenderFormat = "movie" | "sequence";
 
 export interface ConditionSpec {
   kind: string;

@@ -174,14 +174,19 @@ pub struct ShapeParamSpec {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShapeSpec {
-    /// Recipe kind.
+    /// Recipe kind — AND the card's icon name (ADR-137).
+    ///
+    /// The catalog used to carry a separate `icon: &'static str` holding one character per entry, and
+    /// in all fifty-nine entries across the five catalogs that character was a per-`kind` constant:
+    /// the field was one contract stated twice, in two languages, which is exactly the drift ADR-134
+    /// is about. It was also thirty-five colour EMOJI, which a monochrome light workbench cannot
+    /// draw. `editor/src/theme/icons.tsx` keys its drawings on these kinds, so there is nothing left
+    /// to keep in sync — `check-icon-vocab.mjs` fails if a kind here has no mark there.
     pub kind: &'static str,
     /// Card label.
     pub label: &'static str,
     /// One line on what it is for.
     pub blurb: &'static str,
-    /// Card glyph.
-    pub icon: &'static str,
     /// Tunable parameters, in display order.
     pub params: Vec<ShapeParamSpec>,
 }
@@ -218,7 +223,6 @@ pub fn shape_specs() -> Vec<ShapeSpec> {
             kind: "box",
             label: "Box",
             blurb: "A rectangular block",
-            icon: "▧",
             params: vec![
                 p("width", "Width", 0.05, 50.0, 0.1, 1.0, false, "m"),
                 p("height", "Height", 0.05, 50.0, 0.1, 1.0, false, "m"),
@@ -229,7 +233,6 @@ pub fn shape_specs() -> Vec<ShapeSpec> {
             kind: "sphere",
             label: "Sphere",
             blurb: "A ball",
-            icon: "●",
             params: vec![
                 p("radius", "Radius", 0.05, 25.0, 0.05, 0.5, false, "m"),
                 p("segments", "Smoothness", 8.0, 96.0, 4.0, 32.0, true, ""),
@@ -239,7 +242,6 @@ pub fn shape_specs() -> Vec<ShapeSpec> {
             kind: "cylinder",
             label: "Cylinder",
             blurb: "A round column",
-            icon: "⬤",
             params: vec![
                 p("radius", "Radius", 0.05, 25.0, 0.05, 0.5, false, "m"),
                 p("height", "Height", 0.05, 50.0, 0.1, 1.0, false, "m"),
@@ -250,7 +252,6 @@ pub fn shape_specs() -> Vec<ShapeSpec> {
             kind: "cone",
             label: "Cone",
             blurb: "A point over a round base",
-            icon: "▲",
             params: vec![
                 p("radius", "Radius", 0.05, 25.0, 0.05, 0.5, false, "m"),
                 p("height", "Height", 0.05, 50.0, 0.1, 1.0, false, "m"),
@@ -261,7 +262,6 @@ pub fn shape_specs() -> Vec<ShapeSpec> {
             kind: "torus",
             label: "Ring",
             blurb: "A doughnut",
-            icon: "◍",
             params: vec![
                 p("radius", "Ring radius", 0.1, 25.0, 0.05, 0.5, false, "m"),
                 p("thickness", "Thickness", 0.02, 10.0, 0.02, 0.18, false, "m"),
@@ -272,7 +272,6 @@ pub fn shape_specs() -> Vec<ShapeSpec> {
             kind: "capsule",
             label: "Capsule",
             blurb: "A pill — a cylinder with round ends",
-            icon: "▢",
             params: vec![
                 p("radius", "Radius", 0.05, 10.0, 0.05, 0.3, false, "m"),
                 p("height", "Height", 0.2, 50.0, 0.1, 1.2, false, "m"),
@@ -283,7 +282,6 @@ pub fn shape_specs() -> Vec<ShapeSpec> {
             kind: "wedge",
             label: "Wedge",
             blurb: "A ramp",
-            icon: "◣",
             params: vec![
                 p("width", "Width", 0.05, 50.0, 0.1, 1.0, false, "m"),
                 p("height", "Height", 0.05, 50.0, 0.1, 1.0, false, "m"),
@@ -294,7 +292,6 @@ pub fn shape_specs() -> Vec<ShapeSpec> {
             kind: "prism",
             label: "Prism",
             blurb: "A column with flat sides",
-            icon: "⬢",
             params: vec![
                 p("radius", "Radius", 0.05, 25.0, 0.05, 0.5, false, "m"),
                 p("height", "Height", 0.05, 50.0, 0.1, 1.0, false, "m"),
@@ -305,7 +302,6 @@ pub fn shape_specs() -> Vec<ShapeSpec> {
             kind: "tube",
             label: "Tube",
             blurb: "A hollow pipe with a wall thickness",
-            icon: "◎",
             params: vec![
                 p("radius", "Radius", 0.1, 25.0, 0.05, 0.5, false, "m"),
                 p("thickness", "Wall", 0.02, 10.0, 0.02, 0.12, false, "m"),

@@ -67,6 +67,17 @@ describe("timeline geometry", () => {
     expect(ticks[ticks.length - 1]).toEqual({ value: 180, label: "180t" });
   });
 
+  it("keeps every division DISTINCT and inside the lane on a duration that is not a round number", () => {
+    // The defect this pins: rounding each division to an integer made three pairs of a 6.5s ruler
+    // land on the same number — which the ruler used as its React key — and pushed the last one to
+    // 7, past the end of the lane it labels. Both are invisible at 60000 ticks per second, which is
+    // the only unit this module had ever been used in.
+    const ticks = timelineTicks(6.5, (value) => `${value.toFixed(1)}s`);
+    expect(new Set(ticks.map((tick) => tick.value)).size).toBe(TIMELINE_DIVISIONS + 1);
+    expect(ticks[ticks.length - 1].value).toBe(6.5);
+    expect(ticks.every((tick) => tick.value <= 6.5)).toBe(true);
+  });
+
   it("maps a curve point into the plot's inset, not the raw viewBox", () => {
     const bounds = { minTick: 0, tickSpan: 100, minValue: 0, valueSpan: 10 };
     expect(curvePoint({ tick: 0, value: 0 }, bounds)).toEqual({ x: CURVE_VIEWBOX.left, y: CURVE_VIEWBOX.bottom });

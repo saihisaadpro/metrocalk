@@ -72,8 +72,9 @@ export function Onboarding({ show = true, onStart, onSkip }: OnboardingProps = {
       // the clicks of whatever was under it. Percentages here are of the stage, so the card yields
       // with the stage instead of ignoring it, and the grid stays the only thing that decides where
       // the stage is.
-      onPointerDown={(e) => e.stopPropagation()}
-      onClick={(e) => e.stopPropagation()}
+      // No `stopPropagation`: `stageInput.ts`'s `onStageSurface` is the one place that decides
+      // whether a pointer belongs to the stage or to chrome floating over it, and a per-overlay
+      // guard is the idiom that module superseded. See `PlayBadge` for the measurement.
       style={{
         position: "absolute",
         left: "50%",

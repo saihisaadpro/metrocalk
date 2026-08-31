@@ -828,7 +828,7 @@ impl TerrainRuntime {
                 center: mesh.instance_center,
                 scale: 1.0,
                 color: [1.0, 1.0, 1.0],
-                selected: 0.0,
+                highlight: 0.0,
                 rotation: IDENTITY_QUAT,
                 material: [0.0; 4],
             };
@@ -888,7 +888,7 @@ impl TerrainRuntime {
                     center: d.position,
                     scale: d.scale,
                     color: [1.0, 1.0, 1.0],
-                    selected: 0.0,
+                    highlight: 0.0,
                     rotation: d.rotation,
                     material: [0.0; 4],
                 },

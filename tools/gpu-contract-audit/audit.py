@@ -2143,6 +2143,14 @@ fn build(device: &D) {
 }
 """
 
+# An unrelated `impl` whose own `fn create` is reached as `Self::create`. See resources case 0b.
+_RES_SELF_DECOY = """struct Elsewhere;
+impl Elsewhere {
+    fn create(a: u32, b: &str) -> u32 { a }
+    fn make() -> u32 { Self::create(1, "not-a-layout") }
+}
+fn build(device: &D) {"""
+
 _RES_IBL = """
 pub fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2247,6 +2255,19 @@ def _self_test_resources() -> bool:
     #    reached through `ibl::create` from another file, with two same-named `create`s in the way —
     #    so a non-zero count here IS the resolver working, not an incidental number.
     run_case("bind groups whose layouts resolve across files audit clean, and are actually compared")
+
+    # 0b. `Self` IS SCOPED. `Targets::create`'s second parameter is the layout, and the resolver finds
+    #     it by reading every call site of `Targets::create`. An unrelated `impl` with its own
+    #     `fn create` reached as `Self::create` is NOT one of those call sites — but the rejection
+    #     used to compare the literal text `"Self"` against the owner type, so it was. The real tree
+    #     had exactly this on 2026-08-28: `Frame::whole`'s `Self::new(aspect, FULL_FRAME)` was read as
+    #     a call of `InstanceBuf::new` and of `LightBuf::new`, `make_inst_bg`'s `layout` resolved to a
+    #     `const [f32; 4]`, and both instance bind groups reported UNREAD — 2 blocking, from a
+    #     renderer whose bind groups were correct. A clean verdict here is the assertion.
+    run_case(
+        "a `Self::` call inside an unrelated impl is not a call site of this type's same-named fn",
+        renderer=_RES_RENDERER.replace("fn build(device: &D) {", _RES_SELF_DECOY),
+    )
 
     ibl_at = "src/ibl.rs"
 

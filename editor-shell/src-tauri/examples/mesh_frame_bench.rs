@@ -551,7 +551,8 @@ fn pct(v: &mut [f64]) -> (f64, f64) {
 fn classify(rgba: &[u8]) -> (usize, usize, usize) {
     let (mut bg, mut red, mut teal) = (0, 0, 0);
     let near = |c: u8, target: f64| (f64::from(c) - target * 255.0).abs() < 12.0;
-    for px in rgba.chunks_exact(4) {
+    // `as_chunks::<4>()`: one RGBA pixel is four bytes and the type now says so.
+    for px in rgba.as_chunks::<4>().0 {
         let (r, g, b) = (px[0], px[1], px[2]);
         if near(r, CLEAR[0]) && near(g, CLEAR[1]) && near(b, CLEAR[2]) {
             bg += 1;

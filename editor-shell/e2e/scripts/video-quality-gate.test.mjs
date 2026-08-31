@@ -262,3 +262,77 @@ test("FFmpeg evidence rejects black/static footage and accepts moving footage", 
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
   }
 });
+
+/**
+ * A window capture is not a film frame, and measuring one as if it were the other cannot report an
+ * obscured frame as obscured.
+ *
+ * The occlusion-independent legibility sampler in the factory-cinematic spec captures the editor with
+ * `PrintWindow`, which returns the WHOLE WINDOW: the 3D viewport plus the editor's own docks, header and
+ * status bar. Those are near-white with black text, so they hold YHIGH at the top of the range no matter
+ * what the viewport contains — and `YHIGH - YLOW` is precisely the measure that is supposed to notice
+ * when the viewport contains nothing.
+ *
+ * The fixture is that situation and nothing else: a pale chrome surround with a single flat dark
+ * rectangle where the picture should be. It is the synthetic form of the film's worst frames, which
+ * measured 1, 3, 4 and 5 in the delivered cut — the camera inside a machine housing.
+ *
+ * Uncropped it scores multiples of the threshold and passes. Cropped to the rectangle the film actually
+ * occupies it scores zero and fails. The crop is therefore load-bearing, not tidiness, and this test is
+ * here so that removing it breaks something.
+ */
+test("chrome around a picture makes an empty picture measure as a full one", { timeout: 30_000 }, (context) => {
+  const ffmpeg = discoverFfmpeg();
+  if (!ffmpeg) {
+    context.skip("ffmpeg is unavailable in this environment");
+    return;
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mtk-legibility-crop-"));
+  try {
+    // A 1696x1018 "window": pale chrome, with a 1460x856 viewport at (140,85) filled by one dark tone.
+    const frame = path.join(directory, "buried-camera.png");
+    const built = spawnSync(ffmpeg, [
+      "-nostdin", "-hide_banner", "-loglevel", "error",
+      "-f", "lavfi",
+      "-i", "color=c=0xE9E9E9:size=1696x1018:duration=0.04:rate=25",
+      "-vf", "drawbox=x=140:y=85:w=1460:h=856:color=0x2A2A2A@1.0:t=fill",
+      "-frames:v", "1", "-y", frame,
+    ], { encoding: "utf8", windowsHide: true });
+    assert.equal(built.status, 0, built.stderr || "Could not build the buried-camera fixture");
+
+    const interdecile = (filter) => {
+      const measured = spawnSync(ffmpeg, [
+        "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", frame,
+        "-vf", `${filter}format=yuv444p,signalstats,metadata=mode=print:file=-`,
+        "-f", "null", process.platform === "win32" ? "NUL" : "/dev/null",
+      ], { encoding: "utf8", windowsHide: true });
+      assert.equal(measured.status, 0, measured.stderr || "signalstats failed");
+      const [readings] = parseSignalStatsMetadata(measured.stdout);
+      return readings.metrics.YHIGH - readings.metrics.YLOW;
+    };
+
+    const wholeWindow = interdecile("");
+    const filmRectangle = interdecile("crop=1460:856:140:85,");
+
+    // The defect: the frame contains no picture at all, and measured whole it clears the bar easily.
+    assert.ok(
+      wholeWindow >= QUALITY_THRESHOLDS.minimumFrameInterdecileLuma,
+      `An entirely obscured viewport measured ${wholeWindow} across the whole window, which is below the `
+        + "threshold — if this ever fails the chrome has changed and this test needs rewriting, not deleting.",
+    );
+    // The fix: cropped to what the film shows, the same frame is correctly worthless.
+    assert.ok(
+      filmRectangle < QUALITY_THRESHOLDS.minimumFrameInterdecileLuma,
+      `Cropped to the film rectangle the obscured frame measured ${filmRectangle}, which the gate would `
+        + "accept. The crop is what makes this measurement able to fail.",
+    );
+    assert.ok(
+      wholeWindow > filmRectangle * 4,
+      `The chrome must dominate the reading for this test to be about anything: whole ${wholeWindow} vs `
+        + `cropped ${filmRectangle}.`,
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

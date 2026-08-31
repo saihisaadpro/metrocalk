@@ -56,10 +56,20 @@ public class MetrocalkWindowCapture {
 # Resolve the composited host by window CLASS. `MainWindowHandle` also matches tao's visible, unowned,
 # top-level 16x16 'Tao Thread Event Target', and returning that one is what produced 158-byte captures.
 . (Join-Path $PSScriptRoot "lib/app-window.ps1")
-# Resolve permissively first: a minimised host is recoverable here (see the SW_SHOWNOACTIVATE below),
-# and rejecting it on size before restoring it would turn that into a failed capture. -PreserveWindow
-# cannot restore, so it keeps the strict resolve and fails loudly.
-$handle = Get-MetrocalkAppWindow -ProcName $ProcName -AllowIconic:(-not $PreserveWindow)
+# Resolve permissively: a minimised host is recoverable (see the SW_SHOWNOACTIVATE below), and
+# rejecting it on size before restoring it would turn a recoverable state into a failed capture.
+#
+# -PreserveWindow USED TO keep the strict resolve and fail loudly here, and that cost a whole production
+# film: fifteen minutes in - past the import of 15,711 parts, past the track authoring, seven frames into
+# the cutscene - something minimised the editor and frame 0007 threw
+# "implausibly small for a host (160x28) ... The window is MINIMISED".
+#
+# The distinction "preserve" was drawn for is the old unconditional minimise/restore/topmost DANCE, which
+# existed to force a DWM recomposite for a desktop-DC read and made the handle transiently invalid ~50
+# times a run. Un-minimising is not that dance. SW_SHOWNOACTIVATE does not take the foreground - which is
+# the script's own stated reason for preferring it to SW_RESTORE two dozen lines below - so it disturbs
+# nothing the user has in front, and it is the difference between a recoverable blip and a lost run.
+$handle = Get-MetrocalkAppWindow -ProcName $ProcName -AllowIconic
 $topmost = [IntPtr](-1)
 $notTopmost = [IntPtr](-2)
 $swpNoSize = 0x0001
@@ -70,10 +80,7 @@ try {
   # Only un-minimise. The old unconditional minimise/restore/topmost dance existed to force DWM to
   # recomposite for the desktop-DC read; PrintWindow does not need it, and doing it ~50 times in a run is
   # what made the window handle transiently invalid.
-  if ($PreserveWindow -and [MetrocalkWindowCapture]::IsIconic($handle)) {
-    throw "Cannot preserve and capture a minimised '$ProcName' window."
-  }
-  if (-not $PreserveWindow -and [MetrocalkWindowCapture]::IsIconic($handle)) {
+  if ([MetrocalkWindowCapture]::IsIconic($handle)) {
     # SW_SHOWNOACTIVATE (4), not SW_RESTORE (9). Restoring with activation takes the foreground, and if
     # a full-screen application owns it (a game, a player, an RDP client) that application immediately
     # takes it back and re-minimises this window - mid-run, between two captures. PrintWindow reads the

@@ -1190,8 +1190,21 @@ class LayoutResolver:
                         continue
                 else:
                     path = [p.strip() for p in m.group(1).split("::") if p.strip()]
-                    if owner_ty:  # an associated fn: only `T::f` / `Self::f`
-                        if not path or path[-1] not in (owner_ty, "Self"):
+                    if owner_ty:  # an associated fn: only `T::f`, or `Self::f` inside `impl T`
+                        # `Self` IS SCOPED, and reading it as a spelling of one type is how a second
+                        # `fn new` in an unrelated `impl` gets read as a call of this one. The method
+                        # branch above has always resolved a `self.` receiver through `_impl_of`;
+                        # this is the same rule for the associated form, which had it only for the
+                        # explicit `T::f` half. (Found 2026-08-28: `Frame::whole`'s
+                        # `Self::new(aspect, FULL_FRAME)` was attributed to `InstanceBuf::new` AND
+                        # `LightBuf::new`, so `make_inst_bg`'s `layout` parameter resolved to a
+                        # `const [f32; 4]` and both instance bind groups reported UNREAD.)
+                        named = path[-1] if path else ""
+                        if named == "Self":
+                            if self._impl_of(r, m.start()) != owner_ty:
+                                rejected += 1
+                                continue
+                        elif named != owner_ty:
                             rejected += 1
                             continue
                     elif (path and path[-1] not in (module, "crate", "super", "self")) or (

@@ -44,7 +44,14 @@ import type {
   RuleSummary,
   ConditionSpec,
   ShotSpec,
+  CinemaPreviewReply,
+  RenderFormat,
+  RenderReply,
   CinemaReply,
+  DeliveryFrame,
+  FramingCatalog,
+  SubjectCatalog,
+  FramingEdit,
   EffectSpec,
   VfxReply,
   VfxProbe,
@@ -300,14 +307,74 @@ export interface EditorClient {
   vfxList(id: string): Promise<VfxReply>;
   /** Every shot card the Cinematics block can offer. */
   cinemaCatalog(): Promise<ShotSpec[]>;
-  /** Append one shot to an object's cutscene (one undoable commit). */
+  /** Append one shot to an object's cutscene (one undoable commit).
+   *
+   *  A new shot always frames its own owner. What it films is then a property of the SHOT, changed
+   *  through `cinemaSetShotSubject` on the shot the add just opened — rather than a sticky choice
+   *  made before the card is clicked, which is the same decision stated in two places and a mode the
+   *  next card would silently inherit. */
   cinemaAddShot(id: string, kind: string): Promise<CinemaReply>;
   /** Remove one shot by index (one undoable commit). */
   cinemaRemoveShot(id: string, index: number): Promise<CinemaReply>;
   /** Set the cutscene's one pacing mood (one undoable commit). */
   cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply>;
+  /** Set the frame the cutscene is composed and delivered in (one undoable commit). */
+  cinemaSetDelivery(id: string, delivery: DeliveryFrame): Promise<CinemaReply>;
   /** The object's cutscene, read back as sentences plus continuity warnings. */
   cinemaList(id: string): Promise<CinemaReply>;
+  /** The framing vocabulary the shot inspector offers + the bounds it must respect (static data). */
+  cinemaFramingCatalog(): Promise<FramingCatalog>;
+  /** Set one shot's AUTHORED length in seconds (one undoable commit). */
+  cinemaSetShotSeconds(id: string, index: number, seconds: number): Promise<CinemaReply>;
+  /** Move one shot to another position in the list (one undoable commit). */
+  cinemaMoveShot(id: string, from: number, to: number): Promise<CinemaReply>;
+  /** Re-frame one shot in place — size, angle, move, strength (one undoable commit). */
+  cinemaSetShotFraming(id: string, index: number, edit: FramingEdit): Promise<CinemaReply>;
+  /** Point one shot at a different object, keeping its place, its length and its framing
+   *  (one undoable commit). */
+  cinemaSetShotSubject(id: string, index: number, subject: string): Promise<CinemaReply>;
+  /** The objects a shot could frame — ranked by the scene's own hierarchy, or searched by name.
+   *  A read. `index` marks the shot being edited so its current subject comes back ticked. */
+  cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog>;
+  /** The object under the cursor and the chain it hangs from — itself, then what it is part of,
+   *  outward — each rung with the drawn-part count the picker's rows carry. A read.
+   *
+   *  Picking is a hit test against drawn triangles, so a click on an imported assembly lands on a
+   *  LEAF: one bolt, of one weld gun, of a line that imports as 15,711 parts. The chain is what lets
+   *  the author take the machine instead, without the editor guessing which rung they meant. */
+  cinemaSubjectChain(id: string): Promise<SubjectCatalog>;
+  /** Pose the viewport camera at one moment of a cutscene, or (`active: false`) hand it back.
+   *  A render projection, never a document edit — moving a playhead is not something to undo. */
+  cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply>;
+  /** ADR-175 — what a render would produce, without producing it: the frame count, the span and the
+   *  rate, computed by the ENGINE from the same `plan_render` the job runs. The dialog's cost
+   *  sentence is this answer rather than a second copy of the arithmetic. */
+  cinemaRenderPlan(
+    id: string,
+    fps: number,
+    shot: number | null,
+    height?: number | null,
+    format?: RenderFormat | null,
+  ): Promise<RenderReply>;
+  /** ADR-175 — start writing a cutscene out as a numbered PNG sequence. Returns as soon as the job
+   *  is accepted, carrying the plan it accepted; progress is read with `cinemaRenderStatus`.
+   *  `shot` is `null` for the whole cut. `folder` is `null` to let the engine ask the author. */
+  cinemaRenderStart(
+    id: string,
+    fps: number,
+    shot: number | null,
+    stem: string,
+    folder?: string | null,
+    height?: number | null,
+    format?: RenderFormat | null,
+  ): Promise<RenderReply>;
+  /** How far the running render has got, or the ledger of the last one. */
+  cinemaRenderStatus(): Promise<RenderReply>;
+  /** Stop the running render. Every frame already written stays. */
+  cinemaRenderCancel(): Promise<RenderReply>;
+  /** ADR-175 — save the picture currently on the stage as a PNG. Nothing is posed, so what lands in
+   *  the file is what was on screen, held cutscene preview included. */
+  viewportCapture(path?: string | null): Promise<RenderReply>;
   /** Every "only if" card the Behaviour block can offer. */
   conditionCatalog(): Promise<ConditionSpec[]>;
   /** Add one clause to an object (one undoable commit). */
@@ -425,6 +492,23 @@ export interface EditorClient {
    *  (or null). Computed synchronously in the command from the camera ray (no per-frame race, no OS-cursor
    *  dependency — so a synthetic click works too). */
   viewportPick(x: number, y: number): Promise<string | null>;
+  /** Identify the entity under NORMALIZED viewport coords **without changing the selection** — the same
+   *  ray, the same BVH and the same filter a click uses, so what this names is what a click would take.
+   *
+   *  The non-mutating half of picking, and the reason aiming a shot at an object can be a click on the
+   *  stage at all: the Cutscene panel is bound to the editor selection, so a gesture that SELECTED the
+   *  object it is naming would switch which cutscene is on screen and throw away the shot being aimed.
+   *  Called on hover-settle and on the aiming click — never per frame (invariant 4). */
+  viewportPeek(x: number, y: number): Promise<string | null>;
+  /** Say what the cursor is over, so the STAGE answers as well as the badge. Every DRAWN part under one
+   *  of `ids` lights up — so pointing at an assembly lights the assembly, which is what turns the aim
+   *  badge's `Assembly Hall · 7 parts` from a number into something you can see before you commit a shot
+   *  to it. `[]` clears it. Resolves with how many instances are lit: `0` on a subject with no geometry
+   *  is a real answer, not a failure.
+   *
+   *  A render projection — no transaction, no undo entry, nothing saved. Called only when the hovered
+   *  SUBJECT changes, never per frame (invariant 4). */
+  viewportHover(ids: string[]): Promise<number>;
   /** Begin a right-drag orbit — the native render loop then polls the OS cursor and orbits with **0 IPC per
    *  frame** (invariant 4); only this call + `dragEnd` cross the boundary, once per gesture. */
   dragStart(): void;
@@ -928,7 +1012,7 @@ export class TauriClient implements EditorClient {
     return this.core.invoke<VfxProbe>("vfx_probe").catch(() => ({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 }));
   }
   cameraProbe(): Promise<CameraProbe> {
-    return this.core.invoke<CameraProbe>("camera_probe").catch(() => ({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0 }));
+    return this.core.invoke<CameraProbe>("camera_probe").catch(() => ({ eye: [0, 0, 0] as [number, number, number], lookAt: [0, 0, 0] as [number, number, number], fovDeg: 45, cinematic: false, distance: 0, frame: [0, 0, 1, 1] as [number, number, number, number], visibleRect: [0, 0, 1, 1] as [number, number, number, number] }));
   }
   vfxCatalog(): Promise<EffectSpec[]> {
     return this.core.invoke<EffectSpec[]>("vfx_catalog").catch((e: unknown) => { console.error("vfx_catalog failed", e); throw e; });
@@ -946,7 +1030,7 @@ export class TauriClient implements EditorClient {
     return this.core.invoke<ShotSpec[]>("cinema_catalog").catch((e: unknown) => { console.error("cinema_catalog failed", e); throw e; });
   }
   cinemaAddShot(id: string, kind: string): Promise<CinemaReply> {
-    return this.core.invoke<CinemaReply>("cinema_add_shot", { id, kind }).catch((e: unknown) => { console.error("cinema_add_shot failed", e); throw e; });
+    return this.core.invoke<CinemaReply>("cinema_add_shot", { id, kind, subject: null }).catch((e: unknown) => { console.error("cinema_add_shot failed", e); throw e; });
   }
   cinemaRemoveShot(id: string, index: number): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_remove_shot", { id, index }).catch((e: unknown) => { console.error("cinema_remove_shot failed", e); throw e; });
@@ -954,8 +1038,50 @@ export class TauriClient implements EditorClient {
   cinemaSetMood(id: string, mood: "calm" | "normal" | "tense"): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_set_mood", { id, mood }).catch((e: unknown) => { console.error("cinema_set_mood failed", e); throw e; });
   }
+  cinemaSetDelivery(id: string, delivery: DeliveryFrame): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_delivery", { id, delivery }).catch((e: unknown) => { console.error("cinema_set_delivery failed", e); throw e; });
+  }
   cinemaList(id: string): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_list", { id }).catch((e: unknown) => { console.error("cinema_list failed", e); throw e; });
+  }
+  cinemaFramingCatalog(): Promise<FramingCatalog> {
+    return this.core.invoke<FramingCatalog>("cinema_framing_catalog").catch((e: unknown) => { console.error("cinema_framing_catalog failed", e); throw e; });
+  }
+  cinemaSetShotSeconds(id: string, index: number, seconds: number): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_seconds", { id, index, seconds }).catch((e: unknown) => { console.error("cinema_set_shot_seconds failed", e); throw e; });
+  }
+  cinemaMoveShot(id: string, from: number, to: number): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_move_shot", { id, from, to }).catch((e: unknown) => { console.error("cinema_move_shot failed", e); throw e; });
+  }
+  cinemaSetShotFraming(id: string, index: number, edit: FramingEdit): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_framing", { id, index, edit }).catch((e: unknown) => { console.error("cinema_set_shot_framing failed", e); throw e; });
+  }
+  cinemaSetShotSubject(id: string, index: number, subject: string): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_subject", { id, index, subject }).catch((e: unknown) => { console.error("cinema_set_shot_subject failed", e); throw e; });
+  }
+  cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog> {
+    return this.core.invoke<SubjectCatalog>("cinema_subject_catalog", { id, index, query }).catch((e: unknown) => { console.error("cinema_subject_catalog failed", e); throw e; });
+  }
+  cinemaSubjectChain(id: string): Promise<SubjectCatalog> {
+    return this.core.invoke<SubjectCatalog>("cinema_subject_chain", { id }).catch((e: unknown) => { console.error("cinema_subject_chain failed", e); throw e; });
+  }
+  cinemaPreview(id: string, seconds: number, active: boolean): Promise<CinemaPreviewReply> {
+    return this.core.invoke<CinemaPreviewReply>("cinema_preview", { id, seconds, active }).catch((e: unknown) => { console.error("cinema_preview failed", e); throw e; });
+  }
+  cinemaRenderPlan(id: string, fps: number, shot: number | null, height: number | null = null, format: RenderFormat | null = null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_plan", { id, fps, shot, height, format }).catch((e: unknown) => { console.error("cinema_render_plan failed", e); throw e; });
+  }
+  cinemaRenderStart(id: string, fps: number, shot: number | null, stem: string, folder: string | null = null, height: number | null = null, format: RenderFormat | null = null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_start", { id, fps, shot, stem, folder, height, format }).catch((e: unknown) => { console.error("cinema_render_start failed", e); throw e; });
+  }
+  cinemaRenderStatus(): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_status").catch((e: unknown) => { console.error("cinema_render_status failed", e); throw e; });
+  }
+  cinemaRenderCancel(): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("cinema_render_cancel").catch((e: unknown) => { console.error("cinema_render_cancel failed", e); throw e; });
+  }
+  viewportCapture(path: string | null = null): Promise<RenderReply> {
+    return this.core.invoke<RenderReply>("viewport_capture", { path }).catch((e: unknown) => { console.error("viewport_capture failed", e); throw e; });
   }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return this.core.invoke<ConditionSpec[]>("condition_catalog").catch((e: unknown) => { console.error("condition_catalog failed", e); throw e; });
@@ -1126,6 +1252,14 @@ export class TauriClient implements EditorClient {
 
   viewportPick(x: number, y: number): Promise<string | null> {
     return this.core.invoke<string | null>("viewport_pick", { x, y }).catch((e: unknown) => { console.error("viewport_pick failed", e); throw e; });
+  }
+  viewportPeek(x: number, y: number): Promise<string | null> {
+    return this.core.invoke<string | null>("viewport_peek", { x, y }).catch((e: unknown) => { console.error("viewport_peek failed", e); throw e; });
+  }
+  viewportHover(ids: string[]): Promise<number> {
+    // Resolves 0 rather than rejecting: a hover cue that throws would take the gesture down with it, and
+    // a stage that failed to light is a missing cue, not a failed edit.
+    return this.core.invoke<number>("viewport_hover", { ids }).catch((e: unknown) => { console.error("viewport_hover failed", e); return 0; });
   }
   dragStart(): void {
     void this.core.invoke("drag_start").catch((e: unknown) => console.error("drag_start failed", e));
@@ -1478,6 +1612,30 @@ function mockTerrainStats(active: boolean): TerrainStats {
 }
 
 // ── dev / test transport: the in-process MockCore + the framed DeltaClient (the unchanged M2.5 path) ────
+/** The zero row every browser-shell render answer is built from. Written once so the four refusals
+ *  cannot disagree about what "nothing was rendered" looks like. */
+const MOCK_RENDER_IDLE: RenderReply = {
+  running: false,
+  done: false,
+  entity: null,
+  frames: 0,
+  written: 0,
+  width: 0,
+  height: 0,
+  offscreen: false,
+  format: "sequence",
+  bitrate: 0,
+  fps: 0,
+  seconds: 0,
+  folder: "",
+  stem: "",
+  bytes: 0,
+  elapsedMs: 0,
+  failures: [],
+  message: "",
+  reason: null,
+};
+
 const CAPS = ["Health", "Shield", "Click", "Damage", "Light"];
 
 /** The dev/test **first-run** scene (M10.10 / C10) — a small, *named*, meaningful starter scene (NOT the
@@ -2775,7 +2933,7 @@ class MockClient implements EditorClient {
     return Promise.resolve({ additive: 0, soft: 0, total: 0, bursts: 0, peakRadiance: 0 });
   }
   cameraProbe(): Promise<CameraProbe> {
-    return Promise.resolve({ eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 45, cinematic: false, distance: 0 });
+    return Promise.resolve({ eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 45, cinematic: false, distance: 0, frame: [0, 0, 1, 1] as [number, number, number, number], visibleRect: [0, 0, 1, 1] as [number, number, number, number] });
   }
   vfxCatalog(): Promise<EffectSpec[]> {
     return Promise.resolve([]);
@@ -2793,16 +2951,77 @@ class MockClient implements EditorClient {
     return Promise.resolve([]);
   }
   cinemaAddShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaRemoveShot(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetMood(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetDelivery(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaList(): Promise<CinemaReply> {
-    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", reads: [], problems: [], message: "", reason: null });
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: null });
+  }
+  /** Empty, like every other cinematics reply here. The vocabulary lives in ONE place — the Rust
+   *  catalogue that also validates it — and a copy of it in this file would be the same
+   *  one-contract-stated-twice the catalogue exists to remove. The dev build refuses every cinematics
+   *  command anyway, so there is no inspector here for the options to fill. */
+  cinemaFramingCatalog(): Promise<FramingCatalog> {
+    return Promise.resolve({ sizes: [], angles: [], motions: [], minSeconds: 0.2, maxSeconds: 20, maxShots: 12, stillMotions: [], deliveries: [] });
+  }
+  cinemaSetShotSeconds(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaMoveShot(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetShotFraming(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetShotSubject(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  /** An EMPTY list, not an invented one. The picker's whole value is the two facts only the native
+   *  scene can answer — what each object is called and how many drawn parts are under it — and a
+   *  browser stub offering plausible rows would be a picker that aims shots at nothing. */
+  cinemaSubjectCatalog(id: string): Promise<SubjectCatalog> {
+    return Promise.resolve({ owner: id, ownerName: "", current: null, candidates: [], query: "", matches: 0, truncated: false });
+  }
+  /** Empty for the same reason: there is no native scene to have clicked on. */
+  cinemaSubjectChain(id: string): Promise<SubjectCatalog> {
+    return Promise.resolve({ owner: id, ownerName: "", current: null, candidates: [], query: "", matches: 0, truncated: false });
+  }
+  /** Refused rather than faked. A preview's whole content is a camera pose solved against real mesh
+   *  bounds in the native scene; a browser-shell stub could only invent three numbers, and a picture
+   *  of a shot nothing filmed is worse than the refusal that says where to get one. */
+  cinemaPreview(): Promise<CinemaPreviewReply> {
+    return Promise.resolve({ active: false, entity: null, seconds: 0, shotIndex: null, shots: 0, reads: "", subjectName: "", progress: 0, blending: false, eye: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 50, message: "", reason: "Shot preview is available in the packaged desktop editor." });
+  }
+  /** Refused, for the same reason the preview is: a render reads back the native wgpu swapchain, and
+   *  there is no swapchain in a browser tab. The dialog still opens, still counts the frames the cut
+   *  would produce and still names the frame it is composed for — every one of which is arithmetic
+   *  over the document — so what the browser build cannot do is exactly the one step that writes. */
+  /** Refused, like every other cinematics call here — and deliberately NOT re-implemented. The frame
+   *  count is `plan_render`'s answer, stated once, in Rust; a browser copy of that multiplication is
+   *  exactly the one-contract-twice this command exists to remove. The dev build has no cutscene to
+   *  plan a render of anyway: `cinemaList` above answers with an empty cut. */
+  cinemaRenderPlan(id: string, fps: number): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, entity: id, fps, reason: "Rendering to files is available in the packaged desktop editor.", message: "Rendering to files is available in the packaged desktop editor." });
+  }
+  cinemaRenderStart(id: string, fps: number, _shot: number | null, stem: string): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, entity: id, fps, stem, reason: "Rendering to files is available in the packaged desktop editor.", message: "Rendering to files is available in the packaged desktop editor." });
+  }
+  cinemaRenderStatus(): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, message: "No render is running." });
+  }
+  cinemaRenderCancel(): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, message: "No render is running." });
+  }
+  viewportCapture(): Promise<RenderReply> {
+    return Promise.resolve({ ...MOCK_RENDER_IDLE, reason: "Saving a frame is available in the packaged desktop editor.", message: "Saving a frame is available in the packaged desktop editor." });
   }
   conditionCatalog(): Promise<ConditionSpec[]> {
     return Promise.resolve([]);
@@ -2965,6 +3184,12 @@ class MockClient implements EditorClient {
   // The dev MockCore has no native viewport — these are inert (the real wgpu input is Tauri-only).
   viewportPick(_x: number, _y: number): Promise<string | null> {
     return Promise.resolve(null);
+  }
+  viewportPeek(_x: number, _y: number): Promise<string | null> {
+    return Promise.resolve(null);
+  }
+  viewportHover(_ids: string[]): Promise<number> {
+    return Promise.resolve(0);
   }
   dragStart(): void {}
   dragEnd(): void {}
