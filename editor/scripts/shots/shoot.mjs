@@ -204,6 +204,64 @@ function installClipRect() {
   };
 }
 
+/** Runs IN THE PAGE. A cheap, stable fingerprint of the layout: how wide the frame is, and where
+ *  every visible control sits inside it.
+ *
+ *  IT IS INSTALLED BEFORE THE CLICKS, NOT AFTER THEM, and that is the whole of the repair below. It
+ *  used to be an inline closure read only either side of the capture, which answered "did the camera
+ *  move anything" and could not answer the earlier question: **had the page finished moving before
+ *  anything was measured at all**. It had not. A workspace behind `React.lazy` resolves its chunk
+ *  asynchronously, the driver waited a flat 300 ms per click, and on a loaded machine that is a coin
+ *  toss — `shell-dock-tabs` failed a full 47-scene run with six tabs measured at 0px on screen and
+ *  the disturbance check firing beside them, then passed twice on its own in the same tree. A gate
+ *  whose verdict depends on how busy the box is trains everyone to re-run it, which is the same
+ *  ending as not having it. */
+function installFingerprint() {
+  window.__mtkFingerprint = () => {
+    const frame = document.querySelector('[data-testid="shot-frame"]');
+    if (!frame) return "no frame";
+    const box = frame.getBoundingClientRect();
+    const sel = 'button, a[href], input, select, textarea, [role="button"]';
+    const rows = [...frame.querySelectorAll(sel)].map((el) => {
+      const r = el.getBoundingClientRect();
+      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
+    });
+    return `${Math.round(box.width)}×${Math.round(box.height)}|${rows.length}|${rows.join(" ")}`;
+  };
+}
+
+/** Wait until the layout stops moving, and FAIL LOUDLY if it never does.
+ *
+ *  Two identical readings `QUIET_MS` apart is the bar. A flat sleep answers "has enough time passed
+ *  on THIS machine", which is a question about the machine; this answers "has the page finished",
+ *  which is the question the driver actually has. The ceiling is real rather than a fallback: a
+ *  surface that is still moving after `SETTLE_MS` is either animating forever or re-rendering in a
+ *  loop, and photographing it under a caption about a static layout is exactly the "picture is not
+ *  evidence of the verdict" failure the disturbance check below exists to name.
+ *
+ *  `QUIET_MS` is longer than the 180 ms `--mtk-motion-base` used by the disclosure and dock
+ *  transitions, so a section mid-open cannot read as settled between two frames of its own
+ *  animation. */
+const QUIET_MS = 220;
+const SETTLE_MS = 5000;
+
+async function settle(page) {
+  const started = Date.now();
+  let previous = null;
+  for (;;) {
+    const now = await page.evaluate(() => window.__mtkFingerprint());
+    if (now === previous) return;
+    if (Date.now() - started > SETTLE_MS) {
+      throw new Error(
+        `the layout never settled: it was still moving ${SETTLE_MS} ms after the scene reached its ` +
+          "state, so any measurement taken here is of a frame, not of a layout",
+      );
+    }
+    previous = now;
+    await new Promise((r) => setTimeout(r, QUIET_MS));
+  }
+}
+
 function layoutInvariants(windowIsTheSubject) {
   const frame = document.querySelector('[data-testid="shot-frame"]');
   if (!frame) return [];
@@ -983,6 +1041,7 @@ for (const scene of scenes) {
   // Drive the scene to the state it claims to photograph. A selector that matches nothing is a
   // FAILURE: silently skipping it would capture the default state under a caption describing
   // another, and a caption nothing evaluates is what this harness exists to stop.
+  await page.evaluate(installFingerprint);
   for (const sel of click ?? []) {
     const el = await page.$(sel);
     if (!el) {
@@ -990,8 +1049,11 @@ for (const scene of scenes) {
       break;
     }
     await el.click();
-    await new Promise((r) => setTimeout(r, 300)); // the workspace is lazy-loaded behind Suspense
+    await settle(page); // the workspace is lazy-loaded behind Suspense
   }
+  // And once more after the last click, because a scene with NO clicks still mounts panels that fetch
+  // in an effect — the 250 ms above is the same flat guess one step earlier.
+  await settle(page);
 
   // MEASURE BEFORE CAPTURING, because capturing MOVES THINGS. `screenshot({ fullPage: true })`
   // resizes the page to the content box and puts it back, and a shell that lays itself out from
@@ -1302,20 +1364,9 @@ for (const scene of scenes) {
   const notes = evaluated.filter((l) => l.startsWith("NOTE "));
   const layout = evaluated.filter((l) => !l.startsWith("NOTE "));
 
-  // A cheap, stable fingerprint of the layout that was just judged: how wide the frame is, and where
-  // every visible control sits inside it. Compared against the same reading taken after the capture.
-  const fingerprint = () => {
-    const frame = document.querySelector('[data-testid="shot-frame"]');
-    if (!frame) return "no frame";
-    const box = frame.getBoundingClientRect();
-    const sel = 'button, a[href], input, select, textarea, [role="button"]';
-    const rows = [...frame.querySelectorAll(sel)].map((el) => {
-      const r = el.getBoundingClientRect();
-      return `${el.tagName}:${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}`;
-    });
-    return `${Math.round(box.width)}×${Math.round(box.height)}|${rows.length}|${rows.join(" ")}`;
-  };
-  const before = await page.evaluate(fingerprint);
+  // The same reading the settle above already took, now used for its original question: did the
+  // CAPTURE move anything. One definition on `window`, three readers.
+  const before = await page.evaluate(() => window.__mtkFingerprint());
 
   // `fullPage` exists so a panel taller than the window is captured whole. A scene that set its own
   // `viewport` has declared the window to BE the subject — there is nothing beyond it to reach for —
@@ -1331,7 +1382,7 @@ for (const scene of scenes) {
   // again afterwards and must be unchanged: whatever the capture does, the picture and the verdict
   // are about the same thing, and any future capture path that starts moving the page fails here
   // instead of quietly making every screenshot a lie.
-  const after = await page.evaluate(fingerprint);
+  const after = await page.evaluate(() => window.__mtkFingerprint());
   const disturbed =
     before === after
       ? []
