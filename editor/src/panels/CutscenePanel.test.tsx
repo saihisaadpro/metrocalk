@@ -100,6 +100,74 @@ describe("CutscenePanel", () => {
     expect(clips.map((clip) => clip.style.left)).toEqual(["0%", "20%", "60%", "70%"]);
   });
 
+  // ── ADR-197 — a warning about the world, refreshed when the world settles ────────────────────
+
+  it("re-reads the cut when the SCENE changes, not only when the panel edits it", async () => {
+    // The warning list now carries what the world says about each shot's camera, so an author who
+    // pushes a machine into a shot's line of sight must see it. Before this the panel re-read only
+    // after its own mutations, and the engine's reply and the panel disagreed on the packaged .exe.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const client = loaded();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      await screen.findAllByTestId("cutscene-clip");
+      const before = (client.cinemaList as ReturnType<typeof vi.fn>).mock.calls.length;
+
+      act(() => {
+        projectionStore.getState().applyDelta({
+          ops: [{ op: "setField", id: "e2", component: "Transform", field: "x", value: 4 }],
+        });
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(400);
+      });
+      await waitFor(() =>
+        expect((client.cinemaList as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(before),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("costs ONE re-read for a burst of deltas, not one per frame", async () => {
+    // `applyDelta` is the streaming channel handler and its own comment calls a pure-transform delta
+    // "the 60 Hz common case" — a drag, a played animation and a previewed cutscene each push one per
+    // frame. Sixty `cinema_list` round trips a second, each running the placement search, for a
+    // sentence nobody can read at that rate, is the regression this debounce exists to prevent.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const client = loaded();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      await screen.findAllByTestId("cutscene-clip");
+      const before = (client.cinemaList as ReturnType<typeof vi.fn>).mock.calls.length;
+
+      // A second of a 60 Hz stream, with no gap long enough to settle.
+      for (let frame = 0; frame < 60; frame += 1) {
+        act(() => {
+          projectionStore.getState().applyDelta({
+            ops: [{ op: "setField", id: "e2", component: "Transform", field: "x", value: frame }],
+          });
+        });
+        act(() => {
+          vi.advanceTimersByTime(16);
+        });
+      }
+      expect((client.cinemaList as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before);
+
+      // ...and exactly one once it stops.
+      await act(async () => {
+        vi.advanceTimersByTime(400);
+      });
+      await waitFor(() =>
+        expect((client.cinemaList as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before + 1),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("opens the shot on its own numbers when a clip is clicked", async () => {
     selectSomething();
     render(<CutscenePanel client={loaded()} />);

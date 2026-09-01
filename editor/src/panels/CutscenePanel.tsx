@@ -96,6 +96,16 @@ const VIEWPORT_GUIDE =
  *  reason: a control that is enabled and does nothing is worse than one that says why not. */
 const EMPTY_PREVIEW = "There is nothing to preview — add a shot first.";
 
+/** ADR-197 — how long the scene must stop changing before the warning list is re-read, in ms.
+ *
+ *  Above one 60 Hz frame by two orders of magnitude, because that stream is what this exists to
+ *  swallow: `applyDelta` is the streaming channel handler and its own comment calls a pure-transform
+ *  delta “the 60 Hz common case” — a drag, a played animation and a previewed cutscene each push one
+ *  per frame, and `cinema_list` now runs the placement search. Well below the ~1 s at which a person
+ *  would call a panel stale. Only the WORLD's changes wait; the panel's own edits re-read at the
+ *  gesture, because a gesture owns its outcome. */
+const WORLD_SETTLE_MS = 250;
+
 /** Why Render refuses on an object with no cutscene. Same shape, same reason: there is nothing to
  *  film, and the control says so rather than opening a dialog whose every number would be zero. */
 const EMPTY_RENDER = "There is nothing to render — add a shot first.";
@@ -149,8 +159,10 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
   const [busy, setBusy] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
-  /** "The scene changed" — see the read effect below. */
+  /** "The scene changed", live — every committed delta, including the 60 Hz pose stream. */
   const docRevision = useDocumentRevision();
+  /** The same signal AFTER THE SCENE HAS STOPPED MOVING, which is the one the read effect wants. */
+  const [settledDoc, setSettledDoc] = useState(0);
   // The value a slider currently reads while the pointer is down, before it becomes a commit.
   const [draftSeconds, setDraftSeconds] = useState<number | null>(null);
   /** Whether the render dialog is open. ADR-175. */
@@ -215,6 +227,16 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
     };
   }, [client]);
 
+  /** ADR-197 — settle the world's changes before asking the engine about them again.
+   *
+   *  A TRAILING timer, restarted by every delta, so a drag or a played animation costs ONE re-read
+   *  when it stops rather than one per frame. See `WORLD_SETTLE_MS`. */
+  useEffect(() => {
+    if (docRevision === 0) return undefined;
+    const timer = window.setTimeout(() => setSettledDoc(docRevision), WORLD_SETTLE_MS);
+    return () => window.clearTimeout(timer);
+  }, [docRevision]);
+
   // Keyed on the entity asked for, cleared on a selection change, and re-read across a Play
   // transition, after every local mutation, and on every committed change to the SCENE.
   //
@@ -240,7 +262,7 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
     return () => {
       live = false;
     };
-  }, [client, selected, playing, revision, docRevision]);
+  }, [client, selected, playing, revision, settledDoc]);
 
   const rows = cut.rows;
   const duration = cut.seconds;

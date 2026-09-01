@@ -233,16 +233,20 @@ describe("ADR-197 · nowhere good to film from", () => {
     // deleted.
     expect(await selectRow(subject)).toBe(true);
     await browser.pause(900);
-    note(
-      `[panel state] ${JSON.stringify(
-        await browser.execute(() => ({
-          panels: document.querySelectorAll('[data-testid="cutscene-panel"]').length,
-          clips: document.querySelectorAll('[data-testid="cutscene-clip"]').length,
-          problems: document.querySelectorAll('[data-testid="cutscene-problem"]').length,
-          head: document.querySelector('[data-testid="cutscene-panel"]')?.textContent?.slice(0, 220) ?? null,
-        })),
-      )}`,
-    );
+    // THE PANEL'S OWN STATE, asserted rather than inferred from the absence of a warning. "No
+    // warnings" and "no panel" produce the same empty query, and the first run of this spec could not
+    // tell them apart: the panel was mounted, on the right cut, showing one clip — and holding the
+    // `cinema_list` answer it had fetched before the obstruction existed (fixed, ADR-197 §8).
+    const state = await browser.execute(() => ({
+      panels: document.querySelectorAll('[data-testid="cutscene-panel"]').length,
+      clips: document.querySelectorAll('[data-testid="cutscene-clip"]').length,
+      problems: document.querySelectorAll('[data-testid="cutscene-problem"]').length,
+      head: document.querySelector('[data-testid="cutscene-panel"]')?.textContent?.slice(0, 220) ?? null,
+    }));
+    note(`[panel state] ${JSON.stringify(state)}`);
+    expect(state.panels).toBe(1);
+    expect(state.clips).toBe(1);
+    expect(state.problems).toBeGreaterThan(0);
     const drawn = await panelProblems();
     note(`[panel] ${JSON.stringify(drawn)}`);
     expect(drawn.some((p) => /nowhere good to film from/.test(p))).toBe(true);
