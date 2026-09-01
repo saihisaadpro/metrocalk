@@ -41,5 +41,17 @@ export default defineConfig(({ command }) => ({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
+    // **THE PER-TEST BUDGET WAS MEASURING THE MACHINE.** Vitest defaults to 5 s per test, and four
+    // `App` cases — the ones that mount the whole shell and then wait for a `React.lazy` panel — take
+    // 7 to 16 s here whenever a sibling build holds the cores. They fail together, pass alone, and
+    // fail identically on an untouched checkout, which is the definition of a flake rather than a
+    // finding (`<test_and_ci_discipline>` 4).
+    //
+    // Raising the ceiling does not weaken any assertion: nothing in this suite claims a duration, and
+    // the tests that DO measure interaction cost measure it directly rather than through a timeout. A
+    // wait that genuinely never resolves still fails — it just fails saying what it was waiting for
+    // instead of "timed out in 5000ms".
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
   },
 }));
