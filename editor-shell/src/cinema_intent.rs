@@ -3244,7 +3244,7 @@ mod tests {
         let cut = cutscene_of(&engine, hero);
         let reply = reply_for(hero, &cut, "Hero", "ok".into());
         assert!(
-            reply.problems.iter().any(|p| p.contains("jump cut")),
+            reply.problems.iter().any(|p| p.message.contains("jump cut")),
             "{:?}",
             reply.problems
         );

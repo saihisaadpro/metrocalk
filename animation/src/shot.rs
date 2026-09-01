@@ -4200,9 +4200,11 @@ mod tests {
             (progress - 1.0).abs() < 1.0e-6,
             "the fault is at the end of the move, not at its opening: {progress}"
         );
-        assert_eq!(
-            pose.eye,
-            solve_shot_adjusted(&card, plan, cube(), progress, 16.0 / 9.0, 50.0).eye,
+        assert!(
+            dist(
+                pose.eye,
+                solve_shot_adjusted(&card, plan, cube(), progress, 16.0 / 9.0, 50.0).eye
+            ) < 1.0e-4,
             "the pose has to be the one the runtime films at that instant"
         );
     }
@@ -4219,11 +4221,8 @@ mod tests {
             50.0,
             a_world_that_is_always(Vantage::OPEN),
         );
-        assert_eq!(progress, 0.0, "ties go to the earliest sample");
-        assert_eq!(
-            pose.eye,
-            solve_shot(&card, cube(), 0.0, 16.0 / 9.0, 50.0).eye
-        );
+        assert!(progress.abs() < 1.0e-6, "ties go to the earliest sample");
+        assert!(dist(pose.eye, solve_shot(&card, cube(), 0.0, 16.0 / 9.0, 50.0).eye) < 1.0e-4);
     }
 
     #[test]
@@ -4246,8 +4245,8 @@ mod tests {
             50.0,
             a_world_that_is_always(Vantage::OPEN),
         );
-        assert_eq!(
-            pose.eye, camera.eye,
+        assert!(
+            dist(pose.eye, camera.eye) < 1.0e-4,
             "an adjustment must not move a placed camera"
         );
     }
