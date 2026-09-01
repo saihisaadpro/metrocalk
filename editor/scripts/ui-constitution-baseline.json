@@ -387,6 +387,13 @@
       "literal-motion": 0,
       "unitless-length": 0
     },
+    "src/panels/ruleClause.tsx": {
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
+      "first-party-css": 0,
+      "literal-motion": 0,
+      "unitless-length": 0
+    },
     "src/panels/RuleDebugPanel.tsx": {
       "raw-native-control": 0,
       "literal-ui-color": 0,
@@ -409,7 +416,7 @@
       "unitless-length": 0
     },
     "src/panels/StateGraphPanel.tsx": {
-      "raw-native-control": 25,
+      "raw-native-control": 0,
       "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,

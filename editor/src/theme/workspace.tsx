@@ -659,6 +659,54 @@ export function ShortcutBadge({ keys, ariaLabel, title, style }: ShortcutBadgePr
   );
 }
 
+export interface CanvasSplitProps {
+  /** The subject — a graph, a preview, a timeline. Takes whatever width is left, and stays put. */
+  canvas: ReactNode;
+  /** What belongs UNDER the subject rather than beside it: the editor whose rows are wide sentences,
+   *  which a 340px track can only wrap. It scrolls; the subject above it does not. */
+  below?: ReactNode;
+  /** The controls that shape it. A fixed track, because a control column that stretches is a column
+   *  of half-empty rows. */
+  children: ReactNode;
+  /** Put the subject away and give its room to `below`. "Everything collapsible" is a constitution
+   *  layout rule, and on a dock with a hard 520px ceiling it is the difference between an editor and
+   *  a porthole: measured, a graph at its 200px floor plus two section headings leaves 68px for a
+   *  143px card, and no arrangement of the three fixes that — one of them has to be able to go. */
+  canvasHidden?: boolean;
+  className?: string;
+  style?: CSSProperties;
+  "data-testid"?: string;
+}
+
+/**
+ * A CANVAS AND THE CONTROLS THAT SHAPE IT — the constitution's layout rule, as a component.
+ *
+ * "Viewport in the centre, properties on the right" is stated for the shell and then owed by every
+ * editor inside it. A workspace dock is a WIDE, SHORT band (the Logic dock is ~1240x520), so an
+ * editor that stacks its subject above its controls puts the controls below the fold and photographs
+ * as a graph with nothing to do — which is exactly what the state-machine editor did.
+ *
+ * Below 980px the two stack, because at that width a 340px control track is a third of the panel.
+ */
+export function CanvasSplit({ canvas, below, children, canvasHidden = false, className, style, ...rest }: CanvasSplitProps) {
+  return (
+    <div
+      className={["mtk-canvas-split", canvasHidden && "is-canvas-hidden", className].filter(Boolean).join(" ")}
+      style={style}
+      {...rest}
+    >
+      {/* Source order is the STACKED order — subject, then the controls beside it, then what sat
+          under it — because that is the order a reader wants at one column wide and it is the tab
+          order at every width. The two-column arrangement is grid placement, not markup order. */}
+      {/* Unmounted rather than `display: none`: a graph canvas measures itself on mount, and a
+          hidden one comes back with a viewport it computed for a zero-sized box. */}
+      {!canvasHidden && <div className="mtk-canvas-split__subject">{canvas}</div>}
+      <div className="mtk-canvas-split__side">{children}</div>
+      {below != null && <div className="mtk-canvas-split__below">{below}</div>}
+    </div>
+  );
+}
+
 export interface WorkspacePanelProps extends Omit<HTMLAttributes<HTMLElement>, "title"> {
   title: ReactNode;
   subtitle?: ReactNode;

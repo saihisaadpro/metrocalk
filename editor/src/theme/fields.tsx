@@ -161,6 +161,153 @@ export function Checkbox({
   );
 }
 
+export interface RadioGroupProps {
+  /** Names the CHOICE, once, for everyone — the question the options answer. */
+  label: string;
+  children: ReactNode;
+  /** One line under the label saying what picking one does. */
+  help?: ReactNode;
+  className?: string;
+  style?: CSSProperties;
+  "data-testid"?: string;
+}
+
+/**
+ * A SINGLE CHOICE AMONG A LIST — the control the design system did not have.
+ *
+ * `Checkbox` answers "is this on"; nothing answered "which ONE of these", so the two places that
+ * needed it drew a bare `<input type="radio">` and got the OS widget: a filled blue dot at the
+ * desktop's own scale and radius, beside controls that had all been taken off `accent-color`
+ * precisely so they would stop looking like the platform. The state-machine editor's initial-state
+ * marker and the animation graph's entry-state marker are the two, and they render differently from
+ * each other on the same screen today.
+ *
+ * The group is a real `radiogroup` with ONE accessible name, so the question is announced once and
+ * each option carries only its own answer — rather than every row repeating the sentence.
+ */
+export function RadioGroup({ label, children, help, className, style, ...rest }: RadioGroupProps) {
+  const generatedId = useId();
+  const helpId = `mtk-radio-group-${generatedId}-help`;
+  return (
+    <div
+      className={["mtk-radio-group", className].filter(Boolean).join(" ")}
+      role="radiogroup"
+      aria-label={label}
+      aria-describedby={help != null ? helpId : undefined}
+      style={style}
+      {...rest}
+    >
+      {help != null && (
+        <p className="mtk-radio-group__help" id={helpId}>
+          {help}
+        </p>
+      )}
+      {children}
+    </div>
+  );
+}
+
+export interface RadioProps {
+  label: ReactNode;
+  /** The choice this option belongs to — every option of one question shares it. */
+  name: string;
+  checked: boolean;
+  onChange: () => void;
+  /** The whole sentence for assistive technology when the visible label is a shorthand ("Start"). */
+  ariaLabel?: string;
+  /** One line of plain-language consequence, under the label. */
+  description?: ReactNode;
+  disabled?: boolean;
+  /** Why it is refusing, in the user's words — surfaced on the input, where the refusal is. */
+  disabledReason?: string;
+  /** Hide the words and keep the mark — for a row whose own name is already the option's label. */
+  labelHidden?: boolean;
+  id?: string;
+  className?: string;
+  style?: CSSProperties;
+  "data-testid"?: string;
+}
+
+/** The one radio. Same anatomy, states and hit target as [`Checkbox`]; a circle instead of a tick. */
+export function Radio({
+  label,
+  name,
+  checked,
+  onChange,
+  ariaLabel,
+  description,
+  disabled = false,
+  disabledReason,
+  labelHidden = false,
+  id,
+  className,
+  style,
+  ...rest
+}: RadioProps) {
+  const generatedId = useId();
+  const inputId = id ?? `mtk-radio-${generatedId}`;
+  const descriptionId = description != null ? `${inputId}-description` : undefined;
+  return (
+    <label
+      className={["mtk-radio", className].filter(Boolean).join(" ")}
+      htmlFor={inputId}
+      data-disabled={disabled || undefined}
+      title={disabled ? disabledReason : undefined}
+      style={style}
+      {...rest}
+    >
+      <input
+        id={inputId}
+        type="radio"
+        name={name}
+        className="mtk-radio__dot"
+        checked={checked}
+        disabled={disabled}
+        // On the INPUT, not only the label around it — a `<label>` is not itself disabled, so a
+        // reason parked there is a reason the control never gives (the same rule `Checkbox` states).
+        title={disabled ? disabledReason : undefined}
+        aria-label={ariaLabel}
+        aria-describedby={descriptionId}
+        onChange={onChange}
+      />
+      <span className={labelHidden ? "mtk-visually-hidden" : "mtk-radio__label"}>{label}</span>
+      {description != null && (
+        <span className="mtk-radio__description" id={descriptionId}>
+          {description}
+        </span>
+      )}
+    </label>
+  );
+}
+
+export interface ListRowProps {
+  children: ReactNode;
+  /** Lifts the row onto its own surface — for a row that holds a nested editor rather than one line. */
+  tone?: "plain" | "card";
+  role?: AriaRole;
+  className?: string;
+  style?: CSSProperties;
+  id?: string;
+  "data-testid"?: string;
+  "data-id"?: string;
+}
+
+/**
+ * ONE ROW OF AN EDITABLE LIST: a lead mark, a body that grows, trailing metadata and actions.
+ *
+ * The shape every authoring list in the editor is made of, and the one every such list had been
+ * writing by hand as `display: flex; gap: 4; margin: 3px 0` — which is why a delete button lands at a
+ * different distance from its row's edge in each of them. The row is the hit target and the hover
+ * surface; the controls inside it are the shared field family, never a bespoke one.
+ */
+export function ListRow({ children, tone = "plain", className, ...rest }: ListRowProps) {
+  return (
+    <div className={["mtk-list-row", tone === "card" && "mtk-list-row--card", className].filter(Boolean).join(" ")} {...rest}>
+      {children}
+    </div>
+  );
+}
+
 export type CalloutTone = "neutral" | "info" | "success" | "warn" | "danger";
 
 const CALLOUT_ICON: Record<CalloutTone, string> = {

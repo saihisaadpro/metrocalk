@@ -29,6 +29,8 @@ import { StateGraph } from "../../src/graph/StateGraph";
 import { AnimationGraphEditor } from "../../src/graph/AnimationGraphEditor";
 import { animationGraphPorts, createLocomotionGraphPreset } from "../../src/graph/animation-graph-model";
 import { animationEditorStore, animationWorkspaceKey } from "../../src/store/animation";
+import { StateGraphPanel } from "../../src/panels/StateGraphPanel";
+import { DockTabs } from "../../src/theme/workspace";
 import { AnimationWorkspace } from "../../src/panels/AnimationWorkspace";
 import { Diagnostics } from "../../src/panels/Diagnostics";
 import { ImportReport } from "../../src/panels/ImportReport";
@@ -41,6 +43,7 @@ import { PhysicsPanel } from "../../src/panels/PhysicsPanel";
 import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { assetShelfStore } from "../../src/store/assetShelf";
+import { playStore } from "../../src/store/play";
 import { projectionStore } from "../../src/store/projection";
 import type {
   AnimationGraphDebugInfo,
@@ -56,7 +59,9 @@ import type {
   RoleRow,
   RoleSpec,
   ShotSpec,
+  RuleRegistryInfo,
   StateMachine,
+  StateMachineInfo,
   TimelineTuple,
 } from "../../src/transport/protocol";
 import { createMockSession, type EditorClient } from "../../src/transport/session";
@@ -1204,6 +1209,7 @@ export const SCENES: Scene[] = [
   ...rigScenes(),
   ...poseScenes(),
   ...graphScenes(),
+  ...stateMachineScenes(),
   ...inspectorScenes(),
   ...assetScenes(),
   ...modelScenes(),
@@ -2521,6 +2527,376 @@ function gameplayScenes(): Scene[] {
       viewport: { width: 760, height: 980 },
       setup: selectCrystal,
       render: () => <MatchPanel client={gameplayClient()} />,
+    },
+  ];
+}
+
+// ── the state-machine editor ──────────────────────────────────────────────────────────────────────
+
+/** THE SIGNATURE AUTHORING SURFACE THIS HARNESS HAD NEVER PHOTOGRAPHED.
+ *
+ *  `state-graph-door` above captures the CANVAS — `StateGraph`, the projection of a machine onto the
+ *  shared graph framework. The panel that WRAPS it, where a machine is actually built, had no capture
+ *  of any kind: not the states list, not a transition, not a guard, not the empty state, not a
+ *  refusal. It was also the last panel in the tree drawing its own controls — 25 raw `<select>`,
+ *  `<input>` and `<button>` elements under one hand-written monospace style — and no gate could see
+ *  that, because `check-ui-constitution` counts them and a count is not a picture.
+ *
+ *  Photographed in the box the Logic dock really is: a bounded scroll parent →
+ *  `.mtk-bottom-workspace--logic` → its tab strip → the body. The chain is the point — the panel's
+ *  header, rail and footer are only pinned if it FILLS that body rather than growing past it, which
+ *  is the ADR-124 defect one level down. */
+type AuthorReply = { id: string | null; error: string | null; unreachable: string[] };
+
+function stateMachineScenes(): Scene[] {
+  const DOOR_REGISTRY: RuleRegistryInfo = {
+    events: [
+      { name: "badge_accepted", description: "a valid badge was presented at the reader" },
+      { name: "open_requested", description: "someone asked the door to open" },
+      { name: "travel_complete", description: "the leaf reached the end of its travel" },
+      { name: "close_requested", description: "someone asked the door to close" },
+      { name: "obstruction_detected", description: "the safety edge was triggered mid-travel" },
+      { name: "obstruction_cleared", description: "the safety edge reads clear again" },
+    ],
+    actions: [{ name: "SetField", description: "set a component field" }],
+    components: [
+      {
+        name: "DoorState",
+        fields: [
+          { name: "phase", ty: "string" },
+          { name: "obstructed", ty: "boolean" },
+        ],
+      },
+      { name: "Interlock", fields: [{ name: "pressure", ty: "number" }] },
+    ],
+  };
+
+  /** The same door, with a real GUARD on the transition that has one in life: the safety edge only jams
+   *  the leaf while something is actually in the way. An empty `conditions` list on every transition
+   *  would photograph a guard editor that had never been used. */
+  const GUARDED_DOOR: StateMachine = {
+    ...DOOR_MACHINE,
+    transitions: DOOR_MACHINE.transitions.map((t) =>
+      t.id === "t6"
+        ? {
+            ...t,
+            rule: {
+              ...t.rule,
+              conditions: [
+                { entity: "door", component: "DoorState", field: "obstructed", op: "eq" as const, value: { Bool: true } },
+              ],
+            },
+          }
+        : t,
+    ),
+  };
+
+  /** Three states and two transitions — small enough that a TRANSITION CARD, with its guard, fits on
+   *  screen at a size the dock really is. The door is the machine that shows what a graph looks like;
+   *  this is the one that shows what a transition looks like. */
+  const ALARM: StateMachine = {
+    name: "Door Alarm",
+    entity: "door",
+    component: "DoorState",
+    field: "phase",
+    states: ["Idle", "Ringing", "Silenced"],
+    initial: "Idle",
+    transitions: [
+      {
+        id: "a1",
+        from: "Idle",
+        to: "Ringing",
+        rule: {
+          name: "Idle -> Ringing",
+          enabled: true,
+          event: "obstruction_detected",
+          conditions: [
+            { entity: "door", component: "DoorState", field: "obstructed", op: "eq" as const, value: { Bool: true } },
+          ],
+          actions: [],
+        },
+      },
+    ],
+  };
+
+  const CONVEYOR: StateMachine = {
+    name: "Feed Conveyor",
+    entity: "conveyor",
+    component: "DoorState",
+    field: "phase",
+    states: ["Idle", "Running"],
+    initial: "Idle",
+    transitions: [],
+  };
+
+  /** `playing` is a SEPARATE fact from `current`: the shell defaults a machine's `current` to its own
+   *  `initial`, so a live readout keyed on it would claim a machine that has never run is running. The
+   *  wide scene photographs the running case (a `live` chip on the graph, a state in the footer); the
+   *  rest photograph the authoring case, which is what a user meets first. */
+  const seedDoorScene = (playing = false) => () => {
+    playStore.getState().refresh({ playing, paused: false });
+    const summaries = {
+      door: { id: "door", name: "Airlock Door — Bay 3", parentId: null, kind: "mesh" },
+      conveyor: { id: "conveyor", name: "Feed Conveyor", parentId: null, kind: "mesh" },
+      reader: { id: "reader", name: "Badge Reader — North", parentId: null, kind: "requirer" },
+    };
+    projectionStore.setState({
+      summaries: { ...summaries } as never,
+      edges: {} as never,
+      order: Object.keys(summaries),
+      selectedId: "door",
+      multiSelect: ["door"],
+    });
+  };
+
+  const stateMachineClient = (machines: StateMachineInfo[], author: () => Promise<AuthorReply>) =>
+    ({
+      ruleRegistry: () => Promise.resolve(DOOR_REGISTRY),
+      stateMachines: () => Promise.resolve(machines),
+      authorStateMachine: author,
+      deleteStateMachine: () => Promise.resolve(true),
+    }) as unknown as EditorClient;
+
+  /** The real chain the panel lays itself out inside, tab strip included — the strip costs the editor
+   *  ~40px of a 520px dock, and a capture that leaves it out is a capture of a taller panel. */
+  function logicDock(children: ReactNode) {
+    return (
+      <div style={{ height: "100vh", overflow: "hidden auto", background: "var(--mtk-bg-panel)" }}>
+        <div className="mtk-bottom-workspace mtk-bottom-workspace--logic">
+          <DockTabs
+            ariaLabel="Logic editors"
+            activeId="states"
+            onChange={() => {}}
+            tabs={[
+              { id: "rules", label: "Rules" },
+              { id: "states", label: "State machines" },
+              { id: "graph", label: "Binding graph" },
+              { id: "compose", label: "Compose" },
+            ]}
+          />
+          <div className="mtk-bottom-workspace__body is-bleed">{children}</div>
+        </div>
+      </div>
+    );
+  }
+
+  const doorInfo: StateMachineInfo = { id: "sm-door", current: "Opening", machine: GUARDED_DOOR };
+  // `current` is never null on the wire: the shell defaults it to the machine's own `initial`
+  // (`main.rs` `ListStateMachines`), which is exactly why the running/not-running fact comes from the
+  // play store instead of from this field.
+  const conveyorInfo: StateMachineInfo = { id: "sm-conveyor", current: CONVEYOR.initial, machine: CONVEYOR };
+  const openDoor = ["#state-machines-sm-door-tab"];
+  const quiet = (): Promise<AuthorReply> => Promise.resolve({ id: "sm-door", error: null, unreachable: [] });
+
+  const scene = (
+    id: string,
+    looking_for: string,
+    expect: Expect,
+    author: () => Promise<AuthorReply>,
+    click: string[] = openDoor,
+    viewport = { width: 1240, height: 520 },
+    running = false,
+  ): Scene => ({
+    id,
+    looking_for,
+    expect,
+    viewport,
+    click,
+    setup: seedDoorScene(running),
+    render: () => logicDock(<StateGraphPanel client={stateMachineClient([doorInfo, conveyorInfo], author)} />),
+  });
+
+  return [
+    scene(
+      "state-machine-editor",
+      "THE STATE MACHINE EDITOR, in the dock it ships in. What a reader is checking is that this is " +
+        "recognisably the SAME application as the Model workspace: a titled header naming what is " +
+        "open, the machines in this scene as a labelled rail on the left, the graph taking the room " +
+        "and the controls that shape it beside it — never stacked underneath, which is what put both " +
+        "editable lists below a 520px fold. Every control is the shared family: the start state is " +
+        "the design system's radio and not the desktop's blue dot, a delete is a ghost icon button " +
+        "and not the character times, and the guard on obstruction_detected is the SAME clause row " +
+        "the Rules builder one tab over renders. The footer says the thing nobody could find out " +
+        "before: there is no Save button because every edit already is one undoable step",
+      {
+        present: [
+          ["[data-testid='sm-list'] [role='tab']", 2],
+          ["[data-testid='sm-state']", 6],
+          ["[data-testid='sm-transition']", 7],
+          ["[data-testid='sm-cond']", 1],
+          [".mtk-radio__dot", 6],
+          [".react-flow__node", 6],
+        ],
+        // The OS radio is gone: every single-choice mark in this panel is the shared drawing.
+        absent: ["input[type='radio']:not(.mtk-radio__dot)"],
+        text_present: ["Airlock Door — Bay 3", "obstruction_detected", "one undoable step", "now in Opening"],
+        text_absent: ["null", "undefined", "NaN"],
+        // The controls sit BESIDE the canvas, not under it — the whole reason for the split. 300px is
+        // the track's floor; a stacked layout measures the full panel width here and fails the ceiling.
+        min_width: [[".mtk-canvas-split__side", 300]],
+        max_width: [[".mtk-canvas-split__side", 340]],
+        // The panel's own chrome must survive the dock: a header that scrolls away and a footer that
+        // is 100px below the fold are the two failures this composition exists to prevent.
+        // The panel's own chrome must survive the dock, and so must the tab strip above it: a header
+        // that scrolls away, a footer 100px below the fold and a tab row squeezed to zero height are
+        // three separate ways for a bounded dock to eat the thing it is holding, and the strip is the
+        // one that actually happened (24px of every Logic tab, cut to 0, still in the DOM).
+        unclipped: [
+          ".mtk-workspace-panel__header",
+          ".mtk-workspace-panel__footer",
+          ".mtk-dock-tab",
+          "[data-testid='sm-add-state']",
+        ],
+        // The controls column scrolls on its own, so reading down it does not drag the graph away.
+        // Anything below its fold is REACHED, not lost — which is why `sm-add-transition` is not in
+        // the list above and `sm-add-state`, at the top of that column, is.
+        min_height: [[".mtk-canvas-split__side", 300]],
+        // from and to are one sentence. They wrapped into separate lines the moment the track
+        // narrowed, because the selects claimed intrinsic widths instead of sharing the row.
+        same_line: [["[data-testid='sm-trans-from']", "[data-testid='sm-trans-to']"]],
+      },
+      quiet,
+      openDoor,
+      { width: 1240, height: 520 },
+      true,
+    ),
+    scene(
+      "state-machine-unreachable",
+      "a state NOTHING LEADS TO, said as a warning rather than a rejection — the machine is saved, " +
+        "and the thing that is wrong with it is named at the top of the editor with the fix in the " +
+        "same sentence. It used to be a bare coloured line of text with no mark, which is colour " +
+        "carrying a meaning on its own",
+      {
+        present: [
+          ["[data-testid='sm-unreachable']", 1],
+          ["[data-testid='sm-unreachable'] .mtk-callout__icon", 1],
+        ],
+        text_present: ["Jammed", "add a transition into it"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='sm-unreachable']", ".mtk-workspace-panel__footer"],
+        // The warning is ABOVE the graph it is about, not below the fold under it.
+        stacked: [["[data-testid='sm-unreachable']", "[data-testid='state-graph']"]],
+      },
+      () => Promise.resolve({ id: "sm-door", error: null, unreachable: ["Jammed"] }),
+      [...openDoor, "[data-testid='sm-add-transition']"],
+    ),
+    scene(
+      "state-machine-blocked",
+      "the REFUSAL, which is the state that has to be legible: the machine the engine would not " +
+        "accept, its reason quoted in the user's words, and the editor still holding the draft so the " +
+        "edit is one correction away rather than lost (ADR-016). The reason carries a mark and a " +
+        "title of its own — a refusal that is only red is a refusal a colour-blind reader meets as an " +
+        "ordinary sentence",
+      {
+        present: [
+          ["[data-testid='sm-error']", 1],
+          ["[data-testid='sm-error'] .mtk-callout__icon", 1],
+        ],
+        text_present: ["was not saved", "Nowhere"],
+        text_absent: ["null", "undefined", "NaN"],
+        unclipped: ["[data-testid='sm-error']"],
+        stacked: [["[data-testid='sm-error']", "[data-testid='state-graph']"]],
+      },
+      () =>
+        Promise.resolve({
+          id: null,
+          error: "a transition points to 'Nowhere', which isn't one of this machine's states",
+          unreachable: [],
+        }),
+      [...openDoor, "[data-testid='sm-add-transition']"],
+    ),
+    {
+      id: "state-machine-empty",
+      looking_for:
+        "a scene with no state machines in it — an EMPTY STATE with one next step in it, and the " +
+        "control that takes it. The shipped panel printed a grey line of prose naming a button that " +
+        "lived somewhere else on the panel: the decisive step offloaded to a passive sentence, " +
+        "<ux_quality> 1 exactly. The words also have to say what a state machine IS, because the " +
+        "reader who meets this screen is by definition the one who has never made one",
+      expect: {
+        present: [
+          ["[data-testid='sm-empty']", 1],
+          ["[data-testid='sm-empty'] [data-testid='sm-new']", 1],
+        ],
+        text_present: ["No state machines yet", "one undoable step"],
+        text_absent: ["null", "undefined", "NaN"],
+        absent: ["[data-testid='sm-list']"],
+        unclipped: ["[data-testid='sm-new']"],
+      },
+      viewport: { width: 1240, height: 520 },
+      setup: seedDoorScene(),
+      render: () =>
+        logicDock(
+          <StateGraphPanel
+            client={stateMachineClient([], () => Promise.resolve({ id: "sm-1", error: null, unreachable: [] }))}
+          />,
+        ),
+    },
+    scene(
+      "state-machine-narrow",
+      "the SAME editor at 760px, which is what the dock is worth on a laptop with both side docks " +
+        "open. Two shared responsive rules fire here and both have to hold: below 980 the canvas and " +
+        "its controls stack, so the graph keeps a readable width instead of being squeezed into a " +
+        "third of the panel; below 860 the machine rail turns back into a horizontal strip, because " +
+        "a 190px column is a quarter of a 760px panel. What a reader is checking is that NOTHING was " +
+        "given up for it — both machines still reachable, both verbs still on screen, the footer " +
+        "still pinned. 520px is the dock's own ceiling (`clamp(320px, 48vh, 520px)`), so this is the " +
+        "most room this panel is ever given",
+      {
+        present: [
+          ["[data-testid='sm-list'] [role='tab']", 2],
+          ["[data-testid='sm-state']", 6],
+        ],
+        text_present: ["Airlock Door — Bay 3"],
+        text_absent: ["null", "undefined", "NaN"],
+        // The rail is a strip: its two tabs share a row rather than stacking down a column.
+        same_line: [["#state-machines-sm-door-tab", "#state-machines-sm-conveyor-tab"]],
+        unclipped: [".mtk-workspace-panel__footer", "[data-testid='sm-add-state']", "#state-machines-sm-conveyor-tab"],
+      },
+      quiet,
+      openDoor,
+      { width: 760, height: 520 },
+    ),
+    {
+      id: "state-machine-transition-card",
+      looking_for:
+        "ONE TRANSITION, READ AS A SENTENCE: from a state, to a state, when an event — and under it " +
+        "the guard that makes it conditional, drawn with the SAME clause row the Rules builder uses " +
+        "rather than a second copy that had drifted from it. The old version put five monospace " +
+        "dropdowns and a times character on one wrapping line with a bare `+ if` button beside them; " +
+        "the operator list on a true/false field offered `<` and `>`, which can only ever answer the " +
+        "same way. The graph is PUT AWAY here, which is the only way a whole card is on screen at a " +
+        "height the dock really reaches: measured, the graph at its 200px floor plus the two section " +
+        "headings leave 68px for a 143px card, and no arrangement of the three fixes that — so one " +
+        "of them has to be able to go, which is the constitution's `everything collapsible` where it " +
+        "actually bites",
+      expect: {
+        present: [
+          ["[data-testid='sm-transition']", 1],
+          ["[data-testid='sm-cond']", 1],
+          ["[data-testid='sm-add-cond']", 1],
+        ],
+        text_present: ["obstruction_detected", "Only if every one of these holds"],
+        text_absent: ["null", "undefined", "NaN"],
+        // The sentence stays on its line, and so does the guard clause beneath it.
+        same_line: [
+          ["[data-testid='sm-trans-from']", "[data-testid='sm-trans-to']"],
+          ["[data-testid='sm-cond-component']", "[data-testid='sm-cond-op']"],
+        ],
+        unclipped: ["[data-testid='sm-transition']", "[data-testid='sm-cond']", "[data-testid='sm-add-cond']"],
+      },
+      // The WIDE dock, at the tallest it ever is: `.mtk-bottom-dock` is `clamp(320px, 48vh, 520px)`,
+      // so 520 is the ceiling and a scene taller than that photographs a panel nobody has. The
+      // editor track gets 148px of it — which is what the graph's 240px ceiling exists to leave.
+      viewport: { width: 1240, height: 520 },
+      click: ["#state-machines-sm-alarm-tab", "[data-testid='sm-toggle-graph']"],
+      setup: seedDoorScene(),
+      render: () =>
+        logicDock(
+          <StateGraphPanel
+            client={stateMachineClient([{ id: "sm-alarm", current: ALARM.initial, machine: ALARM }], quiet)}
+          />,
+        ),
     },
   ];
 }
