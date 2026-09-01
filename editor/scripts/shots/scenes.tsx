@@ -2342,7 +2342,11 @@ function contextMenuScenes(): Scene[] {
         "selection rather than about one object; and no row's description wraps into its neighbour's " +
         "label, because the descriptions are what carry the scope here — this menu has no scope-note " +
         "column of its own",
-      viewport: { width: 520, height: 620 },
+      // 520 is the WIDTH that can fail — the dock this toolbar lives in is 320px and the row's
+      // description is what carries the scope here. The height is deliberately generous: CI's Linux
+      // Chromium wraps this copy differently, and a popup clipped by a tight window would fail
+      // `unclipped` for a font-metric reason rather than a layout one.
+      viewport: { width: 520, height: 760 },
       // The popup is a click away: a menu photographed closed is a picture of a button.
       click: ["[data-testid='authoring-more']"],
       expect: {
