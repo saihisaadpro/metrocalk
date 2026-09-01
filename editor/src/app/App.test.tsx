@@ -225,6 +225,12 @@ describe("editor app — end-to-end wiring", () => {
 
   it("opens the searchable command palette from Ctrl/Cmd+K", async () => {
     render(<App />);
+    // WAIT FOR THE APP TO BE LISTENING. `App` installs its window `keydown` handler in an effect, and
+    // a chord fired in the same tick as `render` is dispatched at a window nothing is bound to yet —
+    // so the palette never opens and the failure reads as "the chord is not wired". It flakes with
+    // machine load, which is what makes it worthless as a gate; this test failed on the untouched
+    // main checkout while the box was busy (`<test_and_ci_discipline>` 4 — a flake is a failure).
+    await waitFor(() => expect(screen.getByTestId("engine-scene")).toBeTruthy());
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
     expect(await screen.findByTestId("command-palette")).toBeTruthy();
     expect(await screen.findByRole("combobox", { name: /search commands/i })).toBeTruthy();
