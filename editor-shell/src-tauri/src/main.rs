@@ -6050,8 +6050,8 @@ fn card_shot_plans(
             out.push(None);
             continue;
         }
-        let (sample, _, parts) = &subjects[index];
-        out.push(Some(st.planned_placement(shot, *sample, aspect, parts)));
+        let (sample, key, parts) = &subjects[index];
+        out.push(Some(st.planned_placement(key, shot, *sample, aspect, parts)));
     }
     out
 }

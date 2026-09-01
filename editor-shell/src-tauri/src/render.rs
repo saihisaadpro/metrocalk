@@ -543,8 +543,14 @@ impl SceneState {
     /// animates), and everything else the answer depends on — the recipe, where the subject is and
     /// how big it is, the delivery frame — is in the entry's own key. So this returns exactly what an
     /// unmemoised call would, which is the property the test asserts rather than assumes.
+    /// `subject_key` is the entity the shot RESOLVES to, not `ShotRecipe::subject` — which can be the
+    /// literal `"$subject"` of a rule-bound cutscene, and is therefore the same string for two shots
+    /// filming two different objects. It also stands in for `subject` in the key: the excluded-part set
+    /// is derived from that entity, and a memo whose key omits an input to the answer is a memo that
+    /// returns the wrong one.
     pub fn planned_placement(
         &mut self,
+        subject_key: &str,
         shot: &metrocalk_animation::shot::ShotRecipe,
         sample: metrocalk_animation::shot::SubjectSample,
         aspect: f32,
@@ -565,8 +571,7 @@ impl SceneState {
         // Formatted rather than hashed so a memo miss is readable in a debugger, and ROUNDED so float
         // noise in a re-sampled subject that has not moved does not defeat it.
         let key = format!(
-            "{}|{:?}|{:?}|{:?}|{:.3}|{:.3},{:.3},{:.3}|{:.3},{:.3},{:.3}|{:.3},{:.3},{:.3}|{aspect:.4}",
-            shot.subject,
+            "{subject_key}|{:?}|{:?}|{:?}|{:.3}|{:.3},{:.3},{:.3}|{:.3},{:.3},{:.3}|{:.3},{:.3},{:.3}|{aspect:.4}",
             shot.size,
             shot.angle,
             shot.motion,
@@ -9662,12 +9667,12 @@ mod tests {
             },
         );
         let memoised =
-            st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+            st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
         assert_eq!(cold, memoised, "the memo changed the answer");
         assert_eq!(st.cinema_card_plans.len(), 1);
         // And the second ask is the same answer from the map rather than a second search.
         let warm =
-            st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+            st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
         assert_eq!(warm, memoised);
         assert_eq!(st.cinema_card_plans.len(), 1, "a second entry is a memo miss");
     }
@@ -9676,19 +9681,19 @@ mod tests {
     fn membership_changing_drops_the_placement_memo_and_a_pose_does_not() {
         let mut st = crowded_scene(6);
         st.sync_occlusion();
-        let _ = st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        let _ = st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
         assert_eq!(st.cinema_card_plans_revision, Some(1));
 
         // A published pose moves `revision`, and the occluders it was measured against are NOT
         // refitted for it — so neither is this.
         st.revision = st.revision.wrapping_add(1);
-        let _ = st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        let _ = st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
         assert_eq!(st.cinema_card_plans.len(), 1, "a pose must not drop the memo");
 
         // Membership changing rebuilds the BVH, so every answer measured against the old one goes.
         st.ids_revision = 2;
         st.sync_occlusion();
-        let _ = st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        let _ = st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
         assert_eq!(st.cinema_card_plans_revision, Some(2));
         assert_eq!(st.cinema_card_plans.len(), 1, "the stale entries survived");
     }
@@ -9705,7 +9710,7 @@ mod tests {
                 center: [step as f32 * 0.01, 0.0, 0.0],
                 ..card_subject()
             };
-            let _ = st.planned_placement(&card_shot(), sample, 16.0 / 9.0, &subject_only());
+            let _ = st.planned_placement("1_1", &card_shot(), sample, 16.0 / 9.0, &subject_only());
         }
         assert!(
             st.cinema_card_plans.len() <= MAX_MEMOISED_PLACEMENTS,
@@ -9722,19 +9727,42 @@ mod tests {
     fn the_memo_is_what_makes_the_diagnostic_affordable() {
         // THE NUMBER THE MEMO EXISTS FOR, measured rather than asserted in prose. Not a budget gate —
         // a debug build on a shared box has no defensible threshold — but the RATIO is structural:
-        // the second ask is a hash lookup and the first is up to 270 BVH walks, so a memo that had
-        // silently stopped hitting would show up here as a ratio near 1.
+        // the second ask is a hash lookup and the first is 270 BVH walks, so a memo that had silently
+        // stopped hitting would show up here as a ratio near 1.
+        //
+        // MEASURED ON THE PATH THAT COSTS SOMETHING, and this is the whole reason the fixture encloses
+        // the subject. The first version of this test measured `crowded_scene(64)` unmodified: the
+        // authored placement is clear and backed there, so `plan_shot` takes its cheap exit after ONE
+        // candidate and the "cold" number (71.8 µs) was five vantage calls, not fifty-four candidates'
+        // worth. That is a measurement of the case the memo does not exist for. The assertion below
+        // pins it: if the fixture ever stops forcing the full ladder, the test fails rather than
+        // quietly reporting the cheap path again.
         let mut st = crowded_scene(64);
+        // A shell around the subject, big enough that every rung — including the widest — is inside it.
+        st.instances[1].center = [0.0; 3];
+        st.instances[1].scale = 200.0;
+        st.ids_revision += 1;
         st.sync_occlusion();
         let cold = std::time::Instant::now();
-        let _ = st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        let plan =
+            st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
         let cold = cold.elapsed();
+        assert!(
+            !plan.settled.acceptable() && plan.steps > 0,
+            "the fixture stopped forcing the ladder, so this measures nothing: {plan:?}"
+        );
         let warm = std::time::Instant::now();
         for _ in 0..100 {
-            let _ = st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+            let _ = st.planned_placement(
+                "1_1",
+                &card_shot(),
+                card_subject(),
+                16.0 / 9.0,
+                &subject_only(),
+            );
         }
         let warm = warm.elapsed() / 100;
-        eprintln!("ADR-197 placement search: cold {cold:?}, memoised {warm:?}");
+        eprintln!("ADR-197 placement search (full ladder): cold {cold:?}, memoised {warm:?}");
         assert!(
             warm * 8 < cold,
             "the memo is not paying for itself: cold {cold:?}, warm {warm:?}"

@@ -189,8 +189,8 @@ describe("ADR-197 · nowhere good to film from", () => {
     // so it is never part of the subject and never excluded from the obstruction test; that is the
     // difference between "the camera is close to what it is filming" and "the camera is in a wall".
     //
-    // A shape rests on the ground in its own local frame, so a 24 m block's origin sits 12 m below
-    // the subject for the subject to be at its centre.
+    // A shape rests on the ground in its own local frame, so the block's origin sits half its height
+    // below the subject for the subject to be at its centre.
     shell = (await invoke("shape_spawn", { kind: "box", pos: [0, 0, 0] })).created;
     await invoke("shape_update", { id: shell, params: { width: SHELL_M, height: SHELL_M, depth: SHELL_M } });
     await moveTo(shell, HOME[0], HOME[1] - SHELL_M / 2, HOME[2]);
@@ -227,8 +227,10 @@ describe("ADR-197 · nowhere good to film from", () => {
     note(`[filmed] eye ${xyz(pose.eye)} -> ${xyz(pose.look_at)}`);
     expect(finite(pose.eye)).toBe(true);
     expect(finite(pose.look_at)).toBe(true);
-    // Aimed at the thing it is about, however bad the view of it is.
-    expect(dist(pose.look_at, HOME)).toBeLessThan(3);
+    // Aimed at the thing it is about, however bad the view of it is. A loose bound on purpose: this
+    // is a sanity check that the camera is still pointed at the subject, not a claim about framing,
+    // and a spawned shape rests on the ground so its centre is not exactly `HOME`.
+    expect(dist(pose.look_at, HOME)).toBeLessThan(5);
     // The shot is still in the document, at its authored length, with nothing removed or disabled.
     const cut = await invoke("cinema_list", { id: subject });
     expect(cut.shots).toBe(1);
