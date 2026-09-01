@@ -15,6 +15,7 @@ import type {
   AddResponse,
   PickCandidate,
   FocusOutcome,
+  DuplicateOutcome,
   AuthoredMatch,
   CatalogItem,
   CookedMatch,
@@ -228,6 +229,13 @@ export interface EditorClient {
   removeEntity(id: string): void;
   /** Duplicate an entity (M3.3) — one undoable transaction; resolves to the clone's id. */
   duplicateEntity(id: string): Promise<string | null>;
+  /** **Duplicate a whole selection** — one undoable transaction over every selected object, with
+   *  everything inside each of them (ADR-196).
+   *
+   *  Takes ids for the same reason `deleteDeactivateMany` does: the caller knows which set the gesture
+   *  was made over, and a menu opened on fourteen rows must not act on a fifteenth the engine picked
+   *  up in between. The outcome carries what to select and what to say. */
+  duplicateSelection(ids: string[]): Promise<DuplicateOutcome>;
   /** Frame the camera on an entity (M3.3) — no mutation. */
   focusEntity(id: string): void;
   /** Frame the camera on the WHOLE selection (ADR-194) — no mutation, no argument.
@@ -890,6 +898,12 @@ export class TauriClient implements EditorClient {
   }
   duplicateEntity(id: string): Promise<string | null> {
     return this.core.invoke<string | null>("duplicate_entity", { id }).catch((e: unknown) => { console.error("duplicate_entity failed", e); throw e; });
+  }
+  duplicateSelection(ids: string[]): Promise<DuplicateOutcome> {
+    return this.core.invoke<DuplicateOutcome>("duplicate_selection", { ids }).catch((e: unknown) => {
+      console.error("duplicate_selection failed", e);
+      return { created: [], entities: 0, nested: 0, missing: ids.length };
+    });
   }
   focusEntity(id: string): void {
     void this.core.invoke("focus_entity", { id }).catch((e: unknown) => console.error("focus_entity failed", e));
@@ -2561,6 +2575,9 @@ class MockClient implements EditorClient {
   removeEntity(_id: string): void {}
   duplicateEntity(_id: string): Promise<string | null> {
     return Promise.resolve(null);
+  }
+  duplicateSelection(ids: string[]): Promise<DuplicateOutcome> {
+    return Promise.resolve({ created: [], entities: 0, nested: 0, missing: ids.length });
   }
   focusEntity(_id: string): void {}
   focusSelection(): Promise<FocusOutcome> {

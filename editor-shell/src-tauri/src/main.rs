@@ -2352,6 +2352,12 @@ enum EngineCmd {
         id: String,
         reply: Sender<Option<String>>,
     },
+    /// **Duplicate a whole selection** (ADR-196) — one undoable transaction over every selected
+    /// object and everything inside it; replies what was made.
+    DuplicateSelection {
+        ids: Vec<String>,
+        reply: Sender<DuplicateOutcome>,
+    },
     /// Entity details for the hover tooltip (M3.3) — a read.
     Details {
         id: String,
@@ -9102,6 +9108,45 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     );
                 }
                 let _ = reply.send(new.map(|n| n.to_loro_key()));
+            }
+            EngineCmd::DuplicateSelection { ids, reply } => {
+                let targets: Vec<EntityId> = ids
+                    .iter()
+                    .filter_map(|s| EntityId::from_loro_key(s))
+                    .collect();
+                // An id the document cannot even parse is as missing as one it has lost, and the
+                // caller is about to print a number that has to account for both.
+                let unparsed = ids.len() - targets.len();
+                let made = capscene::duplicate_selection(&mut engine, &scene, &targets)
+                    .unwrap_or_default();
+                if !made.roots.is_empty() {
+                    // ONE record, because one transaction — the granularity `DeleteDeactivateMany`
+                    // documents: N single records replay as N commits, and a live Ctrl-Z that took
+                    // all of them back takes exactly one back on replay.
+                    log.append(&Record::DuplicateMany {
+                        sources: ids.clone(),
+                    });
+                    // A delta per created entity rather than a full projection: a duplicate ADDS
+                    // rows and changes none of the ones already on screen (invariant 2).
+                    for &id in &made.created {
+                        if let Some(e) = engine.ecs_entity(id) {
+                            touch += 1;
+                            recency.insert(e, touch);
+                        }
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, project_entity(&engine, id));
+                        }
+                    }
+                    // ONE rebuild for the whole transaction — `echo_created` rebuilds per entity,
+                    // which over a 378-object duplicate is 378 rebuilds of the same scene.
+                    rebuild(&engine, &shared, &mut positions, &assets);
+                }
+                let _ = reply.send(DuplicateOutcome {
+                    created: made.roots.iter().map(EntityId::to_loro_key).collect(),
+                    entities: made.created.len(),
+                    nested: made.nested,
+                    missing: made.missing + unparsed,
+                });
             }
             // ── M10.6 scene-authoring verbs (ADR-036) — each one undoable commit → re-project the scene.
             // (Verbs persist via the M10.3 `.mtk` save/open — the Loro doc; the in-session replay-log
@@ -20699,6 +20744,55 @@ fn duplicate_entity(state: State<AppState>, id: String) -> Option<String> {
     recv_reply(&rx).unwrap_or_default()
 }
 
+/// What duplicating the selection actually made — enough for the caller to report it and to select
+/// the copies without asking again.
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateOutcome {
+    /// The copy of each selected object, in the order the selection gave them. Empty ⇒ nothing was
+    /// duplicated, and the caller must say so rather than claim a copy.
+    created: Vec<String>,
+    /// Everything the transaction created, copies and their contents both. Larger than `created`
+    /// exactly when something had children — one assembly of forty parts is 1 and 41.
+    entities: usize,
+    /// Selected objects skipped because an ancestor of theirs was selected too: cloning both would
+    /// have produced them twice, once inside the parent's copy and once beside it.
+    nested: usize,
+    /// Selected ids the document no longer has.
+    missing: usize,
+}
+
+/// **Duplicate the whole selection** (ADR-196) — every selected object, with everything inside it,
+/// as ONE undoable transaction.
+///
+/// The fourth verb in ADR-183's set to stop acting on one of what it names, and the last: the
+/// right-click row, the authoring toolbar row and the action model all offered `Duplicate` over a
+/// selection of fourteen and cloned the primary — the toolbar row's own description said so, and the
+/// action model reported `appliesTo: 1` beside a trigger reading `Actions · 14`.
+///
+/// Takes ids rather than reading the engine's selection (as `focus_selection` does) for the reason
+/// `delete_deactivate_many` does: this is a MUTATION made from a menu that was opened over a
+/// particular set of rows, and it must not act on a fifteenth object that arrived in between.
+#[tauri::command(async)]
+fn duplicate_selection(state: State<AppState>, ids: Vec<String>) -> DuplicateOutcome {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::DuplicateSelection {
+            ids: ids.clone(),
+            reply,
+        })
+        .is_err()
+    {
+        return DuplicateOutcome {
+            missing: ids.len(),
+            ..DuplicateOutcome::default()
+        };
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
 /// Spawn a physics body (M8.2) — one undoable ECS setup commit, mirrored into the deterministic sim and
 /// rendered as the ball; returns the new entity's id. Starts the sim running so it falls under gravity.
 #[tauri::command(async)]
@@ -25703,6 +25797,7 @@ fn main() {
             entity_actions_selection,
             remove_entity,
             duplicate_entity,
+            duplicate_selection,
             entity_details,
             cad_report,
             cad_report_page,

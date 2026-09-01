@@ -19,6 +19,7 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { projectionStore } from "../store/projection";
+import { duplicateSelection } from "../app/duplicateSelection";
 import { entityLabel, selectionSentence, focusSentence, focusSubject } from "../store/selectionText";
 import { setStatus } from "../store/ui";
 import { pushToast, type ToastKind } from "../store/toasts";
@@ -240,13 +241,11 @@ export function ContextMenu({
         void deleteSelection(client, all).then((outcome) => feedback(outcome.sentence, outcome.ok ? "info" : "error"));
         break;
       case "duplicate":
-        void client
-          .duplicateEntity(primary)
-          .then((newId) => feedback(newId ? `duplicated ${entityLabel(primary)}` : `couldn't duplicate ${entityLabel(primary)}`, newId ? "success" : "error"))
-          .catch((error) => {
-            console.error("duplicate failed", error);
-            feedback(`couldn't duplicate ${entityLabel(primary)}`, "error");
-          });
+        // THE WHOLE SELECTION, exactly as `remove` above (ADR-183) and `focus` below (ADR-194) —
+        // through the same `duplicateSelection` the toolbar row and Ctrl-D call, so the four routes
+        // cannot mean four different things. This row sat in a menu built from a set, said
+        // "Duplicate", and cloned the primary.
+        void duplicateSelection(client, all).then((outcome) => feedback(outcome.sentence, outcome.ok ? "success" : "error"));
         break;
       case "focus":
         // THE WHOLE SELECTION, exactly as `remove` above (ADR-183) and for the same reason (ADR-194).

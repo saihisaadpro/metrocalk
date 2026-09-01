@@ -6,6 +6,7 @@ import { useRef, useState } from "react";
 import { projectionStore, useMultiSelect, useSelectedId } from "../store/projection";
 import { setStatus, setClipboard, useClipboardHasContent } from "../store/ui";
 import { deleteSelection } from "../app/deleteSelection";
+import { duplicateSelection } from "../app/duplicateSelection";
 import { entityLabel } from "../store/selectionText";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
@@ -178,25 +179,20 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
                   "authDuplicate",
                   "Duplicate",
                   async () => {
-                    if (!primary) return;
-                    const duplicate = await client.duplicateEntity(primary);
-                    if (!duplicate) {
-                      setStatus("couldn't duplicate the selection");
-                      pushToast("couldn't duplicate the selection", "error");
-                      return;
-                    }
-                    select(duplicate);
-                    setStatus("duplicated · Ctrl-Z to undo");
-                    pushToast("duplicated", "success");
+                    if (!ids.length) return;
+                    // THE WHOLE SELECTION, IN ONE TRANSACTION — through `duplicateSelection`, which
+                    // is also what the right-click row and Ctrl-D call (ADR-196). This row used to
+                    // clone the primary and say so in its own description; the description is now a
+                    // count because the verb finally matches the number on the trigger above it.
+                    const outcome = await duplicateSelection(client, ids);
+                    setStatus(outcome.sentence);
+                    pushToast(outcome.sentence, outcome.ok ? "success" : "error");
                   },
                   close,
-                  !!primary,
-                  // SAY WHICH ONE. A verb that acts on the primary while the trigger beside it counts
-                  // fourteen is the same lie Delete used to tell, and a description that names the
-                  // object is the cheapest honest version of it until this is batched too.
+                  !!ids.length,
                   hasMultiple
-                    ? `Clone ${entityLabel(primary ?? "")} — the other ${ids.length - 1} are left alone`
-                    : "Clone the selected object",
+                    ? `Clone all ${ids.length} selected objects, with everything inside them`
+                    : "Clone the selected object, with everything inside it",
                   "Select an object to duplicate",
                   "ghost",
                   "Duplicating…",

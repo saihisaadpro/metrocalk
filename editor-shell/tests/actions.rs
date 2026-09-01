@@ -424,15 +424,22 @@ fn a_selection_scopes_every_verb_and_the_primary_is_the_last_id() {
     assert_eq!((answer.count, answer.missing), (3, 0));
 
     // The verbs that take the whole set say so with the count, not with a bare `true`.
-    for a in [Action::Remove, Action::Focus, Action::Inspect] {
+    // `Duplicate` joined them in ADR-196 — it was the last one reporting `1` over a set it was
+    // offered from, and the number is what a row's scope note is drawn from, so it was also the
+    // thing telling the user the truth about a verb that then did something else.
+    for a in [
+        Action::Remove,
+        Action::Focus,
+        Action::Inspect,
+        Action::Duplicate,
+    ] {
         assert_eq!(
             scope(&answer.items, a),
             3,
             "{a:?} acts on the whole selection"
         );
     }
-    // The two that honestly cannot: one clone beside one source, one reveal about one requirer.
-    assert_eq!(scope(&answer.items, Action::Duplicate), 1);
+    // The one that honestly cannot: a reveal asks its question about ONE requirer.
     assert_eq!(scope(&answer.items, Action::Bind), 1);
     // `applies_to` IS the availability — there is no third state.
     assert!(answer
@@ -592,5 +599,202 @@ fn the_single_entity_form_is_the_selection_form_asked_about_one() {
                 "the two forms disagree about {id:?}"
             );
         }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// DUPLICATE, ASKED ABOUT WHAT WAS ACTUALLY SELECTED. Three properties, each written before the fix
+// that makes it pass, because each one is a thing the shipped verb quietly did NOT do.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// A duplicated group carries its contents.
+///
+/// `duplicate_entity` cloned one entity's components and pairs and stopped there, so duplicating any
+/// node with children — a `capscene::group`, an imported CAD assembly's folder (ADR-163), a role's
+/// rig — produced an EMPTY node under the same parent, with the same name, and nothing in the
+/// viewport. Nothing failed: the transaction committed, a fresh id came back, the outliner grew a
+/// row. The clone was just hollow.
+#[test]
+fn duplicating_a_group_clones_what_is_inside_it() {
+    let (mut engine, scene, _) = seeded();
+    let a = capscene::create_entity(&mut engine, [0.0, 0.0, 0.0], "Bolt").unwrap();
+    let b = capscene::create_entity(&mut engine, [1.0, 0.0, 0.0], "Nut").unwrap();
+    let group = capscene::group(&mut engine, &[a, b], "Fixing").unwrap();
+    assert_eq!(engine.children_of(group).len(), 2, "the group holds two");
+
+    let clone = capscene::duplicate_entity(&mut engine, &scene, group).expect("duplicate commits");
+    assert_eq!(
+        engine.children_of(clone).len(),
+        2,
+        "a duplicated group is not an empty node"
+    );
+    // And the copies are COPIES — the originals are still under the original group.
+    assert_eq!(engine.children_of(group).len(), 2, "the source is untouched");
+}
+
+/// A clone can be told apart from its source.
+///
+/// Every field was cloned including `__meta__.name`, so duplicating `Weld Gun` twice left three rows
+/// reading `Weld Gun` in the outliner, three identical hits in `Find objects…` (ADR-185) and three
+/// identical toasts. `<ux_quality>` 4 is information scent; three rows that cannot be told apart have
+/// none.
+#[test]
+fn a_clone_is_named_so_the_outliner_can_tell_it_from_its_source() {
+    let (mut engine, scene, _) = seeded();
+    let src = capscene::create_entity(&mut engine, [0.0, 0.0, 0.0], "Weld Gun").unwrap();
+
+    let first = capscene::duplicate_entity(&mut engine, &scene, src).unwrap();
+    let second = capscene::duplicate_entity(&mut engine, &scene, src).unwrap();
+
+    let name_of = |e: &Engine<FlecsWorld>, id| capscene::entity_name(e, id).unwrap_or_default();
+    let (a, b, c) = (
+        name_of(&engine, src),
+        name_of(&engine, first),
+        name_of(&engine, second),
+    );
+    assert_eq!(a, "Weld Gun", "the source keeps its name");
+    assert_ne!(b, a, "the first clone is distinguishable");
+    assert_ne!(c, a, "the second clone is distinguishable");
+    assert_ne!(b, c, "and the two clones are distinguishable from each other");
+}
+
+/// Duplicate over a SELECTION duplicates the selection.
+///
+/// The last ADR-183 verb still acting on one of what it names: the right-click menu, the authoring
+/// toolbar row and the action model all reported `applies_to: 1` over a selection of any size, and
+/// the toolbar's own description said so — *"the other 13 are left alone"*. One transaction, one
+/// undo, N clones.
+#[test]
+fn duplicating_a_selection_clones_every_member_in_one_transaction() {
+    let (mut engine, scene, _) = seeded();
+    let ids: Vec<EntityId> = (0..3)
+        .map(|i| {
+            capscene::create_entity(&mut engine, [i as f32, 0.0, 0.0], &format!("Part {i}")).unwrap()
+        })
+        .collect();
+    let before = engine.entity_count();
+
+    let made = capscene::duplicate_selection(&mut engine, &scene, &ids).expect("commits");
+    assert_eq!(made.roots.len(), 3, "one clone per selected object");
+    assert_eq!(engine.entity_count(), before + 3);
+
+    // ONE transaction: a single undo takes all three back (inv. 3).
+    assert!(engine.undo());
+    assert_eq!(engine.entity_count(), before, "one undo, all three gone");
+}
+
+/// A parent AND its child selected duplicates the parent once, not the child twice.
+///
+/// The everyday way to arrive here is Select all over an imported assembly, or a marquee across a
+/// group: every part is selected along with the folder that holds it. Cloning each selected id in
+/// turn would copy every part twice — once inside the parent's copy, once beside it — and the second
+/// copy would sit at the root of the scene looking like a stray.
+#[test]
+fn a_selection_holding_a_parent_and_its_child_duplicates_the_parent_once() {
+    let (mut engine, scene, _) = seeded();
+    let a = capscene::create_entity(&mut engine, [0.0, 0.0, 0.0], "Bolt").unwrap();
+    let b = capscene::create_entity(&mut engine, [1.0, 0.0, 0.0], "Nut").unwrap();
+    let group = capscene::group(&mut engine, &[a, b], "Fixing").unwrap();
+    let before = engine.entity_count();
+
+    // The whole subtree selected, folder included — three ids, one thing.
+    let made = capscene::duplicate_selection(&mut engine, &scene, &[group, a, b]).unwrap();
+
+    assert_eq!(made.roots.len(), 1, "one copy, of the top-most node");
+    assert_eq!(made.nested, 2, "and the two inside it are counted, not silently dropped");
+    assert_eq!(
+        engine.entity_count(),
+        before + 3,
+        "three entities: the group's copy and its two children"
+    );
+    assert_eq!(engine.children_of(made.roots[0]).len(), 2);
+    // ONE transaction still, over a subtree.
+    assert!(engine.undo());
+    assert_eq!(engine.entity_count(), before);
+}
+
+/// The copies keep their arrangement, and land BESIDE what was copied rather than inside it.
+///
+/// Two properties in one, because they are the same number. A fixed 1.5 m offset per object would
+/// have put a copied row of parts spanning 8 m straight through the original — and applying it per
+/// object rather than per set would have collapsed the arrangement the user built.
+#[test]
+fn copies_keep_their_arrangement_and_clear_what_they_were_copied_from() {
+    let (mut engine, scene, _) = seeded();
+    let xs = [0.0f32, 3.0, 8.0];
+    let ids: Vec<EntityId> = xs
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| capscene::create_entity(&mut engine, [x, 0.0, 0.0], &format!("Part {i}")).unwrap())
+        .collect();
+
+    let made = capscene::duplicate_selection(&mut engine, &scene, &ids).unwrap();
+
+    let x_of = |e: &Engine<FlecsWorld>, id: EntityId| -> f64 {
+        match e.components_of(id).get("Transform").and_then(|t| t.get("x")) {
+            Some(FieldValue::Number(n)) => *n,
+            Some(FieldValue::Integer(i)) => *i as f64,
+            _ => panic!("a duplicated entity has no Transform.x"),
+        }
+    };
+    let copies: Vec<f64> = made.roots.iter().map(|&id| x_of(&engine, id)).collect();
+    let gap = |a: f64, b: f64, expected: f64| {
+        assert!(
+            (a - b - expected).abs() < 1e-5,
+            "the copies are {} apart where the sources are {expected}",
+            a - b
+        );
+    };
+    // ARRANGEMENT: the gaps between the copies are the gaps between the sources.
+    gap(copies[1], copies[0], f64::from(xs[1] - xs[0]));
+    gap(copies[2], copies[1], f64::from(xs[2] - xs[1]));
+    // CLEAR: the nearest copy starts beyond the far end of what was copied. A per-object 1.5 m would
+    // have put the first copy at 1.5 — inside a set that runs to 8.
+    assert!(
+        copies[0] > f64::from(xs[2]),
+        "the copies start at {} but the sources run to {}",
+        copies[0],
+        xs[2]
+    );
+}
+
+/// A duplicated selection survives export → replay as ONE transaction (ADR-013).
+///
+/// The reason there is a `Record::DuplicateMany` at all rather than N `Record::Duplicate`s: N records
+/// replay as N commits, so the `Record::Undo` that took the whole set back live takes exactly one of
+/// them back on reopen — the divergence the live `.exe` run found for `DeleteDeactivateMany`, which
+/// would have been reintroduced here by the cheaper spelling.
+#[test]
+fn a_duplicated_selection_replays_as_one_transaction() {
+    let log = Log::open(tmp("duplicate-many"), capscene::fingerprint(N));
+    log.clear();
+
+    let (mut a, scene_a, index_a) = seeded();
+    let sources = [index_a.health_bars[0], index_a.health_bars[1]];
+    let made = capscene::duplicate_selection(&mut a, &scene_a, &sources).unwrap();
+    log.append(&Record::DuplicateMany {
+        sources: sources.iter().map(EntityId::to_loro_key).collect(),
+    });
+    // …and the live Ctrl-Z that follows takes BOTH copies back.
+    assert!(a.undo());
+    log.append(&Record::Undo);
+    let clones = made.roots.clone();
+    drop(a);
+
+    let mut world = FlecsWorld::new();
+    let scene = CapScene::intern(&mut world);
+    let mut b = Engine::new(world, 1);
+    capscene::seed(&mut b, &scene, N).expect("re-seed");
+    b.clear_history();
+    let (applied, skipped) = b_replay(&log, &mut b, &scene);
+    b.clear_history();
+
+    assert_eq!((applied, skipped), (2, 0), "the duplicate and the undo both replayed");
+    for clone in clones {
+        assert!(
+            !b.entity_exists(clone),
+            "a copy the user undid came back after a reopen — the undo reverted one record, the \
+             duplicate made two objects"
+        );
     }
 }

@@ -34,7 +34,11 @@ pub enum Action {
     /// reopen, while this menu's `Remove` destroyed exactly one. A person cannot be expected to know
     /// which one they just used.
     Remove,
-    /// Clone the entity + its components/caps under a fresh id — one undoable transaction.
+    /// **Clone the selection** — every selected object, with everything under it, under fresh ids and
+    /// distinct names; one undoable transaction (`capscene::duplicate_selection`, ADR-196).
+    ///
+    /// It cloned exactly one object, and one LEVEL of that object, until then: a duplicated group
+    /// came back empty, and a duplicated selection of fourteen came back as one.
     Duplicate,
     /// Frame the camera on the entity — no mutation, not undoable.
     Focus,
@@ -152,10 +156,10 @@ pub fn actions_for(engine: &Engine<FlecsWorld>, scene: &CapScene, id: EntityId) 
 /// - `Remove` · `Focus` · `Inspect` apply to every live member.
 /// - `Make dynamic` applies to the members that are dead meshes — a *partial* count, which is the
 ///   honest answer for a mixed selection and is why `applies_to` is a number and not a flag.
-/// - `Bind…` and `Duplicate` are **primary-only**: the reveal asks its question about one requirer,
-///   and a clone lands beside one source. They report `applies_to == 1` over any selection, so the
-///   caller can name the object rather than telling a person "duplicate" about 378 things and
-///   handing back one.
+/// - `Duplicate` applies to every live member too (ADR-196) — each copied with everything inside it,
+///   the copies landing beside the set rather than inside it.
+/// - `Bind…` is **primary-only**: the reveal asks its question about one requirer. It reports
+///   `applies_to == 1` over any selection, so the caller can name the one object it is about.
 ///
 /// **One pass, not N.** The bindings are swept once for the whole selection rather than once per
 /// entity — the same reason `capscene::delete_deactivate_many` sweeps them once. Per-entity this is
@@ -272,9 +276,11 @@ pub fn actions_for_selection(
         items: vec![
             ActionItem::make(Action::Bind, bind_scope, bind_reason),
             ActionItem::make(Action::Remove, count, None),
-            // Primary-only, said through the number rather than through prose the caller would have to
-            // parse: one clone, beside one source, however many are selected.
-            ActionItem::make(Action::Duplicate, 1, None),
+            // The whole set, since ADR-196: `capscene::duplicate_selection` clones every selected
+            // object with everything inside it, in one transaction. This row reported `1` over any
+            // selection for as long as the selection has been a set — and the toolbar row beside it
+            // spelled the consequence out in its own description.
+            ActionItem::make(Action::Duplicate, count, None),
             ActionItem::make(Action::Focus, count, None),
             ActionItem::make(Action::Inspect, count, None),
             ActionItem::make(Action::MakeDynamic, dynamic_ready, md_reason),

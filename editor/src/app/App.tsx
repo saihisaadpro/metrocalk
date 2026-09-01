@@ -46,6 +46,7 @@ import { armsGizmoDrag, beganDrag, lateProbeNeedsDragEnd, type GizmoProbe } from
 import { StageMarquee } from "./StageMarquee";
 import { selectionSentence, entityLabel, focusSentence, focusSubject } from "../store/selectionText";
 import { deleteSelection } from "./deleteSelection";
+import { duplicateSelection } from "./duplicateSelection";
 import { selectAllWith, selectionCommands } from "./selectionCommands";
 import { environmentOutcome } from "./environmentOutcome";
 import { stateSelection } from "./stateSelection";
@@ -509,6 +510,26 @@ export function App() {
         selectAll();
         return;
       }
+      // Ctrl/Cmd-D — duplicate the selection. The universal duplicate chord, unbound: the only two
+      // routes to a copy were a row inside a popup menu in the left dock and a right-click row, and
+      // both of them cloned one object out of however many were selected (ADR-196). Guarded on
+      // `editingText` like its neighbours, and on Play for the reason the Delete key is — a
+      // disposable runtime session is not the document.
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "d") {
+        if (editingText) return;
+        e.preventDefault();
+        if (playing || pipeActive) return;
+        const ids = projectionStore.getState().multiSelect;
+        if (!ids.length) {
+          setStatus("Select an object to duplicate");
+          return;
+        }
+        void duplicateSelection(client, ids).then((outcome) => {
+          setStatus(outcome.sentence);
+          pushToast(outcome.sentence, outcome.ok ? "success" : "error");
+        });
+        return;
+      }
       // **DELETE / BACKSPACE — the most-pressed key in any editor, and it was not bound at all**
       // (ADR-183). The only two routes to deleting anything were a row inside a popup menu in the left
       // dock and a right-click row that destroyed one object; a person who selected 378 bolts and
@@ -739,6 +760,24 @@ export function App() {
     { id: "view-front", label: "Front view", category: "View", execute: () => client.viewPreset("front") },
     { id: "view-side", label: "Side view", category: "View", execute: () => client.viewPreset("side") },
     { id: "view-perspective", label: "Perspective view", category: "View", execute: () => client.viewPreset("persp") },
+    {
+      // The verb every editor binds to Ctrl-D, and here it was reachable only from inside a popup
+      // menu in the left dock or a right-click row (ADR-196). A palette row is where a person LEARNS
+      // the chord, so it carries the chord.
+      id: "edit-duplicate",
+      label: "Duplicate",
+      category: "Edit",
+      shortcut: ["Ctrl", "D"],
+      description: "Copy every selected object, with everything inside it, beside the original",
+      keywords: ["clone", "copy", "repeat"],
+      disabled: multiSelect.length === 0,
+      disabledReason: "Select an object first",
+      execute: async () => {
+        const outcome = await duplicateSelection(client, projectionStore.getState().multiSelect);
+        setStatus(outcome.sentence);
+        pushToast(outcome.sentence, outcome.ok ? "success" : "error");
+      },
+    },
     { id: "edit-undo", label: "Undo", category: "Edit", shortcut: ["Ctrl", "Z"], execute: async () => setStatus((await client.undo()) ? "Undo complete" : "Nothing to undo") },
     { id: "edit-redo", label: "Redo", category: "Edit", shortcut: ["Ctrl", "Shift", "Z"], execute: async () => setStatus((await client.redo()) ? "Redo complete" : "Nothing to redo") },
     {

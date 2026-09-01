@@ -211,6 +211,24 @@ export interface FocusOutcome {
   primary: string | null;
 }
 
+/** `duplicate_selection(ids)` — what duplicating the selection actually made.
+ *
+ *  `created` is the copy of each object the user selected, in the order they gave them — the set to
+ *  select for them, so the next gesture lands on the copies rather than the originals. `entities`
+ *  counts everything the transaction created, which is a different number whenever anything has
+ *  children: duplicating one assembly of forty parts is one `created` and forty-one `entities`.
+ *
+ *  `nested` is how many selected objects were skipped because an ancestor of theirs was selected too
+ *  (cloning both would produce that object twice), and `missing` how many no longer exist. Both are
+ *  counted rather than silently dropped so the caller can say so instead of printing a number that
+ *  does not match the selection the user is looking at. */
+export interface DuplicateOutcome {
+  created: string[];
+  entities: number;
+  nested: number;
+  missing: number;
+}
+
 /** `entity_details(id)` — the hover tooltip read (M3.3): name + component names + provided/required caps
  *  + the entities it's bound to. */
 export interface EntityDetails {

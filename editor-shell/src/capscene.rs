@@ -24,7 +24,7 @@
 // truncation (the viewport + reveal both work in f32) and the i64→f32 read are intentional here.
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use metrocalk_core::caps::{canonical, display_name, is_standard};
 use metrocalk_core::marketplace::MarketplaceEntry;
@@ -1590,10 +1590,6 @@ pub fn place_generation_placeholder(
     Ok(id)
 }
 
-/// The deterministic offset a [`duplicate_entity`] clone is placed at, beside its source (so it's
-/// visible, not hidden inside the original). Fixed → replay reproduces the clone's position exactly.
-const DUPLICATE_OFFSET_X: f32 = 1.5;
-
 /// **Remove** an entity as ONE undoable transaction (invariant 3): delete it *and* clean up every
 /// binding it participates in — so a dependent that was tracking a removed provider is **freed** (its
 /// requirement re-opens, the reveal re-offers), and no dangling edge survives. For a binding `from
@@ -1632,72 +1628,347 @@ pub fn remove_entity(
     engine.commit("remove-entity", ops)
 }
 
-/// **Duplicate** an entity as ONE undoable transaction (invariant 3): clone its components (fields) +
-/// its `Provides`/`Requires` capability pairs under a **fresh deterministic id** ([`Engine::alloc_entity_id`]),
-/// placed beside the source. The clone is **independently bindable**: its `BindsTo`/binding edges are
-/// **not** cloned (a fresh copy is unbound), so it re-enters the reveal as its own requirer/provider.
-/// Deterministic id + offset → a replayed duplicate lands byte-identical (ADR-013). Undo removes it.
+/// **What a duplicate made.**
 ///
-/// # Errors
-/// [`PipelineError`] if the source isn't a live entity, or the create transaction fails.
-pub fn duplicate_entity(
-    engine: &mut Engine<FlecsWorld>,
-    scene: &CapScene,
-    src: EntityId,
-) -> Result<EntityId, PipelineError> {
-    let src_ecs = engine
-        .ecs_entity(src)
-        .ok_or(PipelineError::UnknownEntity(src))?;
-    let new_id = engine.alloc_entity_id();
-    let parent = engine.parent_of(src);
-    let mut ops = vec![Op::CreateEntity { id: new_id, parent }];
+/// Two lists rather than one count, because a caller has two different sentences to write. `roots` is
+/// what the person selected and got back — the thing to select for them so the next gesture lands on
+/// the copy. `created` is what it cost the document: an assembly of forty parts is ONE root and
+/// forty-one entities, and a toast that says "40" about a gesture on one row is a lie in the other
+/// direction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Duplicated {
+    /// The clone of each duplicated root, in the order the roots were given.
+    pub roots: Vec<EntityId>,
+    /// Every entity created — the roots' clones and every descendant under them.
+    pub created: Vec<EntityId>,
+    /// How many requested ids were skipped because an ANCESTOR of theirs was selected too. Cloning
+    /// both would have produced that object twice: once inside the parent's copy, once beside it.
+    pub nested: usize,
+    /// How many requested ids are no longer live (a stale selection).
+    pub missing: usize,
+}
 
-    // Clone every component field. Then offset the Transform x so the clone sits beside the source
-    // (the later SetField wins). Read the source x first.
-    let comps = engine.components_of(src);
-    let src_x = comps
+/// One node of a duplicate: where it came from, the fresh id it lands under, and how far along X it
+/// sits from the set's origin (which is what sizes the placement offset, below).
+struct CloneNode {
+    src: EntityId,
+    new: EntityId,
+    /// The clone of this node's parent — `None` for a root, whose clone keeps the source's own parent.
+    parent: Option<EntityId>,
+    world_x: f32,
+}
+
+/// An entity's own `Transform.x`, or 0.0 when it has none (the viewport's default).
+fn local_x(engine: &Engine<FlecsWorld>, id: EntityId) -> f32 {
+    engine
+        .components_of(id)
         .get("Transform")
         .and_then(|t| t.get("x"))
         .map_or(0.0, |v| match v {
             FieldValue::Number(n) => *n as f32,
             FieldValue::Integer(i) => *i as f32,
             _ => 0.0,
-        });
-    for (component, fields) in comps {
-        for (field, value) in fields {
-            ops.push(Op::SetField {
-                entity: new_id,
-                component: component.clone(),
-                field,
-                value,
-            });
+        })
+}
+
+/// The live entities that share `parent` — the row's neighbours in the outliner, which is the scope a
+/// copy has to be distinguishable in. `None` is the root level.
+fn siblings_of(engine: &Engine<FlecsWorld>, parent: Option<EntityId>) -> Vec<EntityId> {
+    match parent {
+        Some(p) => engine.children_of(p),
+        None => engine
+            .entity_ids()
+            .into_iter()
+            .filter(|&id| engine.parent_of(id).is_none())
+            .collect(),
+    }
+}
+
+/// The stem a copy's name is built from: `Weld Gun copy 3` and `Weld Gun copy` both come from
+/// `Weld Gun`, so a copy of a copy is `Weld Gun copy 2` rather than `Weld Gun copy copy`.
+fn name_stem(name: &str) -> &str {
+    let trimmed = name.trim_end();
+    // A trailing run of digits is an index only when what precedes it is a copy — `Part 3` keeps its
+    // 3, because what remains, `Part`, does not end in " copy".
+    let without_index = match trimmed.rsplit_once(' ') {
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => trimmed,
+    };
+    without_index.strip_suffix(" copy").unwrap_or(trimmed)
+}
+
+/// The first free `… copy` / `… copy N` name among `taken`, which is also UPDATED — so a batch of
+/// clones landing under one parent numbers itself instead of colliding N times.
+fn free_copy_name(source: &str, taken: &mut HashSet<String>) -> String {
+    let stem = name_stem(source);
+    let first = format!("{stem} copy");
+    if taken.insert(first.clone()) {
+        return first;
+    }
+    // From 2, not 1: the un-numbered `copy` IS the first one, so a "1" would be a number with no 0
+    // beside it.
+    for n in 2u32.. {
+        let candidate = format!("{stem} copy {n}");
+        if taken.insert(candidate.clone()) {
+            return candidate;
         }
     }
-    ops.push(Op::SetField {
-        entity: new_id,
-        component: "Transform".into(),
-        field: "x".into(),
-        value: FieldValue::Number(f64::from(src_x + DUPLICATE_OFFSET_X)),
+    unreachable!("a u32 of names is not reachable")
+}
+
+/// The gap a copy is placed at BEYOND the extent of what was copied, along X, so it lands beside the
+/// original rather than inside it. Fixed → replay reproduces the placement exactly.
+///
+/// It is a gap and not the whole offset because the offset has to know how big the thing is. A flat
+/// 1.5 m put the copy of a 2 cm bolt seventy-five diameters away and the copy of a 30 m assembly
+/// *inside* the original — one number meaning "beside it" in one scene and "hidden in it" in the
+/// next. The set's own X extent is a size the engine already holds: no renderer, no mesh bounds, and
+/// identical on replay (ADR-013).
+const DUPLICATE_GAP_X: f32 = 1.5;
+
+/// The TOP-MOST live members of a selection, plus how many were skipped and how many are gone.
+///
+/// Reducing to the top-most is what stops a copy appearing twice. Marquee a group with its contents,
+/// or Select all over an imported assembly, and every part is selected along with the folder that
+/// holds it; cloning each selected id in turn would copy every part once inside the folder's copy and
+/// once beside it.
+fn duplicate_roots(
+    engine: &Engine<FlecsWorld>,
+    ids: &[EntityId],
+) -> (Vec<EntityId>, usize, usize) {
+    // De-duplicate while keeping order, and drop what is no longer there — the same first step
+    // `actions_for_selection` takes, and for the same reason: a stale right-click must not inflate
+    // any number the caller is about to print.
+    let mut seen: HashSet<EntityId> = HashSet::new();
+    let mut live: Vec<EntityId> = Vec::new();
+    let mut missing = 0usize;
+    for &id in ids {
+        if !seen.insert(id) {
+            continue;
+        }
+        if engine.ecs_entity(id).is_some() {
+            live.push(id);
+        } else {
+            missing += 1;
+        }
+    }
+
+    let selected: HashSet<EntityId> = live.iter().copied().collect();
+    let mut roots: Vec<EntityId> = Vec::new();
+    let mut nested = 0usize;
+    for &id in &live {
+        let mut ancestor = engine.parent_of(id);
+        let mut inside = false;
+        while let Some(a) = ancestor {
+            if selected.contains(&a) {
+                inside = true;
+                break;
+            }
+            ancestor = engine.parent_of(a);
+        }
+        if inside {
+            nested += 1;
+        } else {
+            roots.push(id);
+        }
+    }
+    (roots, nested, missing)
+}
+
+/// Every entity a duplicate will create: each root followed by its subtree, in the order the ids are
+/// allocated in.
+///
+/// The walk order IS the allocation order, so replaying the same document allocates the same ids in
+/// the same sequence (ADR-013). The roots come first in `roots` order, which is what lets the caller
+/// read the root clones straight back off the front of each subtree.
+fn plan_clone_nodes(engine: &mut Engine<FlecsWorld>, roots: &[EntityId]) -> Vec<CloneNode> {
+    let mut nodes: Vec<CloneNode> = Vec::new();
+    for &root in roots {
+        let new = engine.alloc_entity_id();
+        let x = local_x(engine, root);
+        nodes.push(CloneNode {
+            src: root,
+            new,
+            parent: None,
+            world_x: x,
+        });
+        let mut stack = vec![(root, new, x)];
+        while let Some((parent_src, parent_new, parent_x)) = stack.pop() {
+            for child in engine.children_of(parent_src) {
+                let child_new = engine.alloc_entity_id();
+                // Translation only — a rotated parent tilts its children's offsets, which this does
+                // not model. It sizes a placement gap, not a measurement: the error can only put the
+                // copy further out, never on top of the original.
+                let child_x = parent_x + local_x(engine, child);
+                nodes.push(CloneNode {
+                    src: child,
+                    new: child_new,
+                    parent: Some(parent_new),
+                    world_x: child_x,
+                });
+                stack.push((child, child_new, child_x));
+            }
+        }
+    }
+    nodes
+}
+
+/// **DUPLICATE a selection** — every selected object, with everything under it, as ONE undoable
+/// transaction (invariant 3).
+///
+/// The verb the right-click menu, the authoring toolbar and the action model all offered over a set
+/// while acting on one member of it — the toolbar's own description said so out loud: *"Clone Weld
+/// Gun — the other 13 are left alone"*. Three things it does that the single-id form never did:
+///
+/// 1. **Every selected object**, one commit, one undo. N clones or none.
+/// 2. **What is INSIDE them.** The old form cloned one entity's fields and pairs and stopped, so
+///    duplicating a `group`, an imported CAD assembly's folder (ADR-163) or anything else with
+///    children produced an EMPTY node — same parent, same name, nothing in it, and no error.
+/// 3. **A name you can tell apart.** Every field was cloned including `__meta__.name`, so a scene
+///    could hold three rows reading `Weld Gun`, three identical hits in `Find objects…` (ADR-185)
+///    and no way to say which was which. A copy takes the first free `… copy` / `… copy N` among its
+///    SIBLINGS — the scope the outliner shows it in.
+///
+/// **A selection holding both a parent and its child duplicates the parent once.** Cloning both would
+/// produce the child twice: once inside the parent's copy, once beside it. The skipped ones are
+/// counted (`nested`) rather than silently dropped, so the caller can say so.
+///
+/// The clones are **independently bindable**: `BindsTo`/binding edges are not cloned (a fresh copy is
+/// unbound), so each re-enters the reveal as its own requirer/provider — unchanged from M3.3.
+///
+/// # Errors
+/// [`PipelineError`] if the commit fails. An empty or entirely-dead selection is **not** an error: it
+/// returns an empty [`Duplicated`] with the ids counted in `missing`, and commits nothing.
+pub fn duplicate_selection(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    ids: &[EntityId],
+) -> Result<Duplicated, PipelineError> {
+    let (roots, nested, missing) = duplicate_roots(engine, ids);
+    if roots.is_empty() {
+        return Ok(Duplicated {
+            roots: Vec::new(),
+            created: Vec::new(),
+            nested,
+            missing,
+        });
+    }
+
+    let nodes = plan_clone_nodes(engine, &roots);
+    let root_clones: Vec<EntityId> = nodes
+        .iter()
+        .filter(|n| n.parent.is_none())
+        .map(|n| n.new)
+        .collect();
+
+    // How wide the thing being copied is, along the axis it is being offset on. A single childless
+    // object spans 0 and so lands exactly `DUPLICATE_GAP_X` away — the M3.3 placement, unchanged, for
+    // the case that used to be the only one.
+    let (min_x, max_x) = nodes.iter().fold((f32::MAX, f32::MIN), |(lo, hi), n| {
+        (lo.min(n.world_x), hi.max(n.world_x))
     });
+    let offset = (max_x - min_x) + DUPLICATE_GAP_X;
 
-    // Clone the capability pairs (provides/requires) — NOT BindsTo, so the clone is fresh + unbound.
-    for cap in engine.world().targets(src_ecs, scene.rels.provides) {
-        ops.push(Op::AddPair {
-            entity: new_id,
-            rel: scene.rels.provides,
-            target: cap,
+    // Sibling names, read once per distinct parent: duplicating 378 parts under one assembly scans
+    // that assembly's children once, not 378 times.
+    let mut names_by_parent: HashMap<Option<EntityId>, HashSet<String>> = HashMap::new();
+
+    let mut ops = Vec::new();
+    for node in &nodes {
+        let is_root = node.parent.is_none();
+        let parent = if is_root {
+            engine.parent_of(node.src)
+        } else {
+            node.parent
+        };
+        ops.push(Op::CreateEntity {
+            id: node.new,
+            parent,
         });
-    }
-    for cap in engine.world().targets(src_ecs, scene.rels.requires) {
-        ops.push(Op::AddPair {
-            entity: new_id,
-            rel: scene.rels.requires,
-            target: cap,
-        });
+
+        for (component, fields) in engine.components_of(node.src) {
+            for (field, value) in fields {
+                ops.push(Op::SetField {
+                    entity: node.new,
+                    component: component.clone(),
+                    field,
+                    value,
+                });
+            }
+        }
+
+        if is_root {
+            // After the cloned fields, so this SetField wins: the copy sits beside what was copied.
+            ops.push(Op::SetField {
+                entity: node.new,
+                component: "Transform".into(),
+                field: "x".into(),
+                value: FieldValue::Number(f64::from(node.world_x + offset)),
+            });
+            // Only a root is renamed. A descendant keeps its name because the copy it lives inside is
+            // already what distinguishes it — `Fixing copy › Bolt` reads correctly, and
+            // `Fixing copy › Bolt copy` does not.
+            if let Some(name) = entity_name(engine, node.src) {
+                let taken = names_by_parent.entry(parent).or_insert_with(|| {
+                    siblings_of(engine, parent)
+                        .into_iter()
+                        .filter_map(|s| entity_name(engine, s))
+                        .collect()
+                });
+                let fresh = free_copy_name(&name, taken);
+                ops.push(Op::SetField {
+                    entity: node.new,
+                    component: INSTANCE_META.into(),
+                    field: NAME_FIELD.into(),
+                    value: FieldValue::Str(fresh),
+                });
+            }
+        }
+
+        // The capability pairs (provides/requires) — NOT BindsTo, so every clone is fresh + unbound.
+        if let Some(src_ecs) = engine.ecs_entity(node.src) {
+            for cap in engine.world().targets(src_ecs, scene.rels.provides) {
+                ops.push(Op::AddPair {
+                    entity: node.new,
+                    rel: scene.rels.provides,
+                    target: cap,
+                });
+            }
+            for cap in engine.world().targets(src_ecs, scene.rels.requires) {
+                ops.push(Op::AddPair {
+                    entity: node.new,
+                    rel: scene.rels.requires,
+                    target: cap,
+                });
+            }
+        }
     }
 
-    engine.commit("duplicate-entity", ops)?;
-    Ok(new_id)
+    engine.commit("duplicate", ops)?;
+    Ok(Duplicated {
+        roots: root_clones,
+        created: nodes.iter().map(|n| n.new).collect(),
+        nested,
+        missing,
+    })
+}
+
+/// **Duplicate** ONE entity — [`duplicate_selection`] asked about one, so the two forms cannot come to
+/// disagree about the same object while both compile (`<test_and_ci_discipline>` 6). Returns the
+/// clone's id.
+///
+/// # Errors
+/// [`PipelineError::UnknownEntity`] if `src` isn't a live entity, or the transaction fails.
+pub fn duplicate_entity(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    src: EntityId,
+) -> Result<EntityId, PipelineError> {
+    duplicate_selection(engine, scene, &[src])?
+        .roots
+        .first()
+        .copied()
+        .ok_or(PipelineError::UnknownEntity(src))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════════

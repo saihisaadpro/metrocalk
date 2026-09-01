@@ -23,6 +23,7 @@ import {
 } from "../../src/panels/AssetLabPanel";
 import { STAGE_MIN } from "../../src/app/layout";
 import { CommandPalette } from "../../src/panels/CommandPalette";
+import { AuthoringToolbar } from "../../src/panels/AuthoringToolbar";
 import { ContextMenu } from "../../src/panels/ContextMenu";
 import { Hierarchy } from "../../src/panels/Hierarchy";
 import { LookSection } from "../../src/panels/LookSection";
@@ -2090,12 +2091,15 @@ function contextMenuScenes(): Scene[] {
       id: "ctxmenu-selection",
       looking_for:
         "the menu over 378 selected objects: a subject line stating the scope BEFORE the first verb; " +
-        "`Delete` taking the whole set and saying nothing extra; `Duplicate` marked `this one only` " +
-        "and `Make dynamic` marked `212 of 378`, because those are the two facts a person needs " +
-        "before the click and not in the toast after it; `Bind…` greyed with its reason; and " +
-        "`Select similar` naming what it would match on. What a reader checks: the scope notes are " +
-        "distinguishable from the refusal reasons rather than blurring into one grey column, no row " +
-        "wraps into its neighbour, and the six labels are still scannable at a glance",
+        "`Delete` AND `Duplicate` taking the whole set and saying nothing extra (ADR-196 — this row " +
+        "carried `this one only` until the verb behind it stopped cloning one of 378); `Make " +
+        "dynamic` marked `212 of 378` and `Bind…` marked `this one only`, because those are the two " +
+        "facts a person needs before the click and not in the toast after it; and `Select similar` " +
+        "naming what it would match on. What a reader checks: the scope notes are distinguishable " +
+        "from the labels rather than blurring into one grey column, no row wraps into its " +
+        "neighbour, the six labels are still scannable at a glance — and that only the rows that " +
+        "genuinely narrow carry a note, which is the whole of whether the rule produces a quieter " +
+        "menu or just a wordier one",
       viewport: { width: 900, height: 560 },
       expect: {
         present: [
@@ -2106,17 +2110,20 @@ function contextMenuScenes(): Scene[] {
           // The scope is a STRUCTURED signal, not copy: a test keyed on the wording would break the
           // first time the sentence changed, and a wording change is not a scope change.
           ["[data-action='remove'][data-applies-to='378']", 1],
-          ["[data-action='duplicate'][data-applies-to='1']", 1],
+          // THE ONE THAT CHANGED. A structured signal, not copy: the row said `Duplicate` over 378
+          // objects and cloned the primary, and this attribute is what the scope note is drawn from.
+          ["[data-action='duplicate'][data-applies-to='378']", 1],
+          ["[data-action='bind'][data-applies-to='1']", 1],
           ["[data-action='selectsimilar'][data-applies-to='378']", 1],
         ],
         text_present: [
           "378 objects selected",
           "Delete",
+          // The note that survives, on the verb that honestly cannot take a set: a reveal asks its
+          // question about ONE requirer.
           "this one only",
           "212 of 378",
           "sharing the geometry of Bolt M12 — Hex Head, Zinc",
-          // Every "no" explained, in words rather than a grey row that does nothing.
-          "requires no capabilities",
         ],
         text_absent: ["null", "undefined", "NaN"],
         // A row whose scope note ran past the surface would still satisfy `text_present`, because
@@ -2127,9 +2134,9 @@ function contextMenuScenes(): Scene[] {
       render: () => (
         <ContextMenu
           client={actionsClient(378, [
-            act("bind", "Bind…", 0, false, "requires no capabilities, so there is nothing to bind"),
+            act("bind", "Bind…", 1, false),
             act("remove", "Delete", 378, true),
-            act("duplicate", "Duplicate", 1, true),
+            act("duplicate", "Duplicate", 378, true),
             act("focus", "Focus", 378, false),
             act("inspect", "Inspect", 378, false),
             act("makedynamic", "Make dynamic", 212, true),
@@ -2320,6 +2327,49 @@ function contextMenuScenes(): Scene[] {
           }))}
           onClose={() => {}}
         />
+      ),
+    },
+    {
+      id: "authoring-duplicate-scope",
+      looking_for:
+        "THE ROW THAT ADMITTED THE DEFECT IN ITS OWN DESCRIPTION (ADR-196). The authoring toolbar's " +
+        "Actions menu over a selection of 378: the trigger counts the set, and until this change the " +
+        "`Duplicate` row underneath it read *Clone Bolt M12 — the other 377 are left alone* — an " +
+        "honest description of a verb that quietly narrowed its own scope, which is `<ux_quality>` 6 " +
+        "with the narrowing written down. It now counts what it will take, like `Delete` two rows " +
+        "below it. What a reader checks: the two mutating rows agree with each other and with the " +
+        "number on the trigger above them; the description reads as a promise about the whole " +
+        "selection rather than about one object; and no row's description wraps into its neighbour's " +
+        "label, because the descriptions are what carry the scope here — this menu has no scope-note " +
+        "column of its own",
+      viewport: { width: 520, height: 620 },
+      // The popup is a click away: a menu photographed closed is a picture of a button.
+      click: ["[data-testid='authoring-more']"],
+      expect: {
+        present: [["[data-testid='authDuplicate']", 1], ["[data-testid='authDelete']", 1]],
+        text_present: [
+          "Actions · 378",
+          "Clone all 378 selected objects",
+          "with everything inside them",
+          "Deactivate all 378",
+        ],
+        // The vocabulary of the narrowing, which is the thing that must be GONE from the product and
+        // not merely absent from a happier fixture.
+        text_absent: ["are left alone", "null", "undefined", "NaN"],
+        unclipped: ["[data-testid='authDuplicate']"],
+      },
+      setup: () => {
+        seedAssembly();
+        // The toolbar reads the SELECTION, not the scene: without this the menu photographs its
+        // empty state and every scope claim in the caption is about a set that is not there.
+        projectionStore
+          .getState()
+          .setSelection(Array.from({ length: 378 }, (_, i) => `bolt-${i}`));
+      },
+      render: () => (
+        <div style={{ width: 320, padding: 12 }}>
+          <AuthoringToolbar client={{} as unknown as EditorClient} />
+        </div>
       ),
     },
   ];

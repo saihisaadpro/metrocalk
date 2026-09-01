@@ -137,7 +137,11 @@ test("Delete acts on the WHOLE selection, in one transaction, and dims exactly w
   expect(uiStore.getState().status).toContain("2 objects");
 });
 
-test("a verb that only acts on one says which one, rather than counting three beside it", async () => {
+test("Duplicate acts on the WHOLE selection, and its description counts what it will take", async () => {
+  const duplicateSelection = vi.fn((ids: string[]) =>
+    Promise.resolve({ created: ids.map((id) => `${id}-copy`), entities: ids.length, nested: 0, missing: 0 }),
+  );
+  const duplicateEntity = vi.fn(() => Promise.resolve("a-copy"));
   act(() => {
     projectionStore.getState().bulkLoad([
       { id: "a", name: "Bolt", parentId: null, components: {} },
@@ -145,13 +149,19 @@ test("a verb that only acts on one says which one, rather than counting three be
     ]);
     projectionStore.getState().setSelection(["a", "b"]);
   });
-  render(<AuthoringToolbar client={fakeClient()} />);
+  render(<AuthoringToolbar client={fakeClient({ duplicateSelection, duplicateEntity })} />);
   fireEvent.click(screen.getByRole("button", { name: /^actions/i }));
 
-  // `<ux_quality>` 4 + 6: an enabled control that quietly narrows its own scope is the same defect
-  // Delete had; naming the object is the honest version until duplicate is batched too.
-  expect(screen.getByTestId("authDuplicate").textContent).toContain("Nut");
-  expect(screen.getByTestId("authDuplicate").textContent).toContain("the other 1 are left alone");
-  // …and the refusal that used to name a gesture the stage did not have now names one it does.
-  expect(screen.getByTestId("authGroup").getAttribute("aria-disabled")).not.toBe("true");
+  // `<ux_quality>` 4 + 6: this row used to NAME the primary and say "the other 1 are left alone",
+  // which was the honest description of a verb that quietly narrowed its own scope. It no longer
+  // narrows it, so the description is a count — and the count is the one on the trigger above it.
+  expect(screen.getByTestId("authDuplicate").textContent).toContain("all 2 selected objects");
+  fireEvent.click(screen.getByTestId("authDuplicate"));
+
+  // ONE transaction over the set — never the single-id command on the primary (ADR-196).
+  await waitFor(() => expect(duplicateSelection).toHaveBeenCalledWith(["a", "b"]));
+  expect(duplicateEntity).not.toHaveBeenCalled();
+  // And the copies are what is selected, so the drag that follows moves them.
+  await waitFor(() => expect(projectionStore.getState().multiSelect).toEqual(["a-copy", "b-copy"]));
+  expect(uiStore.getState().status).toContain("2 objects");
 });

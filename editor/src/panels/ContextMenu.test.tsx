@@ -83,11 +83,22 @@ test("the menu states the scope it acts on, and Delete acts on the WHOLE selecti
   loadScene([{ id: "b1", name: "Bolt M12" }, { id: "b2", name: "Bolt M12" }, { id: "b3", name: "Bolt M12" }]);
   const deleteDeactivateMany = vi.fn((ids: string[]) => Promise.resolve(ids));
   const onClose = vi.fn();
+  const duplicateSelection = vi.fn((ids: string[]) =>
+    Promise.resolve({ created: ids.map((id) => `${id}-copy`), entities: ids.length, nested: 0, missing: 0 }),
+  );
   const client = fakeClient({
-    // Three live objects: Delete takes all three, Duplicate is primary-only.
+    // Three live objects: Delete and Duplicate both take all three (ADR-196); `Bind…` is the one
+    // verb that honestly cannot — the reveal asks its question about one requirer.
     entityActionsFor: () =>
-      Promise.resolve(answer(3, [act("remove", "Delete", 3, true), act("duplicate", "Duplicate", 1, true)])),
+      Promise.resolve(
+        answer(3, [
+          act("remove", "Delete", 3, true),
+          act("duplicate", "Duplicate", 3, true),
+          act("bind", "Bind…", 1, false),
+        ]),
+      ),
     deleteDeactivateMany,
+    duplicateSelection,
   });
 
   render(<ContextMenu client={client} ids={["b1", "b2", "b3"]} onClose={onClose} />);
@@ -103,9 +114,20 @@ test("the menu states the scope it acts on, and Delete acts on the WHOLE selecti
   // A verb that takes the whole set says nothing extra; a verb that does not MUST say so on the row.
   expect(removeRow.dataset.appliesTo).toBe("3");
   expect(removeRow.textContent).toBe("Delete");
-  expect(duplicateRow.dataset.appliesTo).toBe("1");
-  expect(duplicateRow.textContent).toContain("this one only");
+  expect(duplicateRow.dataset.appliesTo).toBe("3");
+  expect(duplicateRow.textContent).toBe("Duplicate");
+  const bindRow = rows.find((r) => r.dataset.action === "bind")!;
+  expect(bindRow.textContent).toContain("this one only");
 
+  // THE WHOLE SET, from the row that was opened over a set. This row called `duplicateEntity` on the
+  // primary until ADR-196 — a menu built from three, saying "Duplicate", making one.
+  fireEvent.click(duplicateRow);
+  await waitFor(() => expect(duplicateSelection).toHaveBeenCalledWith(["b1", "b2", "b3"]));
+  await waitFor(() =>
+    expect(projectionStore.getState().multiSelect).toEqual(["b1-copy", "b2-copy", "b3-copy"]),
+  );
+
+  // The same menu, still mounted (`onClose` is the shell's business): Delete takes the same set.
   fireEvent.click(removeRow);
   expect(deleteDeactivateMany).toHaveBeenCalledWith(["b1", "b2", "b3"]);
   await waitFor(() => expect(projectionStore.getState().multiSelect).toEqual([]));

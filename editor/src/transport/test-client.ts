@@ -134,6 +134,7 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     animationGraphClearPreviewParameters: () => Promise.resolve({ ok: true, message: "Transient parameters reset.", accepted: {} }),
     removeEntity: vi.fn(),
     duplicateEntity: () => Promise.resolve(null),
+    duplicateSelection: vi.fn((ids: string[]) => Promise.resolve({ created: ids.map((id) => `${id}-copy`), entities: ids.length, nested: 0, missing: 0 })),
     focusEntity: vi.fn(),
     focusSelection: vi.fn(() => Promise.resolve({ framed: 1, distance: 4, primary: "e1" })),
     reportViewportRect: vi.fn(),

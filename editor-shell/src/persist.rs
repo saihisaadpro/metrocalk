@@ -302,7 +302,19 @@ pub enum Record {
     Remove { id: String },
     /// A viewport **Duplicate** (M3.3): clone an entity by source id. Replayed deterministically (same
     /// alloc sequence + fixed offset → the clone lands byte-identical), so it survives reload.
+    ///
+    /// Still read (older logs are full of it) but no longer written: a duplicate is a set verb since
+    /// ADR-196, and one record per transaction is what keeps a live Ctrl-Z and a replayed one
+    /// reverting the same amount of work — the divergence [`Record::DeleteDeactivateMany`] documents.
     Duplicate { source: String },
+    /// **A whole selection duplicated in ONE transaction** — and one record, for the reason
+    /// [`Record::DeleteDeactivateMany`] spells out: N single records replay as N commits, and the
+    /// `Record::Undo` that took all of them back live takes exactly one of them back on replay.
+    ///
+    /// The SOURCES are recorded, not the clones: replay re-derives the copies through the same
+    /// `duplicate_selection` from the same document, which allocates the same ids in the same order
+    /// and lands them at the same offset (ADR-013).
+    DuplicateMany { sources: Vec<String> },
     /// A generation (M6): a grey placeholder + the streamed-in generated mesh **handle**. Replayed by
     /// re-placing the placeholder + re-applying the stored handle as a validated AI patch (the generated
     /// asset is content-addressed — for the deterministic fake it re-resolves; a novel real-provider
@@ -768,6 +780,15 @@ impl Log {
                     .is_some_and(|e| capscene::remove_entity(engine, scene, e).is_ok()),
                 Record::Duplicate { source } => EntityId::from_loro_key(&source)
                     .is_some_and(|s| capscene::duplicate_entity(engine, scene, s).is_ok()),
+                Record::DuplicateMany { sources } => {
+                    let targets: Vec<EntityId> = sources
+                        .iter()
+                        .filter_map(|s| EntityId::from_loro_key(s))
+                        .collect();
+                    !targets.is_empty()
+                        && capscene::duplicate_selection(engine, scene, &targets)
+                            .is_ok_and(|made| !made.roots.is_empty())
+                }
                 Record::Generate {
                     prompt: _,
                     pos,

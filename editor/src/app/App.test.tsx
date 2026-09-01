@@ -5,6 +5,7 @@ import { projectionStore } from "../store/projection";
 import { playStore } from "../store/play";
 import { walletStore } from "../store/wallet";
 import { toastStore } from "../store/toasts";
+import { uiStore } from "../store/ui";
 
 afterEach(() => {
   projectionStore.getState().reset();
@@ -234,6 +235,21 @@ describe("editor app — end-to-end wiring", () => {
     fireEvent.keyDown(window, { key: "k", ctrlKey: true });
     expect(await screen.findByTestId("command-palette")).toBeTruthy();
     expect(await screen.findByRole("combobox", { name: /search commands/i })).toBeTruthy();
+  });
+
+  it("Ctrl/Cmd+D is BOUND to duplicate, and the palette row teaches the chord (ADR-196)", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByTestId("engine-scene")).toBeTruthy());
+    // The chord did nothing at all before this: the only routes to a copy were a row inside a popup
+    // menu in the left dock and a right-click row. A refusal that says what to do is the proof it is
+    // bound — silence is what it used to do.
+    fireEvent.keyDown(window, { key: "d", ctrlKey: true });
+    await waitFor(() => expect(uiStore.getState().status).toBe("Select an object to duplicate"));
+
+    // And it is DISCOVERABLE: a palette row carries the chord, which is where a person learns it.
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByTestId("command-palette");
+    await waitFor(() => expect(palette.textContent).toContain("Duplicate"));
   });
 
   it("uses header-triggered focus-managed drawers at phone width", () => {
