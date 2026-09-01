@@ -217,14 +217,17 @@ describe("the clipboard takes the whole selection, and gives it back intact", ()
       timeoutMsg: "pasting the cut produced nothing",
     });
     const back = await engineSelection();
+    // EVERY one of them, not a sample: the object this test named is somewhere in the set and a slice
+    // would fail on where it happened to land rather than on what happened to it.
     const names = [];
-    for (const id of back.slice(0, 12)) names.push((await details(id)).name);
+    for (const id of back) names.push((await details(id)).name);
     console.log("  pasted back as:", names.slice(0, 4).join(" · "));
     // THE MOVE. A cut source is deactivated, so nothing live is holding its name — the object comes
     // back as itself rather than as a copy of itself. This is one rule with the placement: a cut
     // pastes at step 0, exactly where it was.
     expect(names).toContain(named.name);
-    expect(names.every((n) => /copy/i.test(n))).toBe(false);
+    // NOT ONE of them is a copy of itself. `every(...) === false` would pass on a single survivor.
+    expect(names.filter((n) => /copy/i.test(n))).toEqual([]);
     await shot("clipboard-cut-pasted-back");
   });
 });
