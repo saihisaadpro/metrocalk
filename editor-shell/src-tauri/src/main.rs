@@ -17363,6 +17363,17 @@ fn compute_reveal(
 
 /// A short human label for an entity — its most salient stdlib component, else its id.
 fn label_of(engine: &Engine<FlecsWorld>, id: EntityId) -> String {
+    // THE NAME SOMEBODY GAVE IT, FIRST. This read is what `entity_details.name` is, and it never
+    // consulted `__meta__.name` at all — so the hover tooltip, the bound-to list and the CAD report's
+    // fallback all printed `MeshRenderer  ·  1_1b` about a row the outliner calls `Weld Gun`, which is
+    // the raw-loro-key-in-user-copy defect `<ux_quality>` 4 forbids and `store/selectionText.ts`
+    // exists to prevent on the other side of the boundary. Found by ADR-196's live `.exe` run, which
+    // asked this command for a duplicated object's name and got its key.
+    if let Some(name) = metrocalk_editor_shell::capscene::entity_name(engine, id) {
+        if !name.is_empty() {
+            return name;
+        }
+    }
     let comps = engine.components_of(id);
     for k in [
         "HealthBar",
@@ -29248,5 +29259,51 @@ mod view_sidecar_tests {
         // two spellings of one state is how a reader ends up handling only one of them.
         let written = serde_json::to_string(&ViewSidecar::default()).expect("serialisable");
         assert!(!written.contains("environment"), "{written}");
+    }
+}
+
+#[cfg(test)]
+mod entity_label_tests {
+    use super::label_of;
+    use metrocalk_core::Engine;
+    use metrocalk_ecs::FlecsWorld;
+    use metrocalk_editor_shell::capscene;
+
+    /// What `entity_details.name` answers about an object somebody has NAMED.
+    ///
+    /// It answered with the object's raw Loro key, or with a component kind and the key — for as long
+    /// as the command has existed. So the hover tooltip, the bound-to list and the CAD report's
+    /// fallback all said `MeshRenderer  ·  1_1b` about a row the outliner calls `Weld Gun`, which is
+    /// the engine-internal-id-in-user-copy defect `<ux_quality>` 4 forbids and `selectionText.ts`
+    /// exists to prevent on the other side of the boundary. The front end had already worked around
+    /// it (`HoverTooltip` prefers the projection's name); the command itself was still wrong, and
+    /// ADR-196's live `.exe` run is what asked it a question only the name could answer.
+    #[test]
+    fn a_named_entity_is_labelled_by_its_name_and_an_unnamed_one_falls_back_to_its_kind() {
+        let mut world = FlecsWorld::new();
+        let scene = capscene::CapScene::intern(&mut world);
+        let mut engine = Engine::new(world, 1);
+
+        let named = capscene::create_entity(&mut engine, [0.0, 0.0, 0.0], "Weld Gun").unwrap();
+        assert_eq!(label_of(&engine, named), "Weld Gun");
+
+        // Renaming moves the label with it — one source of truth, not a snapshot.
+        capscene::rename(&mut engine, named, "Weld Gun copy").unwrap();
+        assert_eq!(label_of(&engine, named), "Weld Gun copy");
+
+        // An unnamed entity keeps the old behaviour: its kind and its key, which is the honest
+        // fallback rather than an invented name that matches nothing the user could search for.
+        let anonymous = engine.alloc_entity_id();
+        engine
+            .commit(
+                "test-anonymous",
+                vec![metrocalk_core::Op::CreateEntity {
+                    id: anonymous,
+                    parent: None,
+                }],
+            )
+            .unwrap();
+        assert_eq!(label_of(&engine, anonymous), anonymous.to_loro_key());
+        let _ = &scene;
     }
 }
