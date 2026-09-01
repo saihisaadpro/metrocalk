@@ -5914,7 +5914,7 @@ fn shot_subject_name(engine: &Engine<FlecsWorld>, key: &str) -> Option<String> {
 /// EVERY cutscene reply this process sends. One producer, so the panel's warning list cannot be one
 /// thing after adding a shot and another after moving one.
 ///
-/// It is `cinema_reply_named` plus the half that needs the world — see [`placed_camera_notes`]. The
+/// It is `cinema_reply_named` plus the half that needs the world — see [`shot_placement_notes`]. The
 /// two halves are appended rather than merged because they answer different questions and only one of
 /// them can be answered by a crate that has never seen a scene.
 fn cinema_reply(
@@ -5931,33 +5931,37 @@ fn cinema_reply(
         });
     reply
         .problems
-        .extend(placed_camera_notes(engine, shared, entity, cut));
+        .extend(shot_placement_notes(engine, shared, entity, cut));
     reply
 }
 
-/// ADR-195 — ask the world about the cameras the author placed, and say what it answers.
+/// ADR-195 / ADR-197 — ask the world about every shot's camera, placed or negotiated, and say what it
+/// answers.
 ///
-/// THE PROMISE NOT TO INTERFERE IS WHAT OBLIGES THIS TO SPEAK. `plan_shot` and `solve_shot_adjusted`
-/// both return a placed camera untouched, on purpose: an author who framed a shot by eye was staring
-/// at the obstruction, the height and the wall when they pressed the button, and correcting that would
-/// be the engine quietly filming a different shot. But a lens parked inside a machine then produced a
-/// solid-colour frame weeks later with nothing said at the time — the same failure `ShotCamera::
-/// is_usable` exists to prevent, arriving from the outside instead of from the numbers.
+/// THE PROMISE NOT TO INTERFERE IS WHAT OBLIGES THE PLACED HALF TO SPEAK. `plan_shot` and
+/// `solve_shot_adjusted` both return a placed camera untouched, on purpose: an author who framed a shot
+/// by eye was staring at the obstruction, the height and the wall when they pressed the button, and
+/// correcting that would be the engine quietly filming a different shot. But a lens parked inside a
+/// machine then produced a solid-colour frame weeks later with nothing said at the time — the same
+/// failure `ShotCamera::is_usable` exists to prevent, arriving from the outside instead of from the
+/// numbers.
+///
+/// AND THE NEGOTIATION ITSELF IS THE OTHER HALF (ADR-197). For a card shot the engine chooses the
+/// placement, walking a fifty-four-rung ladder until the world stops objecting — and when nothing on
+/// that ladder is acceptable it films the least bad one. That is the right decision and it was
+/// completely silent: recorded in `cinematic_placements` and a `diag_log!`, neither of which an author
+/// can read. Nine of the production factory film's thirty shots were filmed at a placement the engine
+/// itself scored `acceptable: false`, and those are exactly its remaining illegible seconds.
 ///
 /// CONTENT-AWARE, and that is not a nicety here: the answer needs a BVH over every drawn part of a
-/// 15,711-part import, and a cutscene with no placed camera cannot have this fault. The scan of the
-/// shot list is the whole cost in that case, which is every cutscene authored before ADR-192.
-fn placed_camera_notes(
+/// 15,711-part import. A scene with no occluders is answered without walking a single ladder.
+fn shot_placement_notes(
     engine: &Engine<FlecsWorld>,
     shared: &render::Shared,
     entity: EntityId,
     cut: &metrocalk_animation::shot::Cutscene,
 ) -> Vec<String> {
-    if !cut
-        .shots
-        .iter()
-        .any(|shot| shot.camera.is_some_and(|camera| camera.is_usable()))
-    {
+    if cut.shots.is_empty() {
         return Vec::new();
     }
     let mut st = shared.lock().unwrap();
@@ -5965,8 +5969,11 @@ fn placed_camera_notes(
     // Sampled for EVERY shot, placed or not, in list order — because `cinematic_shot_subject_sample`
     // is what fills the `cinema_subtree` memo the obstruction test reads, and the two have to be
     // talking about the same subject or the thing being filmed becomes the thing in the way.
-    let mut subjects: Vec<([f32; 3], f32, std::collections::HashSet<u32>)> =
-        Vec::with_capacity(cut.shots.len());
+    let mut subjects: Vec<(
+        metrocalk_animation::shot::SubjectSample,
+        String,
+        std::collections::HashSet<u32>,
+    )> = Vec::with_capacity(cut.shots.len());
     for shot in &cut.shots {
         let sample = cinematic_shot_subject_sample(engine, &mut st, entity, shot);
         let key = cinematic_shot_subject(engine, entity, shot).to_loro_key();
@@ -5980,18 +5987,73 @@ fn placed_camera_notes(
                     .collect()
             })
             .unwrap_or_default();
-        subjects.push((sample.center, sample.radius(), parts));
+        subjects.push((sample, key, parts));
     }
     st.sync_occlusion();
+    // NOTHING TO SEE AND NOTHING TO SAY. Every verdict below is `Vantage::OPEN` against an empty
+    // broad phase, so this is not an optimisation that changes an answer — it is the difference
+    // between answering "no" cheaply and paying 270 solves per card shot to answer "no".
+    if st.occlusion.is_empty() {
+        return Vec::new();
+    }
+    // THE CUT'S OWN DELIVERY FRAME, not `composition_aspect()` — the same reasoning `render_sizing`
+    // records. The composition only insets to the delivery while something is holding the camera, and
+    // this diagnostic runs with the ordinary editor view up, so reading the live composition would
+    // plan every 2.39:1 shot at 16:9 and warn about placements the film will never use.
+    let aspect = cut
+        .delivery
+        .ratio()
+        .unwrap_or_else(|| render::frame_aspect(st.known_surface_aspect(), st.adopted_visible_rect()));
+    let plans = card_shot_plans(&mut st, cut, &subjects, aspect);
     let st = &*st;
-    metrocalk_animation::shot::placed_camera_problems(
+    let mut out = metrocalk_animation::shot::placed_camera_problems(
         cut,
-        |index, _| subjects[index].0,
+        |index, _| subjects[index].0.center,
         |index, pose| {
-            let (center, radius, parts) = &subjects[index];
-            st.vantage(pose.eye, pose.look_at, *center, *radius, parts)
+            let (sample, _, parts) = &subjects[index];
+            st.vantage(
+                pose.eye,
+                pose.look_at,
+                sample.center,
+                sample.radius(),
+                parts,
+            )
         },
-    )
+    );
+    out.extend(metrocalk_animation::shot::card_shot_problems(cut, |index, _| {
+        plans.get(index).copied().flatten()
+    }));
+    out
+}
+
+/// Negotiate every card shot's placement the way the runtime will, through the memo.
+///
+/// Split out from [`shot_placement_notes`] because it is the half that costs something. The search and
+/// its memo live on `SceneState` beside the occluders they measure against — see
+/// [`render::SceneState::planned_placement`]; what is here is only the decision about which shots to
+/// ask about, which is the shell's to make.
+fn card_shot_plans(
+    st: &mut render::SceneState,
+    cut: &metrocalk_animation::shot::Cutscene,
+    subjects: &[(
+        metrocalk_animation::shot::SubjectSample,
+        String,
+        std::collections::HashSet<u32>,
+    )],
+    aspect: f32,
+) -> Vec<Option<metrocalk_animation::shot::ShotAdjustment>> {
+    let mut out = Vec::with_capacity(cut.shots.len());
+    for (index, shot) in cut.shots.iter().enumerate() {
+        // A placed camera is negotiated by nobody, so there is nothing here to ask about — and the
+        // planner's untouched identity adjustment would answer OPEN for a pose it never judged.
+        if shot.camera.is_some_and(|camera| camera.is_usable()) {
+            out.push(None);
+            continue;
+        }
+        let (sample, _, parts) = &subjects[index];
+        out.push(Some(st.planned_placement(shot, *sample, aspect, parts)));
+    }
+    out
 }
 
 fn refresh_animation_plan(engine: &Engine<FlecsWorld>, preview: &mut AnimationPreviewState) {
@@ -23229,7 +23291,7 @@ fn present_cinematic_moment(
         });
         (sample, previous_sample, aspect, plan, previous_plan)
     };
-    let current_pose = solve_shot_adjusted(shot, plan, sample, playback.progress, aspect, 50.0);
+    let current_pose = solve_shot_adjusted(shot, plan, sample, playback.progress, aspect, render::CINEMATIC_FOV_DEG);
     let previous_pose =
         playback
             .blend_from
@@ -23241,7 +23303,7 @@ fn present_cinematic_moment(
                     previous_sample,
                     1.0,
                     aspect,
-                    50.0,
+                    render::CINEMATIC_FOV_DEG,
                 )
             });
     // Both endpoints already stand on or above `CAMERA_FLOOR` (`solve_shot_adjusted`
@@ -23318,7 +23380,7 @@ fn plan_cinematic_shot(
         .unwrap_or_default();
     let radius = sample.radius();
     let plan =
-        metrocalk_animation::shot::plan_shot(shot, sample, aspect, 50.0, |pose, _progress| {
+        metrocalk_animation::shot::plan_shot(shot, sample, aspect, render::CINEMATIC_FOV_DEG, |pose, _progress| {
             state.vantage(pose.eye, pose.look_at, sample.center, radius, &subject)
         });
     let name_of = |size: metrocalk_animation::shot::ShotSize| -> &'static str {
@@ -23344,7 +23406,7 @@ fn plan_cinematic_shot(
     // negotiation never ran" from "the negotiation ran and was satisfied by this" -- which are different
     // faults with opposite fixes, and were indistinguishable in the previous record.
     let filmed =
-        metrocalk_animation::shot::solve_shot_adjusted(shot, plan, sample, 0.5, aspect, 50.0);
+        metrocalk_animation::shot::solve_shot_adjusted(shot, plan, sample, 0.5, aspect, render::CINEMATIC_FOV_DEG);
     let vantage = state.vantage(filmed.eye, filmed.look_at, sample.center, radius, &subject);
     state.cinematic_placements.push(render::CinematicPlacement {
         shot: shot.id.clone(),

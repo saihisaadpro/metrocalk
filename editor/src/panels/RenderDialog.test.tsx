@@ -696,4 +696,41 @@ describe("RenderDialog", () => {
       expect(client.cinemaSetRender).toHaveBeenCalledWith("e1", "movie", 30, 1080, "", "X:\\Renders"),
     );
   });
+
+  // ── ADR-197 — what is wrong with the cut, in front of the button that spends an hour on it ─────
+
+  it("says nothing about warnings when the cut has none", async () => {
+    // The negative control first: the block below must be caused by the cut carrying warnings, not
+    // by the dialog opening.
+    open();
+    await screen.findByTestId("render-start");
+    expect(screen.queryByTestId("render-problems")).toBeNull();
+  });
+
+  it("repeats the cut's warnings inside the dialog that covers them", async () => {
+    // THE DIALOG IS A MODAL OVER THE LIST. A shot the engine could not place renders as a
+    // solid-colour frame, and the click that spends the render happens here, with the panel that
+    // would have said so hidden behind the sheet.
+    const problems = [
+      'shots 2 and 3 on "Weld Gun 7" are framed identically back to back — that reads as a jump cut; change the size or the angle',
+      'shot 2\'s subject is hidden from every angle the engine tried — 78% of it is behind something else; frame it yourself with "Shoot from this view", or film a different part',
+    ];
+    open({ cut: { ...CUT, problems } });
+    const block = await screen.findByTestId("render-problems");
+    // The SAME sentences, never a second wording of them — one producer, read here.
+    for (const problem of problems) {
+      expect(block.textContent).toContain(problem);
+    }
+    expect(block.textContent).toContain("2 warnings about this cut");
+    // A NOTE, NOT A GATE. An author may know exactly why a shot is boxed in and want the render.
+    await waitFor(() =>
+      expect((screen.getByTestId("render-start") as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  it("counts one warning in the singular", async () => {
+    open({ cut: { ...CUT, problems: ["shot 1 has nowhere to film from"] } });
+    const block = await screen.findByTestId("render-problems");
+    expect(block.textContent).toContain("One warning about this cut");
+  });
 });

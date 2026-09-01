@@ -1561,7 +1561,9 @@ pub fn reply_with_names(
         // the same sentences.
         reads: rows.iter().map(|row| row.reads.clone()).collect(),
         rows,
-        problems: cut.problems(),
+        // Named, for the same reason the rows are: the jump-cut warning is the one sentence in the
+        // list that mentions a subject, and a cutscene stores subjects as entity keys.
+        problems: cut.problems_named(subject_name),
         message,
         reason: None,
     }

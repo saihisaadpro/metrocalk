@@ -497,7 +497,9 @@ const physicsClient = () =>
  *  cutscene's OWNER — so a wide of the hall read back as a wide of the one part standing in it.
  *
  *  The jump-cut warning is real output, not a fixture string: shots 4 and 5 are framed identically
- *  back to back, which is what `Cutscene::problems` says that about. */
+ *  back to back, which is what `Cutscene::problems` says that about — and it NAMES those two shots,
+ *  because until ADR-197 it named only the subject, as the entity key the document stores (`412_3`).
+ *  The numbers are the half of the sentence that reaches a control. */
 const CUTSCENE_SHOTS = [
   { id: "sh-1", size: "wide", angle: "three_quarter", motion: "pull_out", amount: 0.3, seconds: 2.5, subject: "hall", subjectName: "Assembly Hall", reads: "a wide shot of Assembly Hall from three-quarters, pulling out — 2.5s" },
   { id: "sh-2", size: "full", angle: "three_quarter", motion: "push_in", amount: 0.35, seconds: 4.0, subject: "rig", subjectName: "Weld Gun 7", reads: "a full shot of Weld Gun 7 from three-quarters, pushing in — 4.0s" },
@@ -541,7 +543,7 @@ const CUTSCENE: CinemaReply = (() => {
     reads: rows.map((row) => row.reads),
     rows,
     problems: [
-      'shots on "Weld Gun 7" are framed identically back to back — that reads as a jump cut; change the size or the angle',
+      'shots 4 and 5 on "Weld Gun 7" are framed identically back to back — that reads as a jump cut; change the size or the angle',
     ],
     message: "",
     reason: null,
@@ -746,6 +748,19 @@ const placedCameraClient = (
       Promise.resolve({ ...CUTSCENE, entity: id, message: `Shot ${index + 1} is now ${CUTSCENE.rows[index]?.reads ?? "back on its card"}` }),
     cinemaSetShotTracking: (id: string, index: number) =>
       Promise.resolve({ ...cut, entity: id, message: `Shot ${index + 1} is now ${rows[index]?.reads ?? "placed"}` }),
+  } as unknown as EditorClient;
+};
+
+/** ADR-197 — the same five-shot cut, with the world's verdict on the placements the ENGINE chose
+ *  appended to the warning list the document's own checks already fill.
+ *
+ *  Every shot here is a CARD shot (`camera: null`), which is the whole distinction: the author never
+ *  chose these positions, so the advice cannot be about the controls that produced them. */
+const cutsceneClientWithProblems = (extraProblems: string[]) => {
+  const cut: CinemaReply = { ...CUTSCENE, problems: [...CUTSCENE.problems, ...extraProblems] };
+  return {
+    ...cutsceneClient(),
+    cinemaList: () => Promise.resolve(cut),
   } as unknown as EditorClient;
 };
 
@@ -1595,6 +1610,60 @@ export const SCENES: Scene[] = [
       <CutscenePanel
         client={placedCameraClient(FOLLOWING_CAMERA, [
           "shot 1's camera is inside something — that frame will be solid colour",
+        ])}
+      />
+    ),
+  },
+  {
+    id: "cutscene-nowhere-to-film-from",
+    looking_for:
+      "THE OTHER HALF OF THE SAME SENTENCE, AND THE LARGER ONE. The scene beside this is about a " +
+      "camera the AUTHOR placed. This one is about the placements the ENGINE chose: a card shot is " +
+      "negotiated against a fifty-four-rung ladder of framings and yaws, and when nothing on it is " +
+      "acceptable the engine films the least bad one — which is the right decision and was, until " +
+      "now, completely silent. Nine of the production factory film's thirty shots were filmed at a " +
+      "placement the engine itself scored unacceptable, and those are exactly its illegible seconds. " +
+      "Check four things. First, the warnings are in the SAME list as the jump-cut note, because a " +
+      "jump cut and a shot with nowhere to film it from are both 'what is wrong with this cut'. " +
+      "Second, each one names its SHOT NUMBER and what is wrong in the author's words — 'hidden', " +
+      "'boxed in' — with no mechanism, no percentage of a thing they cannot see, and no vantage " +
+      "vocabulary. Third, and this is the part the sentence exists for: the advice is NOT 'change " +
+      "the size or the angle', because that is precisely what the engine has already tried on every " +
+      "rung of the ladder on the author's behalf — it points at the one control that is left, " +
+      "'Shoot from this view', which is on screen and enabled. Fourth, it is a NOTE and not a " +
+      "refusal: nothing is disabled, no shot is removed, and the cut still plays",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-clip']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-shoot-here']", 1],
+        // Three warnings, one list: the jump cut the cut already had, plus the two shots the
+        // planner could not place. A second box for the world's half would fail this claim.
+        ["[data-testid='cutscene-problem']", 3],
+      ],
+      text_present: [
+        "shot 2 has nowhere good to film from",
+        "the engine tried every framing and angle",
+        "78% of the subject is behind something else",
+        "shot 3 has nowhere good to film from",
+        "most of the frame is whatever the camera is standing against",
+        "Shoot from this view",
+        "jump cut",
+      ],
+      // The engine's own vocabulary. (That the card sentences never say "change the size or the
+      // angle" is asserted in `animation/src/shot.rs`, where it can be checked against the sentence
+      // alone — the jump-cut warning on this same cut says exactly that, correctly, so a claim over
+      // the whole panel's text could not tell the two apart.)
+      text_absent: ["acceptable", "vantage", "eye_inside", "crowded", "null", "undefined", "NaN"],
+      enabled: ["[data-testid='cutscene-shoot-here']"],
+      unclipped: ["[data-testid='cutscene-problem']"],
+    },
+    render: () => (
+      <CutscenePanel
+        client={cutsceneClientWithProblems([
+          "shot 2 has nowhere good to film from — the engine tried every framing and angle, and in the best one it found 78% of the subject is behind something else; frame it yourself with \"Shoot from this view\", or film a different part",
+          "shot 3 has nowhere good to film from — the engine tried every framing and angle, and in the best one it found most of the frame is whatever the camera is standing against rather than the subject; frame it yourself with \"Shoot from this view\", or film a different part",
         ])}
       />
     ),

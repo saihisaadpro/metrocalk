@@ -808,8 +808,23 @@ impl Cutscene {
     /// Everything wrong with this cutscene, in the author's language. The continuity checks are the
     /// part no mainstream tool ships: an engine that knows film grammar can warn about a jump cut, and
     /// a warning is cheaper than a viewer noticing.
+    ///
+    /// Subjects are named by their key, which is a fact about the document and not a word an author
+    /// has ever seen. Use [`Self::problems_named`] wherever a display name can be resolved.
     #[must_use]
     pub fn problems(&self) -> Vec<String> {
+        self.problems_named(&|_| None)
+    }
+
+    /// The same list, with each shot's subject resolved to a display name by the caller — the exact
+    /// pairing `reply_for` and `reply_with_names` already keep for the shot sentences.
+    ///
+    /// A cutscene stores `ShotRecipe::subject` as an entity key (`"412_3"`), so the jump-cut warning
+    /// used to read *shots on "412_3" are framed identically*: the one line in the whole panel written
+    /// in the document's vocabulary instead of the author's. The names live in the shell, which is why
+    /// this is a parameter and not a lookup.
+    #[must_use]
+    pub fn problems_named(&self, subject_name: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
         let mut out = Vec::new();
         if self.shots.len() > MAX_SHOTS {
             out.push(format!(
@@ -849,7 +864,7 @@ impl Cutscene {
         // camera those two fields are inert, so comparing them would report a jump cut between two
         // completely different hand-framed views and stay silent about two identical ones. The
         // continuity check has to read the same thing the camera does or it is checking a decoration.
-        for pair in self.shots.windows(2) {
+        for (first, pair) in self.shots.windows(2).enumerate() {
             let (a, b) = (&pair[0], &pair[1]);
             if a.subject != b.subject {
                 continue;
@@ -861,11 +876,21 @@ impl Cutscene {
                 _ => false,
             };
             if identical {
-                out.push(format!(
-                    "shots on \"{}\" are framed identically back to back — that reads as a jump cut; \
-                     change the size or the angle",
-                    a.subject
-                ));
+                // WHICH shots, always — the numbers are what the author needs to reach the control,
+                // and they are the half of this sentence that never depends on a name being
+                // resolvable. Four identical shots produce three warnings; naming only the subject
+                // made all three byte-identical and none of them said where to look.
+                let (m, n) = (first + 1, first + 2);
+                out.push(match subject_name(&a.subject) {
+                    Some(who) => format!(
+                        "shots {m} and {n} on \"{who}\" are framed identically back to back — that \
+                         reads as a jump cut; change the size or the angle"
+                    ),
+                    None => format!(
+                        "shots {m} and {n} are framed identically back to back — that reads as a \
+                         jump cut; change the size or the angle"
+                    ),
+                });
             }
         }
         // No establishing shot: opening tight leaves the viewer lost. A placed opener is exempt for
@@ -993,6 +1018,80 @@ pub fn placed_camera_problems(
                      against"
                 )
             });
+        }
+    }
+    out
+}
+
+/// What the WORLD has to say about the shots whose cameras the engine chose — the other half of
+/// [`placed_camera_problems`], and the larger one.
+///
+/// **Why this is separate from `placed_camera_problems`, and why the sentences differ.** They report
+/// the same three faults from opposite situations, and the situation is what makes the message
+/// actionable. A placed camera is a pose the author framed by eye and the engine promised not to touch,
+/// so "your camera is in a wall" sends them to move the tripod they put there. A card shot has no
+/// camera the author can point at: [`plan_shot`] chose the placement, and by the time this can fire it
+/// has already tried **every framing and every yaw on the ladder** and found nothing
+/// [`Vantage::acceptable`] — so telling that author to change the size or the angle would be advice
+/// the engine has already taken, fifty-four times, on their behalf. The only fixes left are outside the
+/// card: frame it by hand, or film something else.
+///
+/// **It can only fire on the least-bad path.** Every other exit from [`plan_shot`] returns a placement
+/// the world did not object to, or the identity adjustment carrying [`Vantage::OPEN`]. So an
+/// unacceptable [`ShotAdjustment::settled`] is *by construction* the case where the whole ladder was
+/// walked and nothing survived it — which is what licenses the sentences to say so.
+///
+/// `settled` is the caller's plan for shot `index`, normally the same [`ShotAdjustment`] the runtime
+/// will film with. `None` means the caller did not measure this shot, and nothing is said about it —
+/// the same fail-quiet contract [`plan_shot`] keeps for a world with no occlusion data.
+///
+/// Never blocking, never corrective: one line per shot, worst fault first, because a camera buried in a
+/// machine cannot see its subject either and saying both is saying the same thing twice.
+#[must_use]
+pub fn card_shot_problems(
+    cut: &Cutscene,
+    mut settled: impl FnMut(usize, &ShotRecipe) -> Option<ShotAdjustment>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (index, shot) in cut.shots.iter().enumerate() {
+        // A placed camera is the other function's business, and asking here would report the
+        // planner's untouched identity adjustment as a clean bill of health for a pose it never judged.
+        if shot.camera.is_some_and(|camera| camera.is_usable()) {
+            continue;
+        }
+        let Some(plan) = settled(index, shot) else {
+            continue;
+        };
+        let vantage = plan.settled;
+        if vantage.acceptable() {
+            continue;
+        }
+        let n = index + 1;
+        // ONE LEAD, THREE SPECIFICS, and the lead is the half that matters. What the author must
+        // learn is that the search has already been done — otherwise the obvious response to any of
+        // these is to try another size, which is the fifty-four things the engine just tried. The
+        // specific fault is about the placement it SETTLED on, and the wording says so rather than
+        // claiming every rejected candidate failed the same way; they did not, and the difference
+        // would be a sentence the engine cannot support.
+        let lead = format!("shot {n} has nowhere good to film from — the engine tried every framing \
+                            and angle, and");
+        let out_of = "frame it yourself with \"Shoot from this view\", or film a different part";
+        if vantage.eye_inside {
+            out.push(format!(
+                "{lead} in the best one it found the camera is inside something, so those frames \
+                 will be solid colour; {out_of}"
+            ));
+        } else if vantage.clear < MIN_CLEAR_FRACTION {
+            let hidden = (1.0 - vantage.clear.clamp(0.0, 1.0)) * 100.0;
+            out.push(format!(
+                "{lead} in the best one it found {hidden:.0}% of the subject is behind something \
+                 else; {out_of}"
+            ));
+        } else if vantage.crowded > MAX_CROWDED_FRACTION {
+            out.push(format!(
+                "{lead} in the best one it found most of the frame is whatever the camera is \
+                 standing against rather than the subject; {out_of}"
+            ));
         }
     }
     out
@@ -1379,7 +1478,8 @@ impl ShotPlayback {
 /// What the world reports about one candidate camera placement. Both fractions are in `0..=1`, and all
 /// three are cheap for an engine holding a scene BVH to answer together — which is why this is one reply
 /// rather than three queries.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Vantage {
     /// The camera stands inside — or within touching distance of — geometry that is not its subject.
     /// This is the outright disqualifier: it is what a solid-colour frame looks like from the outside.
@@ -1435,6 +1535,19 @@ impl Vantage {
             return f32::NEG_INFINITY;
         }
         self.clear + self.backing * BACKING_WEIGHT - self.crowded * CROWDING_WEIGHT
+    }
+}
+
+/// [`Vantage::OPEN`], and written by hand because the DERIVED default would be the opposite reading.
+///
+/// A derived `Default` is all-zeroes — `clear: 0.0`, which is "the subject is completely blocked", the
+/// single worst verdict this type can carry. Everything downstream of an unmeasured placement (a
+/// document saved before the field existed, a caller with no occlusion data) would then read as the
+/// most alarming thing the engine can say, and the whole vocabulary is built the other way round: a
+/// caller that cannot answer hands back `OPEN` and nothing changes.
+impl Default for Vantage {
+    fn default() -> Self {
+        Self::OPEN
     }
 }
 
@@ -1501,16 +1614,30 @@ pub struct ShotAdjustment {
     /// placement was used as written — reported so a run can say how much of its direction survived
     /// contact with the scene.
     pub steps: u8,
+    /// WHAT THE WORLD SAID ABOUT THE PLACEMENT THIS ADJUSTMENT SETTLED ON, at its worst moment.
+    ///
+    /// The negotiation's own verdict on its own answer, carried out of the search instead of being
+    /// thrown away inside it. [`plan_shot`] scores fifty-four placements and, when none of them is
+    /// [`Vantage::acceptable`], films the least bad — a decision that is right (a shot has to be filmed
+    /// from somewhere) and was, until this field existed, completely silent: the run recorded it in a
+    /// developer diagnostic and the author found out weeks later, from the file.
+    ///
+    /// [`Vantage::OPEN`] is the unmeasured reading — the identity adjustment, a placed camera the
+    /// planner returns untouched, or a caller with no occlusion data — and it is acceptable, so nothing
+    /// downstream ever warns about a placement nobody looked at.
+    #[serde(default)]
+    pub settled: Vantage,
 }
 
 impl ShotAdjustment {
-    /// The identity adjustment for one shot — its own authored size, no yaw change.
+    /// The identity adjustment for one shot — its own authored size, no yaw change, and no verdict.
     #[must_use]
     pub fn authored(shot: &ShotRecipe) -> Self {
         Self {
             size: shot.size,
             yaw_offset_deg: 0.0,
             steps: 0,
+            settled: Vantage::OPEN,
         }
     }
 
@@ -1656,10 +1783,11 @@ pub fn plan_shot(
         #[allow(clippy::cast_precision_loss)] // at most five steps exist
         let widening_cost = widened as f32 * WIDENING_PENALTY;
         for yaw in YAW_LADDER_DEG {
-            let candidate = ShotAdjustment {
+            let mut candidate = ShotAdjustment {
                 size,
                 yaw_offset_deg: yaw,
                 steps,
+                settled: Vantage::OPEN,
             };
             steps = steps.saturating_add(1);
             // The worst moment of the move decides. A candidate is only as good as the frame the
@@ -1671,8 +1799,17 @@ pub fn plan_shot(
                 let pose = solve_shot_adjusted(shot, candidate, subject, progress, aspect, fov_deg);
                 let vantage = look(&pose, progress);
                 all_acceptable &= vantage.acceptable();
-                worst_score = worst_score.min(vantage.score());
                 worst_backing = worst_backing.min(vantage.backing);
+                // The verdict is kept, not just the number derived from it. `worst_score` is what the
+                // ranking uses; `settled` is what the author is told, and "your camera is buried" and
+                // "your subject is behind something" are different sentences a single float cannot
+                // tell apart. Selected by the SAME comparison, so the moment that decided the ranking
+                // is the moment that gets described.
+                let score = vantage.score();
+                if score < worst_score {
+                    worst_score = score;
+                    candidate.settled = vantage;
+                }
             }
             if !all_acceptable {
                 // Rank it anyway. A shot has to be filmed from somewhere, and "the best of a bad set"
@@ -2656,6 +2793,7 @@ mod tests {
                     size: s.size,
                     yaw_offset_deg: yaw,
                     steps: 1,
+                    settled: Vantage::OPEN,
                 },
                 cube(),
                 0.5,
@@ -3470,5 +3608,256 @@ mod tests {
         assert_eq!(said.len(), 2, "{said:?}");
         assert!(said[0].starts_with("shot 2's"), "{said:?}");
         assert!(said[1].starts_with("shot 3's"), "{said:?}");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-197 — the negotiation's own verdict, said out loud.
+    // ---------------------------------------------------------------------------------------------
+
+    /// A world that answers the same thing everywhere, so the ladder cannot escape it. `plan_shot`
+    /// then walks all fifty-four rungs and comes back with the least bad — which is the whole
+    /// situation this vocabulary exists to describe.
+    fn a_world_that_is_always(vantage: Vantage) -> impl FnMut(&CameraSample, f32) -> Vantage {
+        move |_: &CameraSample, _: f32| vantage
+    }
+
+    /// The plan for each shot of a cut, negotiated against `world` — what the shell hands
+    /// [`card_shot_problems`], computed the way the runtime computes it.
+    fn plans_of(
+        cut: &Cutscene,
+        mut world: impl FnMut(&CameraSample, f32) -> Vantage,
+    ) -> Vec<Option<ShotAdjustment>> {
+        cut.shots
+            .iter()
+            .map(|shot| Some(plan_shot(shot, cube(), 16.0 / 9.0, 50.0, &mut world)))
+            .collect()
+    }
+
+    /// Everywhere is inside a machine — the world that leaves the ladder nothing to find.
+    const NOWHERE_TO_STAND: Vantage = Vantage {
+        eye_inside: true,
+        clear: 0.0,
+        backing: 0.0,
+        crowded: 1.0,
+    };
+
+    #[test]
+    fn an_open_world_has_nothing_to_say_about_a_negotiated_placement() {
+        // THE NEGATIVE CONTROL. Every message below must be caused by the world objecting to every
+        // placement on the ladder, not by a card shot merely existing.
+        let cut = cut_of(vec![shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold)]);
+        let plans = plans_of(&cut, |_, _| Vantage::OPEN);
+        assert!(card_shot_problems(&cut, |i, _| plans[i]).is_empty());
+    }
+
+    #[test]
+    fn the_identity_adjustment_carries_no_verdict_and_so_reports_nothing() {
+        // A caller that never measured must be indistinguishable from one that measured and found
+        // nothing wrong. This is why `Vantage`'s `Default` is written by hand: the DERIVED one is
+        // `clear: 0.0`, which would make every unmeasured shot shout.
+        assert_eq!(Vantage::default(), Vantage::OPEN);
+        let cut = cut_of(vec![shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold)]);
+        let authored = ShotAdjustment::authored(&cut.shots[0]);
+        assert!(authored.settled.acceptable());
+        assert!(card_shot_problems(&cut, |_, _| Some(authored)).is_empty());
+        // And an unanswered shot is silent rather than assumed good OR assumed bad.
+        assert!(card_shot_problems(&cut, |_, _| None).is_empty());
+    }
+
+    #[test]
+    fn the_plan_carries_the_verdict_of_the_placement_it_actually_settled_on() {
+        // The field is only worth anything if it describes THE FILMED PLACEMENT. Checked by re-asking
+        // the same world about the pose `solve_shot_adjusted` produces for the plan that came back.
+        let s = shot(ShotSize::Close, ShotAngle::Front, ShotMove::PushIn);
+        let hostile = Vantage {
+            eye_inside: false,
+            clear: 0.15,
+            backing: 0.4,
+            crowded: 0.0,
+        };
+        let plan = plan_shot(&s, cube(), 16.0 / 9.0, 50.0, a_world_that_is_always(hostile));
+        assert!(!plan.settled.acceptable(), "{plan:?}");
+        assert_eq!(plan.settled, hostile, "{plan:?}");
+        let filmed = solve_shot_adjusted(&s, plan, cube(), 0.5, 16.0 / 9.0, 50.0);
+        let mut world = a_world_that_is_always(hostile);
+        assert_eq!(world(&filmed, 0.5), plan.settled);
+    }
+
+    #[test]
+    fn the_verdict_describes_the_worst_moment_of_the_move_not_the_first() {
+        // A push-in that starts clear and ends buried is a buried shot. `worst_score` already decided
+        // the ranking on that moment; the sentence has to be about the same one.
+        let s = shot(ShotSize::Medium, ShotAngle::Front, ShotMove::PushIn);
+        let plan = plan_shot(&s, cube(), 16.0 / 9.0, 50.0, |_, progress| {
+            if progress >= 1.0 {
+                NOWHERE_TO_STAND
+            } else {
+                Vantage::OPEN
+            }
+        });
+        assert!(plan.settled.eye_inside, "{plan:?}");
+    }
+
+    #[test]
+    fn a_shot_the_planner_cannot_place_anywhere_says_so_and_names_the_shot() {
+        let cut = cut_of(vec![shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold)]);
+        let plans = plans_of(&cut, a_world_that_is_always(NOWHERE_TO_STAND));
+        let said = card_shot_problems(&cut, |i, _| plans[i]);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with("shot 1 has nowhere good to film from"),
+            "{said:?}"
+        );
+        assert!(said[0].contains("the camera is inside something"), "{said:?}");
+        // The advice must be the one that is LEFT. Changing the size or the angle is what the engine
+        // has already done, on every rung of the ladder, on the author's behalf.
+        assert!(said[0].contains("Shoot from this view"), "{said:?}");
+        assert!(!said[0].contains("change the size"), "{said:?}");
+    }
+
+    #[test]
+    fn a_subject_hidden_from_every_angle_reports_how_much_of_it_is_behind_something() {
+        let cut = cut_of(vec![shot(ShotSize::Medium, ShotAngle::Front, ShotMove::Hold)]);
+        let plans = plans_of(
+            &cut,
+            a_world_that_is_always(Vantage {
+                eye_inside: false,
+                clear: 0.25,
+                backing: 0.5,
+                crowded: 0.0,
+            }),
+        );
+        let said = card_shot_problems(&cut, |i, _| plans[i]);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("75% of the subject is behind something else"), "{said:?}");
+    }
+
+    #[test]
+    fn a_placement_that_is_boxed_in_everywhere_says_that_instead() {
+        let cut = cut_of(vec![shot(
+            ShotSize::Close,
+            ShotAngle::Profile,
+            ShotMove::Hold,
+        )]);
+        let plans = plans_of(
+            &cut,
+            a_world_that_is_always(Vantage {
+                eye_inside: false,
+                clear: 1.0,
+                backing: 0.5,
+                crowded: 0.9,
+            }),
+        );
+        let said = card_shot_problems(&cut, |i, _| plans[i]);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("most of the frame is whatever the camera is standing against"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_negotiation_that_succeeded_is_silent_however_far_it_had_to_go() {
+        // THE DISTINCTION THE WHOLE FEATURE RESTS ON. The ladder running is not the fault; the ladder
+        // running OUT is. A shot rescued by a detour is a shot the engine handled, and warning about
+        // it would be advice about controls whose values the author did not choose.
+        let s = shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold);
+        let authored = solve_shot_eased(&s, cube(), 0.0, 16.0 / 9.0, 50.0);
+        let cut = cut_of(vec![s.clone()]);
+        let plans = plans_of(&cut, blob_world(authored.eye, 1.2));
+        let plan = plans[0].expect("planned");
+        assert!(
+            !plan.is_authored(&s),
+            "the fixture must force a detour: {plan:?}"
+        );
+        assert!(plan.settled.acceptable(), "{plan:?}");
+        assert!(card_shot_problems(&cut, |i, _| plans[i]).is_empty());
+    }
+
+    #[test]
+    fn a_placed_camera_is_never_reported_by_this_half() {
+        // Both halves run over the same shot list, so a shot that could be described twice would be.
+        // `plan_shot` returns a placed camera's identity adjustment untouched — an OPEN verdict about
+        // a pose it never judged — and reporting that as a clean bill of health would be worse than
+        // saying nothing at all.
+        let cut = cut_of(vec![placed(ShotMove::Hold, 0.0)]);
+        let plans = plans_of(&cut, a_world_that_is_always(NOWHERE_TO_STAND));
+        assert!(card_shot_problems(&cut, |i, _| plans[i]).is_empty());
+    }
+
+    #[test]
+    fn every_card_shot_in_a_cutscene_is_asked_about_and_numbered() {
+        let cut = cut_of(vec![
+            placed(ShotMove::Hold, 0.0),
+            shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold),
+            shot(ShotSize::Medium, ShotAngle::Profile, ShotMove::Hold),
+        ]);
+        let plans = plans_of(&cut, a_world_that_is_always(NOWHERE_TO_STAND));
+        let said = card_shot_problems(&cut, |i, _| plans[i]);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].starts_with("shot 2 has nowhere good"), "{said:?}");
+        assert!(said[1].starts_with("shot 3 has nowhere good"), "{said:?}");
+    }
+
+    #[test]
+    fn a_plan_survives_a_serde_round_trip_and_an_older_one_reads_as_unmeasured() {
+        let plan = ShotAdjustment {
+            size: ShotSize::Wide,
+            yaw_offset_deg: 30.0,
+            steps: 4,
+            settled: Vantage {
+                eye_inside: false,
+                clear: 0.25,
+                backing: 0.5,
+                crowded: 0.1,
+            },
+        };
+        let json = serde_json::to_string(&plan).expect("serialise");
+        assert!(json.contains("\"settled\""), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ShotAdjustment>(&json).expect("deserialise"),
+            plan
+        );
+        // A record written before the field existed must read as "nobody measured", not as "totally
+        // blocked" — the reason `Vantage: Default` is written by hand.
+        let older: ShotAdjustment =
+            serde_json::from_str(r#"{"size":"wide","yawOffsetDeg":0.0,"steps":0}"#)
+                .expect("deserialise an older plan");
+        assert_eq!(older.settled, Vantage::OPEN);
+    }
+
+    // ── The jump-cut warning names shots, and names its subject only when a name exists ──────────
+
+    #[test]
+    fn the_jump_cut_warning_names_the_two_shots_and_never_leaks_an_entity_key() {
+        let mut a = shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold);
+        a.subject = "412_3".into();
+        let mut b = a.clone();
+        b.id = "shot-2".into();
+        let cut = cut_of(vec![
+            shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold),
+            a,
+            b,
+        ]);
+        let bare = cut.problems();
+        let jump = bare
+            .iter()
+            .find(|p| p.contains("jump cut"))
+            .expect("a jump cut");
+        assert!(
+            jump.starts_with("shots 2 and 3 are framed identically"),
+            "{jump}"
+        );
+        assert!(
+            !bare.iter().any(|p| p.contains("412_3")),
+            "an entity key reached the author: {bare:?}"
+        );
+        let named = cut.problems_named(&|key| (key == "412_3").then(|| "Weld Gun 7".to_string()));
+        assert!(
+            named
+                .iter()
+                .any(|p| p.starts_with("shots 2 and 3 on \"Weld Gun 7\" are framed identically")),
+            "{named:?}"
+        );
     }
 }

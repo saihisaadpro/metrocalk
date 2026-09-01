@@ -844,6 +844,37 @@ export function RenderDialog({
                   : "Each frame is drawn at this size rather than stretched up to it, so it is sharper than the stage and takes longer per frame."}
               </Callout>
             )}
+
+            {/* ADR-197 — WHAT IS WRONG WITH THE CUT, IN FRONT OF THE BUTTON THAT SPENDS AN HOUR ON IT.
+
+                The panel behind this dialog already lists these, and this dialog is a MODAL that
+                covers it. That is the whole argument: the failure this vocabulary exists to prevent
+                is "a shot the engine could not place renders as a solid-colour frame weeks later,
+                and the first thing that says so is the file" — and the click that starts those weeks
+                happens here, with the list that would have said so hidden behind the sheet.
+
+                The same sentences, never a second wording of them: this reads `cut.problems`, which
+                has one producer. A note and not a gate — the author may know exactly why a shot is
+                boxed in and want the render anyway, so "Start render" stays enabled. */}
+            {cut.problems.length > 0 && (
+              <Callout
+                tone="warn"
+                title={
+                  cut.problems.length === 1
+                    ? "One warning about this cut"
+                    : `${cut.problems.length} warnings about this cut`
+                }
+                data-testid="render-problems"
+              >
+                <ul style={{ margin: 0, paddingLeft: space.md, display: "grid", gap: space.xxs }}>
+                  {cut.problems.map((problem, i) => (
+                    // Identical framings emit byte-identical warnings, so the string is not a key.
+                    // eslint-disable-next-line react/no-array-index-key -- see above
+                    <li key={`${problem}-${i}`}>{problem}</li>
+                  ))}
+                </ul>
+              </Callout>
+            )}
           </>
         )}
 

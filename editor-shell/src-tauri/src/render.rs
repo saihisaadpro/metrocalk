@@ -332,6 +332,8 @@ impl SceneState {
     /// over-approximation: it is one BVH walk instead of a mesh raycast per candidate, it can only ever
     /// report a view as *more* blocked than it is, and the planner's acceptance threshold is set below
     /// 1.0 precisely so a handrail's generous box does not veto a shot a viewer would call clear.
+    ///
+    /// [`Self::planned_placement`] is the memoised search built on top of this.
     #[must_use]
     pub fn vantage(
         &self,
@@ -525,6 +527,82 @@ impl SceneState {
             crowded,
         }
     }
+
+    /// ADR-197 — where a CARD shot's camera will actually stand, negotiated against this scene and
+    /// memoised, so an authoring-time diagnostic can ask the question every panel action.
+    ///
+    /// `plan_shot` is a SEARCH: up to fifty-four placements, each judged at five points along its
+    /// move, every judgement a [`Self::vantage`] walk of the scene BVH. Its cheap exit — the authored
+    /// framing is clear AND has something behind it — does not cover a perfectly good shot against an
+    /// empty background, which walks the whole ladder. That is affordable once per shot per film and
+    /// not affordable fifteen times per panel interaction, which is what asking on every cutscene
+    /// reply would cost.
+    ///
+    /// THE MEMO CANNOT BE STALER THAN WHAT IT MEASURED. Its generation is `ids_revision`, which is
+    /// what [`Self::occlusion`] is itself keyed on (deliberately not refitted while a mechanism
+    /// animates), and everything else the answer depends on — the recipe, where the subject is and
+    /// how big it is, the delivery frame — is in the entry's own key. So this returns exactly what an
+    /// unmemoised call would, which is the property the test asserts rather than assumes.
+    pub fn planned_placement(
+        &mut self,
+        shot: &metrocalk_animation::shot::ShotRecipe,
+        sample: metrocalk_animation::shot::SubjectSample,
+        aspect: f32,
+        subject: &std::collections::HashSet<u32>,
+    ) -> metrocalk_animation::shot::ShotAdjustment {
+        if self.cinema_card_plans_revision != Some(self.ids_revision) {
+            self.cinema_card_plans.clear();
+            self.cinema_card_plans_revision = Some(self.ids_revision);
+        }
+        // BOUNDED, because a moving subject makes new keys. `ids_revision` does not move when a pose
+        // does, so an author clicking around a panel while a mechanism animates mints one entry per
+        // shot per millimetre the subject has travelled. Dropped wholesale rather than by age: this is
+        // a memo, so the only cost of forgetting is recomputing, and an LRU here would be more
+        // machinery than the thing it protects.
+        if self.cinema_card_plans.len() >= MAX_MEMOISED_PLACEMENTS {
+            self.cinema_card_plans.clear();
+        }
+        // Formatted rather than hashed so a memo miss is readable in a debugger, and ROUNDED so float
+        // noise in a re-sampled subject that has not moved does not defeat it.
+        let key = format!(
+            "{}|{:?}|{:?}|{:?}|{:.3}|{:.3},{:.3},{:.3}|{:.3},{:.3},{:.3}|{:.3},{:.3},{:.3}|{aspect:.4}",
+            shot.subject,
+            shot.size,
+            shot.angle,
+            shot.motion,
+            shot.amount,
+            sample.center[0],
+            sample.center[1],
+            sample.center[2],
+            sample.half_extent[0],
+            sample.half_extent[1],
+            sample.half_extent[2],
+            sample.forward[0],
+            sample.forward[1],
+            sample.forward[2],
+        );
+        if let Some(plan) = self.cinema_card_plans.get(&key) {
+            return *plan;
+        }
+        let world = &*self;
+        let plan = metrocalk_animation::shot::plan_shot(
+            shot,
+            sample,
+            aspect,
+            CINEMATIC_FOV_DEG,
+            |pose, _| {
+                world.vantage(
+                    pose.eye,
+                    pose.look_at,
+                    sample.center,
+                    sample.radius(),
+                    subject,
+                )
+            },
+        );
+        self.cinema_card_plans.insert(key, plan);
+        plan
+    }
 }
 
 /// Where the presentation ground sits. Slightly under the origin so a model resting exactly on `y = 0`
@@ -653,6 +731,22 @@ fn instance_world_bounds(instance: &Instance, local: LocalBounds) -> (Vec3, Vec3
 /// The viewport's vertical field of view. Named once so the projection and the framing that fits
 /// against it can never disagree — they were two unrelated literals before.
 pub const CAMERA_FOV_DEG: f32 = 55.0;
+
+/// The lens a CARD shot is solved, judged and filmed through — a slightly longer one than the
+/// workspace's, which is what makes a cutscene read as a film rather than as the editor moving.
+///
+/// Named once for the reason above it: it was four unrelated `50.0` literals in `main.rs`, across the
+/// planner (which decides where the camera may stand), the runtime solve (which puts it there) and
+/// the placement record. All four have to be the same number or the planner validates a frame nobody
+/// films — a stand-off fitted to one cone, judged for obstruction along it, and then drawn through
+/// another. A placed camera is not covered by this: it carries its own `fov_deg`, which is the whole
+/// point of placing one.
+pub const CINEMATIC_FOV_DEG: f32 = 50.0;
+
+/// How many negotiated card-shot placements [`SceneState::planned_placement`] remembers before it
+/// forgets all of them. A cutscene holds at most ten shots, so this is roughly twenty-five subject
+/// positions' worth of history — far more than one panel session needs and small enough to be free.
+const MAX_MEMOISED_PLACEMENTS: usize = 256;
 
 /// How the viewport projects the scene.
 ///
@@ -1381,6 +1475,20 @@ pub struct SceneState {
     pub cinema_subtree: std::collections::HashMap<String, Vec<usize>>,
     /// The `ids_revision` [`Self::cinema_subtree`] was built for.
     pub cinema_subtree_revision: u64,
+    /// One card shot's negotiated placement, memoised against [`Self::ids_revision`] — the planner's
+    /// answer, kept so the AUTHORING-TIME diagnostic can be asked on every panel action.
+    ///
+    /// `plan_shot` walks up to fifty-four placements and judges each at five points along its move, so
+    /// a shot whose authored framing is merely under-backed costs 270 [`Self::vantage`] calls against
+    /// the scene BVH — and the warning it feeds is recomputed on every one of the fifteen cutscene
+    /// commands. The verdict is a pure function of `(recipe, subject sample, aspect, occluders)` and
+    /// the occluders are themselves memoised against `ids_revision` (deliberately NOT refitted while a
+    /// mechanism animates), so keying on the same revision is exact rather than approximate: this memo
+    /// cannot be staler than the structure the answer was measured against.
+    pub cinema_card_plans:
+        std::collections::HashMap<String, metrocalk_animation::shot::ShotAdjustment>,
+    /// The `ids_revision` [`Self::cinema_card_plans`] was built for; `None` until something asks.
+    pub cinema_card_plans_revision: Option<u64>,
     /// A broad phase over every published instance's world bounds, for the cinematic camera's occlusion
     /// queries — the structure that lets a shot ask "is anything between me and my subject?".
     ///
@@ -9502,6 +9610,134 @@ mod tests {
         assert!(
             after.acceptable(),
             "the planner returned a placement that is still no good: {after:?} from {plan:?}"
+        );
+    }
+
+    // ── ADR-197 — the negotiated placement, memoised, and what it costs ────────────────────────────
+
+    /// The recipe the memo tests negotiate. A close shot with an empty background: the case that
+    /// walks the WHOLE ladder rather than taking `plan_shot`'s cheap exit, which is the case worth
+    /// memoising and the only one whose cost is worth measuring.
+    fn card_shot() -> metrocalk_animation::shot::ShotRecipe {
+        metrocalk_animation::shot::ShotRecipe {
+            id: "s".into(),
+            subject: "1_1".into(),
+            size: metrocalk_animation::shot::ShotSize::Close,
+            angle: metrocalk_animation::shot::ShotAngle::Profile,
+            motion: metrocalk_animation::shot::ShotMove::PushIn,
+            amount: 0.35,
+            seconds: 2.0,
+            camera: None,
+        }
+    }
+
+    fn card_subject() -> metrocalk_animation::shot::SubjectSample {
+        metrocalk_animation::shot::SubjectSample {
+            center: [0.0; 3],
+            half_extent: [0.5; 3],
+            forward: [0.0, 0.0, 1.0],
+            stage: metrocalk_animation::shot::Stage::OPEN,
+        }
+    }
+
+    #[test]
+    fn the_placement_memo_answers_exactly_what_the_search_does() {
+        // THE PROPERTY, ASSERTED RATHER THAN ASSUMED. A memo that returns a different answer from the
+        // search is a diagnostic that warns about a shot the runtime will film from somewhere else.
+        let mut st = crowded_scene(6);
+        st.sync_occlusion();
+        let cold = metrocalk_animation::shot::plan_shot(
+            &card_shot(),
+            card_subject(),
+            16.0 / 9.0,
+            CINEMATIC_FOV_DEG,
+            |pose, _| {
+                st.vantage(
+                    pose.eye,
+                    pose.look_at,
+                    card_subject().center,
+                    card_subject().radius(),
+                    &subject_only(),
+                )
+            },
+        );
+        let memoised =
+            st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        assert_eq!(cold, memoised, "the memo changed the answer");
+        assert_eq!(st.cinema_card_plans.len(), 1);
+        // And the second ask is the same answer from the map rather than a second search.
+        let warm =
+            st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        assert_eq!(warm, memoised);
+        assert_eq!(st.cinema_card_plans.len(), 1, "a second entry is a memo miss");
+    }
+
+    #[test]
+    fn membership_changing_drops_the_placement_memo_and_a_pose_does_not() {
+        let mut st = crowded_scene(6);
+        st.sync_occlusion();
+        let _ = st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        assert_eq!(st.cinema_card_plans_revision, Some(1));
+
+        // A published pose moves `revision`, and the occluders it was measured against are NOT
+        // refitted for it — so neither is this.
+        st.revision = st.revision.wrapping_add(1);
+        let _ = st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        assert_eq!(st.cinema_card_plans.len(), 1, "a pose must not drop the memo");
+
+        // Membership changing rebuilds the BVH, so every answer measured against the old one goes.
+        st.ids_revision = 2;
+        st.sync_occlusion();
+        let _ = st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        assert_eq!(st.cinema_card_plans_revision, Some(2));
+        assert_eq!(st.cinema_card_plans.len(), 1, "the stale entries survived");
+    }
+
+    #[test]
+    fn a_subject_that_has_moved_is_re_negotiated_and_the_memo_stays_bounded() {
+        // The key carries where the subject is, because that is what the placement is solved around.
+        // `ids_revision` does not move when a pose does, so this is the growth the bound exists for.
+        let mut st = crowded_scene(4);
+        st.sync_occlusion();
+        for step in 0..(MAX_MEMOISED_PLACEMENTS + 8) {
+            #[allow(clippy::cast_precision_loss)]
+            let sample = metrocalk_animation::shot::SubjectSample {
+                center: [step as f32 * 0.01, 0.0, 0.0],
+                ..card_subject()
+            };
+            let _ = st.planned_placement(&card_shot(), sample, 16.0 / 9.0, &subject_only());
+        }
+        assert!(
+            st.cinema_card_plans.len() <= MAX_MEMOISED_PLACEMENTS,
+            "the memo grew without bound: {}",
+            st.cinema_card_plans.len()
+        );
+        assert!(
+            st.cinema_card_plans.len() > 1,
+            "clearing on every insert would make this a memo that never hits"
+        );
+    }
+
+    #[test]
+    fn the_memo_is_what_makes_the_diagnostic_affordable() {
+        // THE NUMBER THE MEMO EXISTS FOR, measured rather than asserted in prose. Not a budget gate —
+        // a debug build on a shared box has no defensible threshold — but the RATIO is structural:
+        // the second ask is a hash lookup and the first is up to 270 BVH walks, so a memo that had
+        // silently stopped hitting would show up here as a ratio near 1.
+        let mut st = crowded_scene(64);
+        st.sync_occlusion();
+        let cold = std::time::Instant::now();
+        let _ = st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        let cold = cold.elapsed();
+        let warm = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = st.planned_placement(&card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        }
+        let warm = warm.elapsed() / 100;
+        eprintln!("ADR-197 placement search: cold {cold:?}, memoised {warm:?}");
+        assert!(
+            warm * 8 < cold,
+            "the memo is not paying for itself: cold {cold:?}, warm {warm:?}"
         );
     }
 
