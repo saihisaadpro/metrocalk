@@ -574,6 +574,11 @@ impl StandAtReply {
         Self {
             message: reason.clone(),
             reason: Some(reason),
+            // NOTHING WAS MEASURED, SO NOTHING MAY BE ALARMING. The derived default here is `false`,
+            // which reads as "the placement the camera was taken to is unacceptable" — about a
+            // camera that did not move. Same discipline as ADR-197's hand-written `Vantage::OPEN`:
+            // an unmeasured reading has to be the quiet one, or every refusal shouts.
+            acceptable: true,
             ..Self::default()
         }
     }

@@ -2212,7 +2212,9 @@ export interface StandAtReply {
   placed: boolean;
   /** How many rungs of the planner's ladder this placement cost. 0 is the shot as directed. */
   steps: number;
-  /** True when the world had no objection to the placement the camera was taken to. */
+  /** True when the world had no objection to the placement the camera was taken to. A refusal sets
+   *  it true as well: nothing was measured, and the quiet reading is the honest one for a camera
+   *  that did not move. */
   acceptable: boolean;
   message: string;
   /** Set iff nothing moved, and says why. */
