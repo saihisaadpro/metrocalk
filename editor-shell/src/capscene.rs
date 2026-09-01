@@ -28,10 +28,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use metrocalk_core::caps::{canonical, display_name, is_standard};
 use metrocalk_core::marketplace::MarketplaceEntry;
-use metrocalk_core::variant::INSTANCE_META;
+use metrocalk_core::variant::{COMPOSITION_FIELD, INSTANCE_META};
 use metrocalk_core::{
-    CapRole, CapabilityResolver, ComponentMeta, Composition, Engine, EntityId, FieldType,
-    FieldValue, Op, PipelineError,
+    CapRole, CapabilityResolver, ComponentMeta, Composition, CompositionNode, Engine, EntityId,
+    FieldType, FieldValue, Op, PipelineError,
 };
 use metrocalk_ecs::rng::Rng;
 use metrocalk_ecs::{Entity, FlecsWorld, World};
@@ -41,6 +41,7 @@ use metrocalk_deform::{ArapConfig, ArapDeformer, DeformMesh, Deformer, Region};
 // M9.2 part editing reuses G1's math (no new gizmo math) — the plain-array `Transform` + the
 // parent-space write-back; glam stays behind the `Gizmo` trait (the public types are arrays).
 use metrocalk_gizmo::{mat_mul, to_local, Transform as GizmoTransform};
+use serde::{Deserialize, Serialize};
 
 use crate::reveal::Rels;
 
@@ -1697,6 +1698,32 @@ fn name_stem(name: &str) -> &str {
     without_index.strip_suffix(" copy").unwrap_or(trimmed)
 }
 
+/// The names already in use among a parent's **live** children — the scope a new row has to be
+/// distinguishable in.
+///
+/// Deactivated siblings are excluded on purpose: a deleted object's name is not a name the outliner
+/// is showing, and holding one hostage would rename the object a Cut→Paste has just put back.
+fn taken_sibling_names(engine: &Engine<FlecsWorld>, parent: Option<EntityId>) -> HashSet<String> {
+    siblings_of(engine, parent)
+        .into_iter()
+        .filter(|&s| engine.is_active(s))
+        .filter_map(|s| entity_name(engine, s))
+        .collect()
+}
+
+/// The name a new sibling can take: **its own**, when nothing live beside it is using that name, and
+/// otherwise the first free `… copy` / `… copy N`.
+///
+/// One rule, two behaviours that both read correctly: a *duplicate* always renames, because the
+/// object it was copied from is right there holding the name; a *cut* pasted back keeps the name it
+/// had, because the thing that held it is gone.
+fn free_sibling_name(source: &str, taken: &mut HashSet<String>) -> String {
+    if taken.insert(source.to_string()) {
+        return source.to_string();
+    }
+    free_copy_name(source, taken)
+}
+
 /// The first free `… copy` / `… copy N` name among `taken`, which is also UPDATED — so a batch of
 /// clones landing under one parent numbers itself instead of colliding N times.
 fn free_copy_name(source: &str, taken: &mut HashSet<String>) -> String {
@@ -1724,7 +1751,7 @@ fn free_copy_name(source: &str, taken: &mut HashSet<String>) -> String {
 /// *inside* the original — one number meaning "beside it" in one scene and "hidden in it" in the
 /// next. The set's own X extent is a size the engine already holds: no renderer, no mesh bounds, and
 /// identical on replay (ADR-013).
-const DUPLICATE_GAP_X: f32 = 1.5;
+const PLACEMENT_GAP_X: f32 = 1.5;
 
 /// The TOP-MOST live members of a selection, plus how many were skipped and how many are gone.
 ///
@@ -1732,7 +1759,7 @@ const DUPLICATE_GAP_X: f32 = 1.5;
 /// or Select all over an imported assembly, and every part is selected along with the folder that
 /// holds it; cloning each selected id in turn would copy every part once inside the folder's copy and
 /// once beside it.
-fn duplicate_roots(
+fn top_most_live_roots(
     engine: &Engine<FlecsWorld>,
     ids: &[EntityId],
 ) -> (Vec<EntityId>, usize, usize) {
@@ -1844,7 +1871,7 @@ pub fn duplicate_selection(
     scene: &CapScene,
     ids: &[EntityId],
 ) -> Result<Duplicated, PipelineError> {
-    let (roots, nested, missing) = duplicate_roots(engine, ids);
+    let (roots, nested, missing) = top_most_live_roots(engine, ids);
     if roots.is_empty() {
         return Ok(Duplicated {
             roots: Vec::new(),
@@ -1862,12 +1889,12 @@ pub fn duplicate_selection(
         .collect();
 
     // How wide the thing being copied is, along the axis it is being offset on. A single childless
-    // object spans 0 and so lands exactly `DUPLICATE_GAP_X` away — the M3.3 placement, unchanged, for
+    // object spans 0 and so lands exactly `PLACEMENT_GAP_X` away — the M3.3 placement, unchanged, for
     // the case that used to be the only one.
     let (min_x, max_x) = nodes.iter().fold((f32::MAX, f32::MIN), |(lo, hi), n| {
         (lo.min(n.world_x), hi.max(n.world_x))
     });
-    let offset = (max_x - min_x) + DUPLICATE_GAP_X;
+    let offset = (max_x - min_x) + PLACEMENT_GAP_X;
 
     // Sibling names, read once per distinct parent: duplicating 378 parts under one assembly scans
     // that assembly's children once, not 378 times.
@@ -1909,13 +1936,10 @@ pub fn duplicate_selection(
             // already what distinguishes it — `Fixing copy › Bolt` reads correctly, and
             // `Fixing copy › Bolt copy` does not.
             if let Some(name) = entity_name(engine, node.src) {
-                let taken = names_by_parent.entry(parent).or_insert_with(|| {
-                    siblings_of(engine, parent)
-                        .into_iter()
-                        .filter_map(|s| entity_name(engine, s))
-                        .collect()
-                });
-                let fresh = free_copy_name(&name, taken);
+                let taken = names_by_parent
+                    .entry(parent)
+                    .or_insert_with(|| taken_sibling_names(engine, parent));
+                let fresh = free_sibling_name(&name, taken);
                 ops.push(Op::SetField {
                     entity: node.new,
                     component: INSTANCE_META.into(),
@@ -2299,43 +2323,374 @@ pub fn delete_deactivate_many(
     engine.commit("delete-deactivate", ops)
 }
 
-/// **COPY** — snapshot a sub-tree's **resolved** state (components + overrides + active flags) to a
-/// portable clipboard value, reusing the variant [`Composition`] machinery (no new model — pure read).
-/// The [`Composition`] is `serde`, so a clipboard captured in one project pastes into another
-/// (**cross-project**), same-process or serialized.
-#[must_use]
-pub fn copy_subtree(engine: &Engine<FlecsWorld>, root: EntityId, clip_id: &str) -> Composition {
-    engine.save_composition(root, clip_id)
-}
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+// THE CLIPBOARD (ADR-198) — copy · cut · paste over a SELECTION, and a paste that lands somewhere.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════
 
-/// **PASTE** a copied [`Composition`] under **fresh deterministic ids** ([`Engine::alloc_entity_id`]) — ONE
-/// undoable transaction (undo removes the whole pasted sub-tree). Deterministic ids ⇒ a replayed paste
-/// lands byte-identical (ADR-013). Works across projects (the [`Composition`] is the only thing that
-/// crosses — never a stale id). Returns the new root.
+/// The [`Composition::id`] a clipboard entry carries. It is not a marketplace asset id: nothing indexes
+/// it, and a paste writes the SOURCE's own composition link back instead of this one — so a copied
+/// instance stays an instance of the asset it came from rather than of "the clipboard".
+const CLIPBOARD_ID: &str = "clipboard";
+
+/// The capability pairs one node carries, by **canonical name**.
 ///
-/// # Errors
-/// [`PipelineError`] if the instantiate transaction fails.
-pub fn paste_composition(
-    engine: &mut Engine<FlecsWorld>,
-    comp: &Composition,
-) -> Result<EntityId, PipelineError> {
-    engine.instantiate_composition(comp)
+/// Names rather than interned handles, because a clipboard is allowed to cross a project boundary (the
+/// [`Composition`] beside them is `serde` for exactly that reason) and a handle is meaningless in
+/// another world. [`CapScene::caps`] resolves a name back on the way in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCaps {
+    pub provides: Vec<String>,
+    pub requires: Vec<String>,
 }
 
-/// **CUT** — copy a sub-tree to the clipboard, then **delete (deactivate)** the source (non-destructive, so
-/// the data is preserved on the clipboard AND recoverable via undo). Returns the clipboard [`Composition`].
+/// One copied ROOT and everything under it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClipEntry {
+    /// The subtree's resolved state, pre-order — the same [`Composition`] the variant/marketplace
+    /// machinery already uses, so the clipboard adds a *shape*, not a second model.
+    pub composition: Composition,
+    /// The capability pairs of each node, indexed exactly like [`Composition::nodes`] (both come from
+    /// `Engine::instance_nodes`, so the two orders cannot drift).
+    ///
+    /// A `Composition` carries components and not pairs, so a paste built on it alone arrived with no
+    /// `Requires`/`Provides` at all — and the M3.1 reveal, the product's headline gesture, had nothing
+    /// to offer for the pasted object. `duplicate_selection` copies the pairs; paste did not, and the
+    /// two are the same verb with a clipboard in between.
+    pub caps: Vec<NodeCaps>,
+    /// The loro key of the parent the source sat under (`None` = the top level), so a paste lands back
+    /// in the assembly it was copied out of rather than at the root of the scene.
+    ///
+    /// A key and not an [`EntityId`]: a clipboard that has crossed into another project must be
+    /// obviously stale rather than silently aliasing whatever that project put at the same id. The
+    /// paste checks the parent is live and falls back to the top level when it is not.
+    pub parent: Option<String>,
+    /// The composition this subtree was itself instantiated from, if any — carried across so a copy of
+    /// an instance is still an instance of the same asset (M9.2 deliverable 4: the link is never lost).
+    pub source_composition: Option<String>,
+}
+
+/// **What a copy or a cut put on the clipboard**: one entry per selected root, and how it got there.
+///
+/// The clipboard held a single [`Composition`] until ADR-198 — so `Copy` over a selection of fourteen
+/// copied one of them, exactly the way `Duplicate` cloned one of them before ADR-196.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Clipboard {
+    /// One per copied root, in the order the selection gave them.
+    pub entries: Vec<ClipEntry>,
+    /// Whether the source was **cut** rather than copied — which is what makes the first paste land
+    /// where the objects were instead of beside them. A cut and a paste is a MOVE, and a move that
+    /// puts the object down 1.5 m from where it was picked up is not a move.
+    pub cut: bool,
+}
+
+impl Clipboard {
+    /// Whether there is anything to paste.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// How many objects a paste would produce — the number a menu row can put beside its own label.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// What a copy took, and what it could not.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Copied {
+    pub clipboard: Clipboard,
+    /// Requested ids skipped because an ancestor of theirs was selected too (they came along inside it).
+    pub nested: usize,
+    /// Requested ids that are no longer live.
+    pub missing: usize,
+}
+
+/// What a paste made.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pasted {
+    /// The root of each pasted subtree, in clipboard order — what to select for the person.
+    pub roots: Vec<EntityId>,
+    /// Every entity created, roots and descendants — what it cost the document.
+    pub created: Vec<EntityId>,
+}
+
+/// Entity → its canonical capability name, inverted from [`CapScene::caps`] once per copy.
+fn canonical_cap_names(scene: &CapScene) -> HashMap<Entity, &str> {
+    scene
+        .caps
+        .iter()
+        .map(|(name, &handle)| (handle, name.as_str()))
+        .collect()
+}
+
+/// **COPY a selection to the clipboard** — every selected object with everything under it, as a
+/// portable value. A pure read: nothing is committed and nothing in the document changes.
+///
+/// The reduction to top-most roots is [`duplicate_selection`]'s, for the same reason: a marquee over a
+/// group selects the folder *and* its parts, and copying each in turn would paste every part twice.
+#[must_use]
+pub fn copy_selection(
+    engine: &Engine<FlecsWorld>,
+    scene: &CapScene,
+    ids: &[EntityId],
+    cut: bool,
+) -> Copied {
+    let (roots, nested, missing) = top_most_live_roots(engine, ids);
+    let cap_names = canonical_cap_names(scene);
+    let entries = roots
+        .iter()
+        .map(|&root| {
+            let composition = engine.save_composition(root, CLIPBOARD_ID);
+            let caps = engine
+                .instance_nodes(root)
+                .into_iter()
+                .map(|(eid, _path)| node_caps(engine, scene, &cap_names, eid))
+                .collect();
+            ClipEntry {
+                composition,
+                caps,
+                parent: engine.parent_of(root).map(|p| p.to_loro_key()),
+                source_composition: engine.composition_of(root),
+            }
+        })
+        .collect();
+    Copied {
+        clipboard: Clipboard { entries, cut },
+        nested,
+        missing,
+    }
+}
+
+/// One entity's `Provides` / `Requires` pairs, by canonical name.
+fn node_caps(
+    engine: &Engine<FlecsWorld>,
+    scene: &CapScene,
+    cap_names: &HashMap<Entity, &str>,
+    id: EntityId,
+) -> NodeCaps {
+    let Some(ecs) = engine.ecs_entity(id) else {
+        return NodeCaps::default();
+    };
+    let named = |rel: Entity| -> Vec<String> {
+        engine
+            .world()
+            .targets(ecs, rel)
+            .into_iter()
+            .filter_map(|c| cap_names.get(&c).map(|n| (*n).to_string()))
+            .collect()
+    };
+    NodeCaps {
+        provides: named(scene.rels.provides),
+        requires: named(scene.rels.requires),
+    }
+}
+
+/// **CUT a selection** — copy it to the clipboard, then delete (deactivate) the sources as ONE
+/// undoable transaction. Non-destructive both ways: the data is on the clipboard *and* recoverable
+/// with Ctrl-Z. Returns the clipboard and the ids that actually went.
 ///
 /// # Errors
 /// [`PipelineError`] if the delete transaction fails.
-pub fn cut_subtree(
+pub fn cut_selection(
     engine: &mut Engine<FlecsWorld>,
     scene: &CapScene,
-    root: EntityId,
-    clip_id: &str,
-) -> Result<Composition, PipelineError> {
-    let clip = engine.save_composition(root, clip_id);
-    delete_deactivate(engine, scene, root)?;
-    Ok(clip)
+    ids: &[EntityId],
+) -> Result<(Copied, Vec<EntityId>), PipelineError> {
+    let copied = copy_selection(engine, scene, ids, true);
+    // The top-most roots, not the raw ids: deactivating a child whose parent is going too is a second
+    // statement of the same delete, and the caller is about to report a count.
+    let (roots, _, _) = top_most_live_roots(engine, ids);
+    if roots.is_empty() {
+        return Ok((copied, Vec::new()));
+    }
+    delete_deactivate_many(engine, scene, &roots)?;
+    Ok((copied, roots))
+}
+
+/// A node's own `Transform.x` inside a [`Composition`], or 0.0 — the clipboard's copy of [`local_x`].
+fn clip_local_x(node: &CompositionNode) -> f32 {
+    node.components
+        .get("Transform")
+        .and_then(|t| t.get("x"))
+        .map_or(0.0, |v| match v {
+            FieldValue::Number(n) => *n as f32,
+            FieldValue::Integer(i) => *i as f32,
+            _ => 0.0,
+        })
+}
+
+/// Every clipboard node's X relative to the set's own origin, entry by entry, in `nodes` order.
+///
+/// The nodes are pre-order (parent before child), so one forward pass accumulates each node's offset
+/// from its parent — the same translation-only reading [`plan_clone_nodes`] takes, and the same
+/// caveat: it sizes a placement gap, never a measurement.
+fn clip_world_xs(entry: &ClipEntry) -> Vec<f32> {
+    let mut xs: Vec<f32> = Vec::with_capacity(entry.composition.nodes.len());
+    for node in &entry.composition.nodes {
+        let own = clip_local_x(node);
+        xs.push(match node.parent {
+            Some(pi) => xs[pi] + own,
+            None => own,
+        });
+    }
+    xs
+}
+
+/// **PASTE the clipboard** — every entry on it, under fresh deterministic ids, as ONE undoable
+/// transaction (invariant 3). Returns what was made.
+///
+/// Three things a paste has to decide, and each of them used to have the wrong answer:
+///
+/// 1. **Where it lands.** The composition bakes the source's resolved `Transform`, so a paste arrived
+///    at exactly the source's coordinates — one object hidden inside another, under a toast reading
+///    "pasted". It now clears the set's own extent the way a duplicate does, and `step` steps it on
+///    again for each paste of the same clipboard, so pasting three times makes three objects rather
+///    than three coincident ones. **A CUT pastes at step 0 exactly where it was**: a cut and a paste
+///    is a move, and the source is already gone from view.
+/// 2. **What it is called.** A copy of `Bolt` becomes `Bolt copy` beside it; a *cut* `Bolt` pasted
+///    back keeps its own name, because nothing live is using it any more.
+/// 3. **Where it belongs.** The old paste created every root with `parent: None`, so a part copied out
+///    of an assembly reappeared at the top of the scene. It now lands back under the parent it was
+///    copied from, when that parent is still live in this document.
+///
+/// # Errors
+/// [`PipelineError`] if the commit fails. An empty clipboard is not an error — it makes nothing.
+pub fn paste_clipboard(
+    engine: &mut Engine<FlecsWorld>,
+    scene: &CapScene,
+    clip: &Clipboard,
+    step: usize,
+) -> Result<Pasted, PipelineError> {
+    if clip.is_empty() {
+        return Ok(Pasted::default());
+    }
+
+    // How wide the whole clipboard is along the axis it is offset on — one number for the set, so the
+    // arrangement between the pasted roots is the arrangement between their sources.
+    let per_entry: Vec<Vec<f32>> = clip.entries.iter().map(clip_world_xs).collect();
+    let (min_x, max_x) = per_entry
+        .iter()
+        .flatten()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+    // A cut pastes back in place the first time (it is a move); a copy always clears its source.
+    let steps = if clip.cut { step } else { step + 1 };
+    let offset = ((max_x - min_x) + PLACEMENT_GAP_X) * steps as f32;
+
+    // Sibling names read once per distinct target parent — a paste of 378 parts under one assembly
+    // scans that assembly's children once, not 378 times.
+    let mut names_by_parent: HashMap<Option<EntityId>, HashSet<String>> = HashMap::new();
+    let mut ops: Vec<Op> = Vec::new();
+    let mut roots: Vec<EntityId> = Vec::new();
+    let mut created: Vec<EntityId> = Vec::new();
+
+    for (entry, world_xs) in clip.entries.iter().zip(&per_entry) {
+        // The parent it was copied out of, when this document still has it. A stale key (another
+        // project, or a parent since destroyed) lands the paste at the top level rather than under
+        // whatever happens to hold that id here.
+        let target_parent = entry
+            .parent
+            .as_deref()
+            .and_then(EntityId::from_loro_key)
+            .filter(|p| engine.ecs_entity(*p).is_some());
+
+        let mut ids: Vec<EntityId> = Vec::with_capacity(entry.composition.nodes.len());
+        for (i, node) in entry.composition.nodes.iter().enumerate() {
+            let id = engine.alloc_entity_id();
+            ids.push(id);
+            created.push(id);
+            let is_root = node.parent.is_none();
+            let parent = match node.parent {
+                Some(pi) => Some(ids[pi]),
+                None => target_parent,
+            };
+            ops.push(Op::CreateEntity { id, parent });
+
+            for (component, fields) in &node.components {
+                for (field, value) in fields {
+                    ops.push(Op::SetField {
+                        entity: id,
+                        component: component.clone(),
+                        field: field.clone(),
+                        value: value.clone(),
+                    });
+                }
+            }
+
+            if is_root {
+                roots.push(id);
+                // After the copied fields, so this write wins.
+                ops.push(Op::SetField {
+                    entity: id,
+                    component: "Transform".into(),
+                    field: "x".into(),
+                    value: FieldValue::Number(f64::from(world_xs[i] + offset)),
+                });
+                if let Some(name) = clip_name(node) {
+                    let taken = names_by_parent
+                        .entry(parent)
+                        .or_insert_with(|| taken_sibling_names(engine, parent));
+                    let fresh = free_sibling_name(&name, taken);
+                    ops.push(Op::SetField {
+                        entity: id,
+                        component: INSTANCE_META.into(),
+                        field: NAME_FIELD.into(),
+                        value: FieldValue::Str(fresh),
+                    });
+                }
+                if let Some(source) = &entry.source_composition {
+                    ops.push(Op::SetField {
+                        entity: id,
+                        component: INSTANCE_META.into(),
+                        field: COMPOSITION_FIELD.into(),
+                        value: FieldValue::Str(source.clone()),
+                    });
+                }
+            }
+
+            if !node.active {
+                ops.push(Op::SetActive {
+                    entity: id,
+                    active: false,
+                });
+            }
+
+            // The capability pairs, resolved from canonical names — so a pasted requirer is a
+            // requirer, and the reveal has something to say about it.
+            if let Some(caps) = entry.caps.get(i) {
+                for name in &caps.provides {
+                    if let Some(&target) = scene.caps.get(name) {
+                        ops.push(Op::AddPair {
+                            entity: id,
+                            rel: scene.rels.provides,
+                            target,
+                        });
+                    }
+                }
+                for name in &caps.requires {
+                    if let Some(&target) = scene.caps.get(name) {
+                        ops.push(Op::AddPair {
+                            entity: id,
+                            rel: scene.rels.requires,
+                            target,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    engine.commit("paste", ops)?;
+    Ok(Pasted { roots, created })
+}
+
+/// The user-facing name baked into a clipboard node, if it has one.
+fn clip_name(node: &CompositionNode) -> Option<String> {
+    match node.components.get(INSTANCE_META).and_then(|m| m.get(NAME_FIELD)) {
+        Some(FieldValue::Str(s)) => Some(s.clone()),
+        _ => None,
+    }
 }
 
 /// Describe-to-create, end to end (local tier): resolve `query` over the stdlib and, on a confident

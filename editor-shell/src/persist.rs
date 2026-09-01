@@ -315,6 +315,25 @@ pub enum Record {
     /// `duplicate_selection` from the same document, which allocates the same ids in the same order
     /// and lands them at the same offset (ADR-013).
     DuplicateMany { sources: Vec<String> },
+    /// **A paste** (ADR-198): the whole clipboard, plus which step of it this paste was.
+    ///
+    /// Copy, cut and paste had **no record at all** — the three verbs were commits to the Loro doc,
+    /// which an explicit `.mtk` save persists, and invisible to the in-session replay log that
+    /// restores a scene on reopen. So a pasted object vanished on the next launch, and a cut object
+    /// came back. (The cut half is now a `DeleteDeactivateMany` like any other delete; only the paste
+    /// needed a record of its own.)
+    ///
+    /// The whole [`Clipboard`](crate::capscene::Clipboard) is kept rather than the source ids, and
+    /// that is the difference between this record and [`Record::DuplicateMany`]: a duplicate
+    /// re-derives its copies from objects the document still has, while a paste's source may have
+    /// been cut away, deleted, or opened in **another project** — the clipboard is session state, not
+    /// document state, so replaying it means carrying it. `step` is which paste of that clipboard
+    /// this was, which is what puts a second paste beside the first instead of on top of it.
+    Paste {
+        clipboard: crate::capscene::Clipboard,
+        #[serde(default)]
+        step: usize,
+    },
     /// A generation (M6): a grey placeholder + the streamed-in generated mesh **handle**. Replayed by
     /// re-placing the placeholder + re-applying the stored handle as a validated AI patch (the generated
     /// asset is content-addressed — for the deterministic fake it re-resolves; a novel real-provider
@@ -788,6 +807,10 @@ impl Log {
                     !targets.is_empty()
                         && capscene::duplicate_selection(engine, scene, &targets)
                             .is_ok_and(|made| !made.roots.is_empty())
+                }
+                Record::Paste { clipboard, step } => {
+                    capscene::paste_clipboard(engine, scene, &clipboard, step)
+                        .is_ok_and(|made| !made.roots.is_empty())
                 }
                 Record::Generate {
                     prompt: _,

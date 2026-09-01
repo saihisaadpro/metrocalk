@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use metrocalk_core::{Engine, EntityId, FieldValue, Op};
 use metrocalk_ecs::{Entity, FlecsWorld};
 
-use metrocalk_editor_shell::actions::{actions_for, actions_for_selection, Action};
+use metrocalk_editor_shell::actions::{actions_for, actions_for_selection, Action, ActionItem};
 use metrocalk_editor_shell::capscene::{self, CapScene};
 use metrocalk_editor_shell::persist::{Log, Record};
 use metrocalk_editor_shell::reveal::{reveal, Context};
@@ -420,7 +420,7 @@ fn a_selection_scopes_every_verb_and_the_primary_is_the_last_id() {
         index.health_bars[2],
     ];
 
-    let answer = actions_for_selection(&engine, &scene, &bars);
+    let answer = actions_for_selection(&engine, &scene, &bars, 0);
     assert_eq!((answer.count, answer.missing), (3, 0));
 
     // The verbs that take the whole set say so with the count, not with a bare `true`.
@@ -451,7 +451,7 @@ fn a_selection_scopes_every_verb_and_the_primary_is_the_last_id() {
     // provider — which requires nothing — must grey Bind with the provider's own reason, not the
     // requirer's answer from the head of the list.
     let provider = nearest_provider(&engine, &scene, bars[0]);
-    let ending_on_provider = actions_for_selection(&engine, &scene, &[bars[0], provider]);
+    let ending_on_provider = actions_for_selection(&engine, &scene, &[bars[0], provider], 0);
     let bind = ending_on_provider
         .items
         .iter()
@@ -487,7 +487,7 @@ fn make_dynamic_counts_the_members_it_can_actually_act_on() {
         .unwrap();
 
     let bar = index.health_bars[0];
-    let answer = actions_for_selection(&engine, &scene, &[bar, mesh]);
+    let answer = actions_for_selection(&engine, &scene, &[bar, mesh], 0);
     assert_eq!(answer.count, 2);
     assert_eq!(
         scope(&answer.items, Action::MakeDynamic),
@@ -509,7 +509,7 @@ fn make_dynamic_counts_the_members_it_can_actually_act_on() {
     );
 
     // Every member qualifying says nothing extra: there is no partial to explain.
-    let all_meshes = actions_for_selection(&engine, &scene, &[mesh]);
+    let all_meshes = actions_for_selection(&engine, &scene, &[mesh], 0);
     let md = all_meshes
         .items
         .iter()
@@ -526,12 +526,12 @@ fn a_dead_id_is_counted_missing_rather_than_silently_dropped_and_a_repeat_is_cou
 
     // A stale right-click after a Remove/Undo race: the live half still acts, and the menu is told how
     // many are gone so it can say so rather than quietly narrowing the scope it printed.
-    let mixed = actions_for_selection(&engine, &scene, &[bar, ghost]);
+    let mixed = actions_for_selection(&engine, &scene, &[bar, ghost], 0);
     assert_eq!((mixed.count, mixed.missing), (1, 1));
     assert_eq!(scope(&mixed.items, Action::Remove), 1);
 
     // A repeated id would otherwise inflate every count the menu prints.
-    let repeated = actions_for_selection(&engine, &scene, &[bar, bar, bar]);
+    let repeated = actions_for_selection(&engine, &scene, &[bar, bar, bar], 0);
     assert_eq!((repeated.count, repeated.missing), (1, 0));
 }
 
@@ -540,32 +540,74 @@ fn nothing_live_refuses_every_verb_and_the_two_reasons_are_different_facts() {
     let (engine, scene, _index) = seeded();
     let ghost = EntityId::from_loro_key("1_ffff").unwrap();
 
-    let empty = actions_for_selection(&engine, &scene, &[]);
+    // Every verb EXCEPT `Paste`, which is not about the selection: see the assertions below.
+    let selection_verbs = |a: &metrocalk_editor_shell::SelectionActions| -> Vec<ActionItem> {
+        a.items
+            .iter()
+            .filter(|i| i.action != Action::Paste)
+            .cloned()
+            .collect()
+    };
+
+    let empty = actions_for_selection(&engine, &scene, &[], 0);
     assert_eq!((empty.count, empty.missing), (0, 0));
-    assert!(empty
-        .items
+    assert!(selection_verbs(&empty)
         .iter()
         .all(|i| !i.available && i.applies_to == 0));
-    assert!(empty
-        .items
+    assert!(selection_verbs(&empty)
         .iter()
         .all(|i| i.reason.as_deref() == Some("nothing is selected")));
 
     // Not the same sentence: a person can act on "nothing is selected" and cannot act on "they are
     // gone", so joining them with an `or` would answer neither (the `import cancelled or unsupported`
     // lesson, ADR-178).
-    let gone = actions_for_selection(&engine, &scene, &[ghost]);
+    let gone = actions_for_selection(&engine, &scene, &[ghost], 0);
     assert_eq!((gone.count, gone.missing), (0, 1));
-    assert!(gone
-        .items
+    assert!(selection_verbs(&gone)
         .iter()
         .all(|i| i.reason.as_deref() == Some("the selected objects no longer exist")));
 
     // Every verb the model knows is answered in the refusals too — a new verb cannot be added to the
     // live answer and forgotten in the dead one.
-    let live = actions_for_selection(&engine, &scene, &[index_first_bar(&engine, &scene)]);
+    let live = actions_for_selection(&engine, &scene, &[index_first_bar(&engine, &scene)], 0);
     assert_eq!(empty.items.len(), live.items.len());
     assert_eq!(gone.items.len(), live.items.len());
+}
+
+/// **`Paste` is the one row an empty selection does not refuse** (ADR-198).
+///
+/// Every other verb in this model is a sentence about the selected objects, so "nothing is selected"
+/// answers all of them at once. Paste is a sentence about the clipboard, and *nothing selected* is
+/// the state a person is most often in when they reach for it — a right-click on empty space, having
+/// just copied something. The model refusing it there would be its own shape answering a question it
+/// was never asked.
+#[test]
+fn paste_is_offered_with_nothing_selected_and_refused_with_an_empty_clipboard() {
+    let (engine, scene, _index) = seeded();
+    let paste_row = |ids: &[EntityId], clipboard: usize| -> ActionItem {
+        actions_for_selection(&engine, &scene, ids, clipboard)
+            .items
+            .into_iter()
+            .find(|i| i.action == Action::Paste)
+            .expect("the model answers about Paste")
+    };
+
+    let held = paste_row(&[], 3);
+    assert!(held.available, "nothing selected does not refuse a paste");
+    assert_eq!(held.applies_to, 3, "its scope is what the CLIPBOARD holds");
+
+    let nothing_held = paste_row(&[], 0);
+    assert!(!nothing_held.available);
+    assert_eq!(
+        nothing_held.reason.as_deref(),
+        Some("nothing has been copied or cut yet"),
+        "the refusal names the clipboard, not the selection (every no explained)"
+    );
+
+    // And the answer does not change when there IS a selection: the clipboard is the whole scope.
+    let with_selection = paste_row(&[index_first_bar(&engine, &scene)], 2);
+    assert!(with_selection.available);
+    assert_eq!(with_selection.applies_to, 2);
 }
 
 /// Any live entity — the refusal path must answer about the same verb list the live path does.
@@ -590,7 +632,7 @@ fn the_single_entity_form_is_the_selection_form_asked_about_one() {
 
     for id in [bar, provider, index.health_bars[1], ghost] {
         let single = actions_for(&engine, &scene, id);
-        let set = actions_for_selection(&engine, &scene, &[id]).items;
+        let set = actions_for_selection(&engine, &scene, &[id], 0).items;
         assert_eq!(single.len(), set.len());
         for (a, b) in single.iter().zip(set.iter()) {
             assert_eq!(
@@ -795,6 +837,302 @@ fn a_duplicated_selection_replays_as_one_transaction() {
             !b.entity_exists(clone),
             "a copy the user undid came back after a reopen — the undo reverted one record, the \
              duplicate made two objects"
+        );
+    }
+}
+
+/// An entity's `Transform.x`, the way every surface that places something reads it.
+fn transform_x(engine: &Engine<FlecsWorld>, id: EntityId) -> f64 {
+    match engine.components_of(id).get("Transform").and_then(|t| t.get("x")) {
+        Some(FieldValue::Number(n)) => *n,
+        Some(FieldValue::Integer(i)) => *i as f64,
+        _ => panic!("an entity that should have a Transform.x has none"),
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// THE CLIPBOARD, ASKED ABOUT WHAT WAS ACTUALLY SELECTED. The first three were written before the fix
+// that makes them pass, because each one is a thing the shipped verb quietly did NOT do.
+// `Copy`/`Cut`/`Paste` were the last three verbs in the authoring toolbar still reading "one subtree
+// at a time" (ADR-196's owed item 1) - and the round trip lost more than the rest of the selection.
+// =================================================================================================
+
+/// A pasted copy is still called something.
+///
+/// `Engine::save_composition` skipped the whole `__meta__` component so a *re-snapshot* would not
+/// compound the `composition` provenance link. But `__meta__` holds the user-facing **name** (M10.6
+/// rename) and the **primitive kind** the renderer draws from, in the same component - so copy then
+/// paste dropped the object's name and its shape along with the provenance nobody wanted.
+#[test]
+fn a_pasted_copy_keeps_the_name_of_what_was_copied() {
+    let (mut engine, scene, _) = seeded();
+    let src = capscene::create_entity(&mut engine, [0.0, 0.0, 0.0], "Weld Gun").unwrap();
+
+    let held = capscene::copy_selection(&engine, &scene, &[src], false).clipboard;
+    let made = capscene::paste_clipboard(&mut engine, &scene, &held, 0).expect("paste commits");
+
+    let name = capscene::entity_name(&engine, made.roots[0]);
+    assert!(name.is_some(), "a pasted copy came back with no name at all");
+    // And it is distinguishable from the object it was copied from, the ADR-196 rule: the source is
+    // still there holding `Weld Gun`.
+    assert_eq!(name.as_deref(), Some("Weld Gun copy"));
+}
+
+/// A pasted copy lands where a person can see it.
+///
+/// The composition bakes the source's resolved `Transform`, so the paste landed at exactly the
+/// source's coordinates - one object hidden inside another, with a toast saying "pasted". The
+/// round-trip test asserted that coincidence as a feature ("geometry round-trips").
+#[test]
+fn a_paste_lands_beside_what_it_was_copied_from_rather_than_inside_it() {
+    let (mut engine, scene, _) = seeded();
+    let src = capscene::create_entity(&mut engine, [4.0, 0.0, 0.0], "Bolt").unwrap();
+
+    let held = capscene::copy_selection(&engine, &scene, &[src], false).clipboard;
+    let made = capscene::paste_clipboard(&mut engine, &scene, &held, 0).expect("paste commits");
+
+    let (a, b) = (transform_x(&engine, made.roots[0]), transform_x(&engine, src));
+    assert!(
+        (a - b).abs() > 0.5,
+        "the copy landed at {a} and the source is at {b} - the same place"
+    );
+}
+
+/// A pasted copy can still be bound.
+///
+/// A `Composition` carries components, not capability pairs, so the pasted entity arrived with no
+/// `Requires`/`Provides` at all: the M3.1 reveal - the product's headline gesture - had nothing to
+/// offer for it. `duplicate_selection` copies the pairs; paste did not, and the two verbs are the
+/// same verb with a clipboard in between.
+#[test]
+fn a_pasted_copy_keeps_the_capabilities_of_what_was_copied() {
+    let (mut engine, scene, index) = seeded();
+    let bar = index.health_bars[0];
+
+    let held = capscene::copy_selection(&engine, &scene, &[bar], false).clipboard;
+    let made = capscene::paste_clipboard(&mut engine, &scene, &held, 0).expect("paste commits");
+
+    let pos = capscene::positions(&engine);
+    let rec: HashMap<Entity, u64> = HashMap::new();
+    let ctx = Context {
+        cap_name: &scene.cap_name,
+        position: &pos,
+        recency: &rec,
+    };
+    let r = reveal(
+        engine.world(),
+        engine.ecs_entity(made.roots[0]).unwrap(),
+        scene.rels,
+        &ctx,
+    );
+    assert_eq!(
+        r.required,
+        vec!["Health".to_string()],
+        "the pasted copy requires Health like the object it was copied from"
+    );
+    assert!(
+        !r.compatible.is_empty(),
+        "and it is independently bindable, like a duplicate"
+    );
+}
+
+/// **Copy over a SELECTION copies the selection**, with everything inside each member.
+///
+/// The clipboard held one `Composition`, so `Copy` took the primary out of however many objects were
+/// selected - and said so in the toolbar's own description, *"Copy Weld Gun - one subtree at a
+/// time"*. The reduction to top-most is `Duplicate`'s (ADR-196) and is here for the same reason: a
+/// marquee over a group selects the folder and its parts, and copying each in turn pastes the parts
+/// twice.
+#[test]
+fn copying_a_selection_puts_every_object_on_the_clipboard_with_what_is_inside_them() {
+    let (mut engine, scene, _) = seeded();
+    let a = capscene::create_entity(&mut engine, [0.0, 0.0, 0.0], "Bolt").unwrap();
+    let b = capscene::create_entity(&mut engine, [1.0, 0.0, 0.0], "Nut").unwrap();
+    let group = capscene::group(&mut engine, &[a, b], "Fixing").unwrap();
+    let loose = capscene::create_entity(&mut engine, [5.0, 0.0, 0.0], "Washer").unwrap();
+    let before = engine.entity_count();
+
+    // The whole subtree selected, folder included - four ids, two things.
+    let copied = capscene::copy_selection(&engine, &scene, &[group, a, b, loose], false);
+    assert_eq!(copied.clipboard.len(), 2, "two roots, not four and not one");
+    assert_eq!(
+        copied.nested, 2,
+        "the two inside the group are counted, not silently dropped"
+    );
+    assert_eq!(
+        copied.clipboard.entries[0].composition.nodes.len(),
+        3,
+        "the group went on the clipboard WITH its contents"
+    );
+
+    let made =
+        capscene::paste_clipboard(&mut engine, &scene, &copied.clipboard, 0).expect("paste commits");
+    assert_eq!(made.roots.len(), 2);
+    assert_eq!(engine.entity_count(), before + 4, "3 + 1 entities pasted");
+    // ONE transaction: a single undo takes the whole paste back (inv. 3).
+    assert!(engine.undo());
+    assert_eq!(
+        engine.entity_count(),
+        before,
+        "one undo, the whole paste gone"
+    );
+}
+
+/// A part copied out of an assembly pastes back **into the assembly**.
+///
+/// `instantiate_composition` created every root with `parent: None`, so a bolt copied from inside a
+/// 15,711-part import reappeared at the top of the scene - a row a person then has to find and drag
+/// back. The clipboard carries the source's parent as a loro KEY, so a clipboard that has crossed
+/// into another project is stale rather than silently aliasing that project's object at the same id.
+#[test]
+fn a_paste_lands_back_under_the_parent_it_was_copied_out_of() {
+    let (mut engine, scene, _) = seeded();
+    let bolt = capscene::create_entity(&mut engine, [0.0, 0.0, 0.0], "Bolt").unwrap();
+    let assembly = capscene::group(&mut engine, &[bolt], "Assembly").unwrap();
+
+    let held = capscene::copy_selection(&engine, &scene, &[bolt], false).clipboard;
+    let made = capscene::paste_clipboard(&mut engine, &scene, &held, 0).expect("paste commits");
+
+    assert_eq!(
+        engine.parent_of(made.roots[0]),
+        Some(assembly),
+        "the copy landed at the root of the scene instead of beside the part it came from"
+    );
+    assert_eq!(engine.children_of(assembly).len(), 2);
+
+    // A clipboard whose parent is not in THIS document lands at the top level rather than under
+    // whatever happens to hold that id here.
+    let (mut other, other_scene, _) = seeded();
+    let elsewhere =
+        capscene::paste_clipboard(&mut other, &other_scene, &held, 0).expect("cross-project paste");
+    assert_eq!(other.parent_of(elsewhere.roots[0]), None);
+}
+
+/// **A cut and a paste is a MOVE** - so the first paste puts the object back where it was, under the
+/// name it already had.
+///
+/// Two properties that are the same decision. The placement offset exists because a copy has to clear
+/// the object it was copied from; a cut has no such object left on screen, and putting it down 1.5 m
+/// from where it was picked up is not a move. The name is free for exactly the same reason, which is
+/// why the sibling scan skips deactivated rows rather than special-casing a cut.
+#[test]
+fn a_cut_and_a_paste_puts_the_object_back_where_it_was_under_its_own_name() {
+    let (mut engine, scene, _) = seeded();
+    let src = capscene::create_entity(&mut engine, [4.0, 0.0, 0.0], "Weld Gun").unwrap();
+
+    let (copied, gone) = capscene::cut_selection(&mut engine, &scene, &[src]).expect("cut commits");
+    assert_eq!(gone, vec![src]);
+    assert!(!engine.is_active(src), "cut deactivates (non-destructive)");
+    assert!(engine.ecs_entity(src).is_some(), "and does not destroy");
+
+    let made =
+        capscene::paste_clipboard(&mut engine, &scene, &copied.clipboard, 0).expect("paste commits");
+    let landed = transform_x(&engine, made.roots[0]);
+    assert!(
+        (landed - 4.0).abs() < 1e-5,
+        "a cut pasted back landed at {landed} instead of the 4.0 it was cut from"
+    );
+    assert_eq!(
+        capscene::entity_name(&engine, made.roots[0]).as_deref(),
+        Some("Weld Gun"),
+        "a moved object was renamed to a copy of itself"
+    );
+}
+
+/// Pasting twice makes two objects **in two places**.
+///
+/// The offset is computed from the clipboard's own extent, so without a step every paste of the same
+/// clipboard lands in the same spot: three Ctrl-Vs, three objects, one visible. That is the
+/// coincident-paste defect one level up, and it is the one a person meets first - repeat-paste is
+/// what a clipboard is FOR.
+#[test]
+fn pasting_the_same_clipboard_twice_makes_two_objects_in_two_places() {
+    let (mut engine, scene, _) = seeded();
+    let src = capscene::create_entity(&mut engine, [0.0, 0.0, 0.0], "Bolt").unwrap();
+    let held = capscene::copy_selection(&engine, &scene, &[src], false).clipboard;
+
+    let first = capscene::paste_clipboard(&mut engine, &scene, &held, 0).unwrap();
+    let second = capscene::paste_clipboard(&mut engine, &scene, &held, 1).unwrap();
+
+    let (a, b) = (
+        transform_x(&engine, first.roots[0]),
+        transform_x(&engine, second.roots[0]),
+    );
+    assert!((a - b).abs() > 0.5, "both pastes landed at {a}");
+    // And they can be told apart in the outliner, which is the other half of "two objects".
+    assert_ne!(
+        capscene::entity_name(&engine, first.roots[0]),
+        capscene::entity_name(&engine, second.roots[0])
+    );
+}
+
+/// **A paste survives a close and reopen** - as ONE transaction (ADR-013).
+///
+/// Copy, cut and paste had no `Record` at all: the verbs were commits to the Loro doc, which an
+/// explicit `.mtk` save persists, and invisible to the in-session replay log that restores the scene
+/// on the next launch. So a pasted object vanished, silently, and a cut object came back.
+///
+/// The record carries the whole clipboard rather than the source ids - the difference from
+/// `DuplicateMany`, which re-derives its copies from objects the document still has. A paste's
+/// sources may have been cut away, deleted, or left behind in another project.
+#[test]
+fn a_paste_survives_a_close_and_reopen_as_one_transaction() {
+    let log = Log::open(tmp("paste"), capscene::fingerprint(N));
+    log.clear();
+
+    let (mut a, scene_a, index_a) = seeded();
+    let sources = [index_a.health_bars[0], index_a.health_bars[1]];
+    let copied = capscene::copy_selection(&a, &scene_a, &sources, false);
+    let made = capscene::paste_clipboard(&mut a, &scene_a, &copied.clipboard, 0).unwrap();
+    log.append(&Record::Paste {
+        clipboard: copied.clipboard.clone(),
+        step: 0,
+    });
+    let pasted = made.roots.clone();
+    assert_eq!(pasted.len(), 2);
+    drop(a); // close
+
+    let mut world = FlecsWorld::new();
+    let scene = CapScene::intern(&mut world);
+    let mut b = Engine::new(world, 1);
+    capscene::seed(&mut b, &scene, N).expect("re-seed");
+    b.clear_history();
+    let (applied, skipped) = b_replay(&log, &mut b, &scene);
+    b.clear_history();
+
+    assert_eq!((applied, skipped), (1, 0), "the paste replayed");
+    for id in &pasted {
+        assert!(
+            b.entity_exists(*id),
+            "a pasted object was gone after a reopen - the paste was never recorded"
+        );
+    }
+
+    // ...and one live Ctrl-Z after the paste takes the whole paste back on replay too, which is the
+    // reason a paste is one record rather than N.
+    let (mut c, scene_c, index_c) = seeded();
+    let held = capscene::copy_selection(&c, &scene_c, &[index_c.health_bars[0]], false).clipboard;
+    let undone = capscene::paste_clipboard(&mut c, &scene_c, &held, 0).unwrap();
+    log.clear();
+    log.append(&Record::Paste {
+        clipboard: held,
+        step: 0,
+    });
+    assert!(c.undo());
+    log.append(&Record::Undo);
+    drop(c);
+
+    let mut world = FlecsWorld::new();
+    let scene = CapScene::intern(&mut world);
+    let mut d = Engine::new(world, 1);
+    capscene::seed(&mut d, &scene, N).expect("re-seed");
+    d.clear_history();
+    let (applied, skipped) = b_replay(&log, &mut d, &scene);
+    assert_eq!((applied, skipped), (2, 0));
+    for id in undone.created {
+        assert!(
+            !d.entity_exists(id),
+            "an undone paste came back after a reopen"
         );
     }
 }

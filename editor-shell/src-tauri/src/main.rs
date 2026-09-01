@@ -2975,18 +2975,19 @@ enum EngineCmd {
         ids: Vec<String>,
         reply: Sender<Vec<String>>,
     },
-    /// Copy a sub-tree to the clipboard (a read → fills the thread clipboard).
-    CopySubtree {
-        id: String,
+    /// Copy a whole SELECTION to the clipboard (a read → fills the thread clipboard).
+    CopySelection {
+        ids: Vec<String>,
+        reply: Sender<CopyOutcome>,
     },
-    /// Cut = copy + delete(deactivate) → reply applied.
-    CutSubtree {
-        id: String,
-        reply: Sender<bool>,
+    /// Cut a whole SELECTION = copy + delete(deactivate), ONE transaction.
+    CutSelection {
+        ids: Vec<String>,
+        reply: Sender<CutOutcome>,
     },
-    /// Paste the clipboard under fresh ids → reply the new root id.
+    /// Paste everything on the clipboard under fresh ids, ONE transaction → the pasted roots.
     PasteClipboard {
-        reply: Sender<Option<String>>,
+        reply: Sender<PasteOutcome>,
     },
     /// M11.1 (ADR-040) — import a user asset file from disk (FBX/glTF/OBJ/PNG/… via the MAGIC router):
     /// register its GPU mesh, place an entity carrying the handle, persist the bytes (survives reload) →
@@ -8317,9 +8318,14 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
     // bumped on every committed edit/bind so it's live, not inert.
     let mut recency: HashMap<Entity, u64> = HashMap::new();
     let mut touch: u64 = 0;
-    // M10.6 — the scene-authoring clipboard: a copied/cut sub-tree's resolved `Composition` (serde), held
-    // on this thread between copy/cut and paste. Cross-project paste (a project clipboard) is M10.3's seam.
-    let mut clipboard: Option<metrocalk_core::Composition> = None;
+    // M10.6 / ADR-198 — the scene-authoring clipboard: every copied/cut ROOT's resolved state (serde),
+    // held on this thread between copy/cut and paste. Cross-project paste (a project clipboard) is
+    // M10.3's seam, and the reason a `Clipboard` crosses as values and never as ids.
+    let mut clipboard = capscene::Clipboard::default();
+    // How many times THIS clipboard has been pasted. A paste offsets by the set's own extent, so
+    // without a step a second paste lands exactly on the first — the coincident-paste defect one
+    // level up. Reset by every copy and cut, because that is a different clipboard.
+    let mut paste_step: usize = 0;
     // In-flight generation reservations (M7): placeholder loro-key → the token Hold, so the async
     // completion settles (success) or releases (failure) exactly the right hold. Lives on this thread
     // only, so reserve→settle/release is atomic (no race).
@@ -9033,7 +9039,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         None => unparsable += 1,
                     }
                 }
-                let mut answer = actions_for_selection(&engine, &scene, &entities);
+                let mut answer = actions_for_selection(&engine, &scene, &entities, clipboard.len());
                 answer.missing += unparsable;
                 let _ = reply.send(answer);
             }
@@ -10986,41 +10992,84 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 };
                 let _ = reply.send(done);
             }
-            EngineCmd::CopySubtree { id } => {
-                clipboard = EntityId::from_loro_key(&id)
-                    .map(|e| capscene::copy_subtree(&engine, e, "clipboard"));
-            }
-            EngineCmd::CutSubtree { id, reply } => {
-                let ok = if let Some(e) = EntityId::from_loro_key(&id) {
-                    match capscene::cut_subtree(&mut engine, &scene, e, "clipboard") {
-                        Ok(c) => {
-                            clipboard = Some(c);
-                            true
-                        }
-                        Err(_) => false,
-                    }
-                } else {
-                    false
-                };
-                if ok {
-                    if let Some(ch) = &channel {
-                        send_proj!(ch, proj_full(&engine, &scene));
-                    }
-                    rebuild(&engine, &shared, &mut positions, &assets);
+            EngineCmd::CopySelection { ids, reply } => {
+                let (targets, unparsed) = parse_ids(&ids);
+                let copied = capscene::copy_selection(&engine, &scene, &targets, false);
+                let outcome = copy_outcome(&copied, unparsed);
+                // A COPY REPLACES THE CLIPBOARD EVEN WHEN IT TOOK NOTHING? No — a copy over a stale
+                // selection must not silently throw away what a person put there a minute ago.
+                if outcome.objects > 0 {
+                    clipboard = copied.clipboard;
+                    paste_step = 0;
                 }
-                let _ = reply.send(ok);
+                let _ = reply.send(outcome);
+            }
+            EngineCmd::CutSelection { ids, reply } => {
+                let (targets, unparsed) = parse_ids(&ids);
+                let mut outcome = CutOutcome::default();
+                match capscene::cut_selection(&mut engine, &scene, &targets) {
+                    Ok((copied, gone)) if !gone.is_empty() => {
+                        let counts = copy_outcome(&copied, unparsed);
+                        outcome = CutOutcome {
+                            objects: counts.objects,
+                            parts: counts.parts,
+                            nested: counts.nested,
+                            missing: counts.missing,
+                            gone: gone.iter().map(EntityId::to_loro_key).collect(),
+                        };
+                        clipboard = copied.clipboard;
+                        paste_step = 0;
+                        // ONE record, because one transaction — the granularity
+                        // `DeleteDeactivateMany` documents. The cut's *copy* half is session state
+                        // and has nothing to persist; its delete half is a delete like any other, and
+                        // without this a cut object came back on the next launch.
+                        log.append(&Record::DeleteDeactivateMany {
+                            ids: outcome.gone.clone(),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        rebuild(&engine, &shared, &mut positions, &assets);
+                    }
+                    Ok((copied, _)) => {
+                        let counts = copy_outcome(&copied, unparsed);
+                        outcome.missing = counts.missing;
+                        outcome.nested = counts.nested;
+                    }
+                    Err(_) => outcome.missing = ids.len(),
+                }
+                let _ = reply.send(outcome);
             }
             EngineCmd::PasteClipboard { reply } => {
-                let new = clipboard
-                    .as_ref()
-                    .and_then(|c| capscene::paste_composition(&mut engine, c).ok());
-                if new.is_some() {
-                    if let Some(ch) = &channel {
-                        send_proj!(ch, proj_full(&engine, &scene));
+                let made = capscene::paste_clipboard(&mut engine, &scene, &clipboard, paste_step)
+                    .unwrap_or_default();
+                if !made.roots.is_empty() {
+                    // The whole clipboard, not the source ids: a paste's sources may have been cut
+                    // away, deleted, or left behind in another project, so re-deriving it on replay
+                    // is not available the way `DuplicateMany` re-derives its copies.
+                    log.append(&Record::Paste {
+                        clipboard: clipboard.clone(),
+                        step: paste_step,
+                    });
+                    paste_step += 1;
+                    // A delta per created entity rather than a full projection: a paste ADDS rows and
+                    // changes none of the ones already on screen (invariant 2).
+                    for &id in &made.created {
+                        if let Some(e) = engine.ecs_entity(id) {
+                            touch += 1;
+                            recency.insert(e, touch);
+                        }
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, project_entity(&engine, id));
+                        }
                     }
+                    // ONE rebuild for the whole transaction.
                     rebuild(&engine, &shared, &mut positions, &assets);
                 }
-                let _ = reply.send(new.map(|n| n.to_loro_key()));
+                let _ = reply.send(PasteOutcome {
+                    created: made.roots.iter().map(EntityId::to_loro_key).collect(),
+                    entities: made.created.len(),
+                });
             }
             EngineCmd::ImportAsset {
                 path,
@@ -20773,6 +20822,72 @@ struct DuplicateOutcome {
     missing: usize,
 }
 
+/// The live [`EntityId`]s in a wire list, plus how many the document could not even parse.
+///
+/// An id the document cannot parse is as missing as one it has lost, and a caller is about to print a
+/// number that has to account for both.
+fn parse_ids(ids: &[String]) -> (Vec<EntityId>, usize) {
+    let parsed: Vec<EntityId> = ids
+        .iter()
+        .filter_map(|s| EntityId::from_loro_key(s))
+        .collect();
+    let unparsed = ids.len() - parsed.len();
+    (parsed, unparsed)
+}
+
+/// The wire shape of a [`capscene::Copied`], counting the entities the clipboard now holds.
+fn copy_outcome(copied: &capscene::Copied, unparsed: usize) -> CopyOutcome {
+    CopyOutcome {
+        objects: copied.clipboard.len(),
+        parts: copied
+            .clipboard
+            .entries
+            .iter()
+            .map(|e| e.composition.nodes.len())
+            .sum(),
+        nested: copied.nested,
+        missing: copied.missing + unparsed,
+    }
+}
+
+/// What a copy put on the clipboard — the two counts a caller needs to report it honestly.
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CopyOutcome {
+    /// How many objects are now held: the top-most live members of the selection. `0` ⇒ nothing was
+    /// copied, and the caller must say so rather than claim a copy.
+    objects: usize,
+    /// How many entities those objects hold in total, roots and contents both. Larger than `objects`
+    /// exactly when something has children — one assembly of forty parts is 1 and 41.
+    parts: usize,
+    /// Selected objects skipped because an ancestor of theirs was selected too: they came along
+    /// inside it, and copying both would paste them twice.
+    nested: usize,
+    /// Selected ids the document no longer has.
+    missing: usize,
+}
+
+/// A cut is a copy plus the delete, so it also reports which rows actually went.
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CutOutcome {
+    objects: usize,
+    parts: usize,
+    nested: usize,
+    missing: usize,
+    /// The ids the engine deactivated — so the caller dims exactly those rows rather than assuming
+    /// its own list is what happened.
+    gone: Vec<String>,
+}
+
+/// What a paste made: the roots to select, and what it cost the document.
+#[derive(serde::Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PasteOutcome {
+    created: Vec<String>,
+    entities: usize,
+}
+
 /// **Duplicate the whole selection** (ADR-196) — every selected object, with everything inside it,
 /// as ONE undoable transaction.
 ///
@@ -23353,33 +23468,61 @@ fn delete_deactivate_many(state: State<AppState>, ids: Vec<String>) -> Vec<Strin
     deleted
 }
 
-/// M10.6 — copy a sub-tree to the clipboard (a read → fills the thread clipboard).
-#[tauri::command]
-fn copy_subtree(state: State<AppState>, id: String) {
-    ipc();
-    let _ = state.tx.send(EngineCmd::CopySubtree { id });
-}
-
-/// M10.6 — cut = copy + delete(deactivate); reply applied.
+/// **Copy the whole selection** to the clipboard (ADR-198) — a read; nothing is committed.
+///
+/// The clipboard held ONE subtree until then, so this took the primary out of however many objects
+/// were selected — the last two verbs (with `cut_selection`) still doing what ADR-183 and ADR-196
+/// removed from `Delete` and `Duplicate`, under copy that said "the selection".
 #[tauri::command(async)]
-fn cut_subtree(state: State<AppState>, id: String) -> bool {
+fn copy_selection(state: State<AppState>, ids: Vec<String>) -> CopyOutcome {
     ipc();
     let (reply, rx) = mpsc::channel();
-    if state.tx.send(EngineCmd::CutSubtree { id, reply }).is_err() {
-        return false;
+    if state
+        .tx
+        .send(EngineCmd::CopySelection {
+            ids: ids.clone(),
+            reply,
+        })
+        .is_err()
+    {
+        return CopyOutcome {
+            missing: ids.len(),
+            ..CopyOutcome::default()
+        };
     }
-    recv_reply(&rx).unwrap_or(false)
+    recv_reply(&rx).unwrap_or_default()
 }
 
-/// M10.6 — paste the clipboard under fresh ids; reply the new root id.
+/// **Cut the whole selection** — copy it, then deactivate the sources as ONE undoable transaction.
 #[tauri::command(async)]
-fn paste_clipboard(state: State<AppState>) -> Option<String> {
+fn cut_selection(state: State<AppState>, ids: Vec<String>) -> CutOutcome {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CutSelection {
+            ids: ids.clone(),
+            reply,
+        })
+        .is_err()
+    {
+        return CutOutcome {
+            missing: ids.len(),
+            ..CutOutcome::default()
+        };
+    }
+    recv_reply(&rx).unwrap_or_default()
+}
+
+/// **Paste the clipboard** under fresh deterministic ids as ONE undoable transaction; reply the roots.
+#[tauri::command(async)]
+fn paste_clipboard(state: State<AppState>) -> PasteOutcome {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state.tx.send(EngineCmd::PasteClipboard { reply }).is_err() {
-        return None;
+        return PasteOutcome::default();
     }
-    recv_reply(&rx).unwrap_or(None)
+    recv_reply(&rx).unwrap_or_default()
 }
 
 /// M11.1 (ADR-040) — import an asset file from a known path (the e2e drives this); reply the new entity id.
@@ -25949,8 +26092,8 @@ fn main() {
             ungroup_entity,
             multi_edit,
             delete_deactivate,
-            copy_subtree,
-            cut_subtree,
+            copy_selection,
+            cut_selection,
             paste_clipboard,
             import_asset,
             cancel_native_import,

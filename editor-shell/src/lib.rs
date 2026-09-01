@@ -122,9 +122,10 @@ pub use cad_import::{
 };
 pub use cad_intent::{import_step, StepImport};
 pub use capscene::{
-    add_kind, apply_marketplace_entry, bind, describe_create, duplicate_entity, instantiate,
-    place_generation_placeholder, place_mesh, positions, remove_entity, seed, CapResolver,
-    CapScene, MeshCatalog, SeedIndex, MESH_FIELD, TRACKS,
+    add_kind, apply_marketplace_entry, bind, copy_selection, cut_selection, describe_create,
+    duplicate_entity, instantiate, paste_clipboard, place_generation_placeholder, place_mesh,
+    positions, remove_entity, seed, CapResolver, CapScene, ClipEntry, Clipboard, Copied,
+    MeshCatalog, NodeCaps, Pasted, SeedIndex, MESH_FIELD, TRACKS,
 };
 pub use cinema_intent::{
     add_shot_ops, cutscene_of, describe_shot, remove_shot_ops, reply_for as cinema_reply,

@@ -47,6 +47,19 @@ pub enum Action {
     /// M8.3: turn a dead mesh model into a correct dynamic body (RigidBody + Collider auto-derived) — one
     /// undoable transaction. Offered only for a mesh that isn't already a physics body.
     MakeDynamic,
+    /// **Put the selection on the clipboard** — every selected object with everything under it
+    /// (`capscene::copy_selection`, ADR-198). A read: nothing is committed.
+    Copy,
+    /// **Copy the selection, then delete it** — one undoable transaction, recoverable both ways
+    /// (`capscene::cut_selection`).
+    Cut,
+    /// **Paste what is on the clipboard** — the one verb here that is not about the selection.
+    ///
+    /// Its `applies_to` is how many objects the CLIPBOARD holds, so it is available with nothing
+    /// selected at all — the state in which a person most often wants it. Every other row in this
+    /// model refuses an empty selection; refusing this one too would have been the model's own shape
+    /// answering a question it was never asked.
+    Paste,
 }
 
 impl Action {
@@ -60,6 +73,9 @@ impl Action {
             Action::Focus => "Focus",
             Action::Inspect => "Inspect",
             Action::MakeDynamic => "Make dynamic",
+            Action::Copy => "Copy",
+            Action::Cut => "Cut",
+            Action::Paste => "Paste",
         }
     }
 
@@ -68,17 +84,20 @@ impl Action {
     pub fn mutates(self) -> bool {
         matches!(
             self,
-            Action::Remove | Action::Duplicate | Action::MakeDynamic
+            Action::Remove | Action::Duplicate | Action::MakeDynamic | Action::Cut | Action::Paste
         )
     }
 }
 
 /// Every action the model knows, in menu order — the one list, so a new verb cannot be added to the
 /// answer for a live entity and forgotten in the answer for a dead one.
-const EVERY_ACTION: [Action; 6] = [
+const EVERY_ACTION: [Action; 9] = [
     Action::Bind,
     Action::Remove,
     Action::Duplicate,
+    Action::Copy,
+    Action::Cut,
+    Action::Paste,
     Action::Focus,
     Action::Inspect,
     Action::MakeDynamic,
@@ -133,6 +152,19 @@ pub struct SelectionActions {
     pub items: Vec<ActionItem>,
 }
 
+/// The `Paste` row, which is the same row whatever is selected — its scope is the CLIPBOARD.
+///
+/// Written once and used from both branches of [`actions_for_selection`] rather than twice, because
+/// the empty-selection branch is exactly where the two would have drifted: that branch refuses every
+/// verb with one sentence, and paste would have quietly joined them.
+fn paste_item(clipboard: usize) -> ActionItem {
+    ActionItem::make(
+        Action::Paste,
+        clipboard,
+        (clipboard == 0).then(|| "nothing has been copied or cut yet".to_string()),
+    )
+}
+
 /// The valid actions for `id` + a reason for each unavailable one. Deterministic and side-effect-free.
 ///
 /// The single-entity form of [`actions_for_selection`], and it is written as a *call* to it rather
@@ -141,7 +173,7 @@ pub struct SelectionActions {
 /// to disagree about the same object while both compile.
 #[must_use]
 pub fn actions_for(engine: &Engine<FlecsWorld>, scene: &CapScene, id: EntityId) -> Vec<ActionItem> {
-    actions_for_selection(engine, scene, &[id]).items
+    actions_for_selection(engine, scene, &[id], 0).items
 }
 
 /// **The valid actions for a SELECTION** — the same model, asked about many objects at once.
@@ -158,6 +190,11 @@ pub fn actions_for(engine: &Engine<FlecsWorld>, scene: &CapScene, id: EntityId) 
 ///   honest answer for a mixed selection and is why `applies_to` is a number and not a flag.
 /// - `Duplicate` applies to every live member too (ADR-196) — each copied with everything inside it,
 ///   the copies landing beside the set rather than inside it.
+/// - `Copy` and `Cut` apply to every live member too (ADR-198) — the last two verbs in this model
+///   that were still taking the primary out of however many objects the menu said it was about.
+/// - `Paste` is the exception that proves the rule: it is **not about the selection at all**, so its
+///   `applies_to` is `clipboard` — how many objects are held — and it is the one row that stays
+///   available when nothing is selected.
 /// - `Bind…` is **primary-only**: the reveal asks its question about one requirer. It reports
 ///   `applies_to == 1` over any selection, so the caller can name the one object it is about.
 ///
@@ -170,6 +207,7 @@ pub fn actions_for_selection(
     engine: &Engine<FlecsWorld>,
     scene: &CapScene,
     ids: &[EntityId],
+    clipboard: usize,
 ) -> SelectionActions {
     // De-duplicate while keeping order: the primary is the LAST id (the projection store's own
     // convention), and a repeated id would otherwise inflate every count the menu prints.
@@ -199,7 +237,12 @@ pub fn actions_for_selection(
             missing,
             items: EVERY_ACTION
                 .into_iter()
-                .map(|a| ActionItem::make(a, 0, Some(reason.to_string())))
+                .map(|a| match a {
+                    // PASTE IS NOT ABOUT THE SELECTION, so "nothing is selected" is not a reason to
+                    // refuse it — and with nothing selected is exactly when a person reaches for it.
+                    Action::Paste => paste_item(clipboard),
+                    _ => ActionItem::make(a, 0, Some(reason.to_string())),
+                })
                 .collect(),
         };
     }
@@ -281,6 +324,12 @@ pub fn actions_for_selection(
             // selection for as long as the selection has been a set — and the toolbar row beside it
             // spelled the consequence out in its own description.
             ActionItem::make(Action::Duplicate, count, None),
+            // The whole set, for the reason `Duplicate` above is: copy and cut took the PRIMARY out
+            // of however many were selected, and said "the selection" in their own descriptions
+            // (ADR-198).
+            ActionItem::make(Action::Copy, count, None),
+            ActionItem::make(Action::Cut, count, None),
+            paste_item(clipboard),
             ActionItem::make(Action::Focus, count, None),
             ActionItem::make(Action::Inspect, count, None),
             ActionItem::make(Action::MakeDynamic, dynamic_ready, md_reason),

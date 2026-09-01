@@ -281,19 +281,20 @@ fn multi_edit_is_all_or_nothing_when_an_id_is_unknown() {
 
 #[test]
 fn copy_paste_round_trips_a_subtree_with_new_ids() {
-    let (mut e, _scene) = engine_with_resolver();
+    let (mut e, scene) = engine_with_resolver();
     // A 2-node subtree: a named parent with a child.
     let parent = capscene::create_entity(&mut e, [4.0, 0.0, 0.0], "Root").expect("parent");
     let child = spawn_at(&mut e, 1.0);
     capscene::reparent_entity(&mut e, child, Some(parent)).expect("child under parent");
 
-    let clip = capscene::copy_subtree(&e, parent, "clip");
-    let new_root = capscene::paste_composition(&mut e, &clip).expect("paste");
+    let held = capscene::copy_selection(&e, &scene, &[parent], false).clipboard;
+    let made = capscene::paste_clipboard(&mut e, &scene, &held, 0).expect("paste");
+    let new_root = made.roots[0];
 
     assert_ne!(new_root, parent, "paste allocated a FRESH id (no alias)");
     assert!(
         e.ecs_entity(parent).is_some(),
-        "copy is non-destructive — the original survives"
+        "copy is non-destructive - the original survives"
     );
     assert!(e.ecs_entity(new_root).is_some(), "the pasted root is live");
     // The sub-tree came along under new ids.
@@ -303,10 +304,18 @@ fn copy_paste_round_trips_a_subtree_with_new_ids() {
         !new_children.contains(&child),
         "the pasted child is a fresh id, not the original"
     );
-    // Resolved state matches (the parent's x).
+    // THE PARENT'S X IS *NOT* THE SOURCE'S ANY MORE, and that is the fix rather than a regression
+    // (ADR-198). This assertion used to read "geometry round-trips" and was the coincident paste
+    // written down as a requirement: the copy landed at exactly 4.0, inside the object it was copied
+    // from, under a toast reading "pasted". What round-trips is the ARRANGEMENT - the child keeps its
+    // offset from the parent - while the set as a whole clears its source.
     assert!(
-        (x_of(&e, new_root) - x_of(&e, parent)).abs() < 1e-9,
-        "geometry round-trips"
+        x_of(&e, new_root) > x_of(&e, parent),
+        "the copy landed on top of what it was copied from"
+    );
+    assert!(
+        (x_of(&e, new_children[0]) - x_of(&e, child)).abs() < 1e-9,
+        "the child keeps its local offset inside the copy"
     );
 
     // Paste is one undoable tx.
@@ -319,23 +328,32 @@ fn copy_paste_round_trips_a_subtree_with_new_ids() {
 
 #[test]
 fn copy_paste_works_across_projects_via_the_serde_clipboard() {
-    let (mut a, _sa) = engine_with_resolver();
+    let (mut a, sa) = engine_with_resolver();
     let root = capscene::create_entity(&mut a, [7.0, 0.0, 0.0], "Crossing").expect("create");
-    let clip = capscene::copy_subtree(&a, root, "clip");
+    let held = capscene::copy_selection(&a, &sa, &[root], false).clipboard;
 
-    // The clipboard crosses as bytes (a different project / process) — never a stale id.
-    let json = serde_json::to_string(&clip).expect("Composition serializes");
-    let clip_b: metrocalk_core::Composition = serde_json::from_str(&json).expect("deserializes");
+    // The clipboard crosses as bytes (a different project / process) - never a stale id.
+    let json = serde_json::to_string(&held).expect("Clipboard serializes");
+    let held_b: capscene::Clipboard = serde_json::from_str(&json).expect("deserializes");
 
-    let (mut b, _sb) = engine_with_resolver();
-    let pasted = capscene::paste_composition(&mut b, &clip_b).expect("paste into project B");
+    let (mut b, sb) = engine_with_resolver();
+    let made = capscene::paste_clipboard(&mut b, &sb, &held_b, 0).expect("paste into project B");
+    let pasted = made.roots[0];
     assert!(
         b.ecs_entity(pasted).is_some(),
         "the sub-tree pasted into a fresh project"
     );
+    // A lone object spans nothing, so it clears its source by exactly the placement gap - and in a
+    // project that has no source, that is simply where it lands.
     assert!(
-        (x_of(&b, pasted) - 7.0).abs() < 1e-9,
-        "its geometry survived the crossing"
+        (x_of(&b, pasted) - 8.5).abs() < 1e-6,
+        "its geometry survived the crossing (at {})",
+        x_of(&b, pasted)
+    );
+    assert_eq!(
+        capscene::entity_name(&b, pasted).as_deref(),
+        Some("Crossing"),
+        "and so did its name - nothing in project B was holding it"
     );
 }
 
@@ -343,22 +361,23 @@ fn copy_paste_works_across_projects_via_the_serde_clipboard() {
 fn cut_copies_then_non_destructively_deletes_the_source() {
     let (mut e, scene) = engine_with_resolver();
     let root = capscene::create_entity(&mut e, [0.0; 3], "Cut me").expect("create");
-    let clip = capscene::cut_subtree(&mut e, &scene, root, "clip").expect("cut");
+    let (copied, gone) = capscene::cut_selection(&mut e, &scene, &[root]).expect("cut");
+    assert_eq!(gone, vec![root]);
     assert!(
-        !clip.nodes.is_empty(),
+        !copied.clipboard.is_empty(),
         "the clipboard holds the cut sub-tree"
     );
     assert!(
         !e.is_active(root),
-        "cut deactivated the source (non-destructive — undo restores)"
+        "cut deactivated the source (non-destructive - undo restores)"
     );
     assert!(
         e.ecs_entity(root).is_some(),
         "the source still EXISTS (deactivate, not destroy)"
     );
-    // Paste the cut clipboard elsewhere.
-    let pasted = capscene::paste_composition(&mut e, &clip).expect("paste the cut");
-    assert!(e.ecs_entity(pasted).is_some());
+    // Paste the cut clipboard back.
+    let made = capscene::paste_clipboard(&mut e, &scene, &copied.clipboard, 0).expect("paste the cut");
+    assert!(e.ecs_entity(made.roots[0]).is_some());
 }
 
 // ── DELETE = DEACTIVATE (undo restores + frees dependents) ─────────────────────────────────────────────
