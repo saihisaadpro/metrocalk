@@ -79,6 +79,27 @@ requireBudget(
   initialBytes <= budget.maximumInitialJavaScriptBytes,
   `Initial JavaScript is ${initialBytes} bytes; budget is ${budget.maximumInitialJavaScriptBytes}`,
 );
+// THE TWO CEILINGS HAVE TO AGREE, and until this check existed they did not (ADR-197).
+//
+// Every entry byte is also an initial byte, so `maximumInitialJavaScriptBytes` states a SECOND, implied
+// ceiling on the entry: whatever is left after the vendor chunks the entry statically imports. ADR-171
+// raised the entry ceiling 199,000 -> 210,000 and left the initial one at 403,000, which put the implied
+// entry ceiling at 208,448 — 1,552 bytes BELOW the ceiling the entry gate was checking. Every build in
+// that band is green on one gate and red on the other, and the one that shipped it (entry 209,845) was
+// discovered ten commits later by a lane that had not touched the entry at all.
+//
+// So the gate now checks its own numbers before it checks the build: an entry sitting exactly on its own
+// ceiling must still fit under the initial one. Raising one without the other fails HERE, with the
+// arithmetic in the message, instead of silently arming a trap for whoever next adds a kilobyte.
+const initialVendorBytes = initialBytes - entry.bytes;
+requireBudget(
+  budget.maximumEntryBytes + initialVendorBytes <= budget.maximumInitialJavaScriptBytes,
+  `The budget contradicts itself: an entry at its own ceiling (${budget.maximumEntryBytes}) plus the ` +
+    `${initialVendorBytes} bytes of chunks it statically imports is ` +
+    `${budget.maximumEntryBytes + initialVendorBytes}, over the initial ceiling of ` +
+    `${budget.maximumInitialJavaScriptBytes}. Raise maximumInitialJavaScriptBytes with ` +
+    `maximumEntryBytes, or a build can pass the entry gate and fail the initial one`,
+);
 requireBudget(
   largest.bytes <= budget.maximumChunkBytes,
   `Largest JavaScript chunk ${largest.file} is ${largest.bytes} bytes; budget is ${budget.maximumChunkBytes}`,
