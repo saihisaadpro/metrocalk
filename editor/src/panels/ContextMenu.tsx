@@ -21,7 +21,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEve
 import { projectionStore } from "../store/projection";
 import { duplicateSelection } from "../app/duplicateSelection";
 import { entityLabel, selectionSentence, focusSentence, focusSubject } from "../store/selectionText";
-import { setStatus } from "../store/ui";
+import { setStatus, useClipboardHasContent } from "../store/ui";
 import { pushToast, type ToastKind } from "../store/toasts";
 import { PopoverSurface } from "../theme/Popover";
 import { PopupMenuItem } from "../theme/workspace";
@@ -119,6 +119,9 @@ export function ContextMenu({
   // `actions_for_selection` reads for the two primary-only verbs. Said once here so the rows and the
   // header cannot disagree about which object `Duplicate` and `Bind…` are about.
   const primary = ids[ids.length - 1] ?? "";
+  // Whether there is anything to paste. It is read here rather than passed in because it is the
+  // one thing this menu can offer with nothing selected, and the shell has no reason to know that.
+  const hasClipboard = useClipboardHasContent();
   const shownCandidates = candidates.slice(0, MAX_CANDIDATE_ROWS);
   const hiddenCandidates = candidates.length - shownCandidates.length;
   // A stable key for the selection, so the effect below refetches when the SET changes rather than on
@@ -136,7 +139,13 @@ export function ContextMenu({
     let live = true;
     // Nothing selected is not a question worth asking: the reply is a list of refusals this surface
     // no longer renders, and the menu is ready the moment it opens.
-    if (!key.length) {
+    //
+    // **UNLESS THERE IS SOMETHING TO PASTE** (ADR-198). ADR-191's argument was against seven rows of
+    // refusal over an empty selection, not against a verb that can actually do something: `Paste` is
+    // the one row in the model whose scope is the CLIPBOARD, and right-clicking empty space after a
+    // copy is the commonest clipboard gesture there is. The rows are filtered to the available ones
+    // below, so what an empty selection can still show is exactly the verbs that work.
+    if (!key.length && !hasClipboard) {
       setAnswer(EMPTY);
       setLoadState("ready");
       return;
@@ -144,7 +153,7 @@ export function ContextMenu({
     setLoadState("loading");
     setAnswer(EMPTY);
     client
-      .entityActionsFor(key.split(","))
+      .entityActionsFor(key ? key.split(",") : [])
       .then((next) => {
         if (!live) return;
         setAnswer(next);
@@ -158,7 +167,7 @@ export function ContextMenu({
     return () => {
       live = false;
     };
-  }, [key, client]);
+  }, [client, key, hasClipboard]);
 
   // WITH NOTHING SELECTED THERE ARE NO VERBS, AND SEVEN REFUSALS ARE NOT AN EXPLANATION.
   //
@@ -169,7 +178,10 @@ export function ContextMenu({
   // and repeating it seven times is `<ux_quality>` 6's inert controls rather than ADR-016's
   // explained refusals. The verbs are about the selection; with no selection the pointer's list is
   // the menu.
-  const actions = ids.length ? answer.items : [];
+  // ...and with nothing selected, ONLY the rows that can act (ADR-198). The argument above is
+  // against a wall of identical refusals, not against a usable verb: `Paste` is scoped to the
+  // clipboard rather than to the selection, so it is available here and everything else is not.
+  const actions = ids.length ? answer.items : answer.items.filter((item) => item.available);
 
   // `Select similar` is a SELECTION verb, not a mutation, so it is answered here rather than by the
   // engine's action model: the fact it matches on (the content-addressed mesh handle, else the
@@ -193,7 +205,9 @@ export function ContextMenu({
   // ONE RING OVER BOTH SECTIONS. `Under the pointer` leads it, the registry's actions follow, and the
   // similar row sits last — so the keyboard contract does not change shape depending on whether the
   // object has something to match on, or whether the click landed on anything.
-  const hasSimilarRow = loadState === "ready" && actions.length > 0;
+  // `Select similar` asks a question ABOUT a selected object, so it needs one — `actions.length`
+  // stopped implying that the moment an empty selection could still offer `Paste` (ADR-198).
+  const hasSimilarRow = loadState === "ready" && ids.length > 0 && actions.length > 0;
   const rowCount = shownCandidates.length + actions.length + (hasSimilarRow ? 1 : 0);
 
   // `Popover` already supplies the menu role in the integrated app. Render this surface as its labelled
@@ -510,7 +524,7 @@ export function ContextMenu({
           and opens only if there is a selection or something under the pointer), so this is the
           component's own floor rather than a state a gesture produces — and a `PopoverSurface`
           rendering an empty box is worse than any sentence. */}
-      {ids.length === 0 && candidates.length === 0 && (
+      {ids.length === 0 && candidates.length === 0 && actions.length === 0 && (
         <div role="status" style={{ padding: `${space.md}px ${space.lg}px`, color: color.text.muted }}>
           Nothing here, and nothing selected.
         </div>

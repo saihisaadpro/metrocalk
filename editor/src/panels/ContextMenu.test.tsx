@@ -9,12 +9,16 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ContextMenu } from "./ContextMenu";
 import { projectionStore } from "../store/projection";
 import { toastStore } from "../store/toasts";
+import { uiStore } from "../store/ui";
 import { fakeClient } from "../transport/test-client";
 import type { ActionItem, EntityProjection, SelectionActions } from "../transport/protocol";
 
 afterEach(() => {
   projectionStore.getState().reset();
   toastStore.getState().reset();
+  // The clipboard is session state and one case below fills it; a test that leaked it would change
+  // what the NEXT case's empty selection is allowed to offer.
+  uiStore.getState().setClipboard({ objects: 0, parts: 0, cut: false, label: "" });
 });
 
 /** An action the way the engine states it — `appliesTo` IS the availability (ADR-183). */
@@ -374,6 +378,43 @@ test("with nothing selected there are no verbs — SUPERSEDES the seven-fold ref
   expect(screen.queryByTestId("ctxmenu-subject")).toBeNull();
 });
 
+test("with nothing selected but something HELD, the one row that can act is offered (ADR-198)", async () => {
+  loadScene([{ id: "e2", name: "Weld Gun" }]);
+  uiStore.getState().setClipboard({ objects: 3, parts: 9, cut: false, label: "3 objects" });
+  const pasteClipboard = vi.fn(() => Promise.resolve({ created: ["p1"], entities: 3 }));
+  // The engine answers an empty selection with refusals for every verb EXCEPT paste, whose scope is
+  // the clipboard. ADR-191's argument was against a wall of identical "nothing is selected" rows, not
+  // against a verb that works — and right-clicking empty space after a copy is the commonest
+  // clipboard gesture there is.
+  const entityActionsFor = vi.fn(() =>
+    Promise.resolve(
+      answer(0, [
+        act("remove", "Delete", 0, true, "nothing is selected"),
+        act("paste", "Paste", 3, true),
+      ]),
+    ),
+  );
+  render(
+    <ContextMenu
+      client={fakeClient({ entityActionsFor, pasteClipboard })}
+      ids={[]}
+      candidates={[under("e2", 12)]}
+      onClose={vi.fn()}
+    />,
+  );
+
+  const rows = await screen.findAllByTestId("ctxitem");
+  // ONE row: the refusals are still not rendered here, and neither is `Select similar`, which asks a
+  // question about a selected object and has none.
+  expect(rows).toHaveLength(1);
+  expect(rows[0].dataset.action).toBe("paste");
+  expect(screen.queryByText("nothing is selected")).toBeNull();
+  expect(entityActionsFor).toHaveBeenCalledWith([]);
+
+  fireEvent.click(rows[0]);
+  await waitFor(() => expect(pasteClipboard).toHaveBeenCalled());
+});
+
 test("a menu with nothing in it says so rather than rendering an empty box", async () => {
   render(<ContextMenu client={fakeClient({})} ids={[]} candidates={[]} onClose={vi.fn()} />);
   expect(await screen.findByText("Nothing here, and nothing selected.")).toBeTruthy();
@@ -454,7 +495,7 @@ test("choosing the one BEHIND selects it — the whole point of the section", as
   expect(onClose).toHaveBeenCalled();
 });
 
-test("with NOTHING selected the list is the menu — no verbs, and the engine is not asked", async () => {
+test("with nothing selected AND an empty clipboard the list is the menu — no verbs, and the engine is not asked", async () => {
   loadScene([{ id: "e2", name: "Weld Gun" }]);
   // The engine answers an empty selection with a list of REFUSALS — six rows all reading "nothing is
   // selected". The `.exe` capture showed two live rows above seven of them, taking two thirds of the
