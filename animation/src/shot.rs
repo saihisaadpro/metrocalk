@@ -133,6 +133,22 @@ pub struct ShotCamera {
     pub look_at: [f32; 3],
     /// Vertical field of view, degrees.
     pub fov_deg: f32,
+    /// ADR-195 — THE HEAD TURNS, THE TRIPOD DOES NOT MOVE. `None` is a locked-off camera: the pose
+    /// above is filmed exactly as authored however far the subject walks, which is what every
+    /// placed camera did before this field existed and what every document authored without it
+    /// still opens as.
+    ///
+    /// `Some(offset)` is a camera on a **panning head**: the eye stays bolted where the author put
+    /// it and only the aim follows, at `subject.center + offset`. It stores the OFFSET rather than
+    /// a bare flag because an author does not aim at a centroid — they aim at a head, a tool tip,
+    /// the corner of a pallet. Re-aiming at the centre the instant tracking is switched on would
+    /// change the frame they just composed, which is the one thing this must not do; carrying the
+    /// offset makes switching it on **bit-identical** while the subject is where it was, and only
+    /// motion changes the picture.
+    ///
+    /// One field, not two, so it is impossible to be following without a framing to preserve.
+    #[serde(default)]
+    pub track: Option<[f32; 3]>,
 }
 
 /// The shortest stand-off an authored camera may be stored at. Below this the eye and the aim are the
@@ -159,6 +175,69 @@ impl ShotCamera {
             return false;
         }
         self.range() >= MIN_AUTHORED_RANGE
+    }
+
+    /// Where this camera is aiming RIGHT NOW, given where its subject is right now.
+    ///
+    /// The authored point for a locked-off camera; the subject's live centre plus the stored
+    /// framing offset for a panning head. The eye is never consulted here and never moves —
+    /// re-placing a camera the author placed is exactly the reinterpretation the doc comment above
+    /// forbids, and "follow it" is a request to turn the head, not to move the tripod.
+    ///
+    /// FALLS BACK when the live aim would collapse onto the eye. A subject that walks into the lens
+    /// leaves no look direction at all, and a camera with an undefined forward vector renders a
+    /// frame of nothing; the authored aim is the one point known to be a legal stand-off from this
+    /// eye, because [`Self::is_usable`] checked it where it was stored.
+    #[must_use]
+    pub fn aim_at(&self, subject_center: [f32; 3]) -> [f32; 3] {
+        let Some(offset) = self.track else {
+            return self.look_at;
+        };
+        let live = [
+            subject_center[0] + offset[0],
+            subject_center[1] + offset[1],
+            subject_center[2] + offset[2],
+        ];
+        let d = [
+            self.eye[0] - live[0],
+            self.eye[1] - live[1],
+            self.eye[2] - live[2],
+        ];
+        let range = d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt();
+        if range.is_finite() && range >= MIN_AUTHORED_RANGE {
+            live
+        } else {
+            self.look_at
+        }
+    }
+
+    /// Put this camera's head on the subject, recording the framing it has right now as the offset
+    /// to preserve. Idempotent at rest, and the inverse of [`Self::locked_off`].
+    #[must_use]
+    pub fn following(self, subject_center: [f32; 3]) -> Self {
+        Self {
+            track: Some([
+                self.look_at[0] - subject_center[0],
+                self.look_at[1] - subject_center[1],
+                self.look_at[2] - subject_center[2],
+            ]),
+            ..self
+        }
+    }
+
+    /// Lock the head off: the authored aim, filmed as authored, wherever the subject goes.
+    #[must_use]
+    pub fn locked_off(self) -> Self {
+        Self {
+            track: None,
+            ..self
+        }
+    }
+
+    /// True when this camera's head follows its subject.
+    #[must_use]
+    pub fn is_following(&self) -> bool {
+        self.track.is_some()
     }
 
     /// The stand-off: how far the eye is from what it aims at.
@@ -807,6 +886,118 @@ impl Cutscene {
     }
 }
 
+/// Where along a placed shot's move the world is asked about it.
+///
+/// The authored pose, the middle and the end. A placed camera is never re-placed, so this is not a
+/// search like [`PATH_SAMPLES`] — it is three questions, and the middle one is there because an orbit
+/// swings THROUGH the thing it will end up clear of. Three and not five: this is a diagnostic paid for
+/// on every read of a cutscene, not a per-candidate cost paid once per film.
+const PLACED_PATH_SAMPLES: [f32; 3] = [0.0, 0.5, 1.0];
+
+/// What the WORLD has to say about the shots whose cameras the author placed — the half
+/// [`Cutscene::problems`] structurally cannot answer, in the same vocabulary and on the same list.
+///
+/// **Why this is a separate function and not more of `problems()`.** `problems()` is a pure reading of
+/// the document: two shots framed alike, a shot too short for its pacing, an opener that starts tight.
+/// Every one of those is decidable from the cutscene alone. Whether a camera is standing inside a wall
+/// is not a fact about the cutscene at all — it is a fact about the other 15,710 parts of an imported
+/// factory, and the only thing that can answer it is the engine holding the scene. So the words live
+/// here, beside the rest of the vocabulary, and the measurement is supplied by the caller.
+///
+/// **Why only placed cameras.** A card shot's placement is already negotiated against exactly this
+/// measurement — [`plan_shot`] walks a ladder of alternatives until the world stops objecting, and
+/// widens or swings the shot until it does. Warning about a card shot would be advice about something
+/// the engine has already handled, and about controls (`size`, `angle`) whose values the author did not
+/// choose. A placed camera is the one case where the engine deliberately does NOT correct anything —
+/// see [`solve_shot_adjusted`] — and a promise not to interfere is exactly what obliges it to speak.
+///
+/// **Never blocking, never corrective.** Nothing here moves a camera. One line per shot, worst fault
+/// first, because a camera buried in a machine cannot see its subject either and saying both is saying
+/// the same thing twice.
+///
+/// `subject_center` is where that shot's subject is standing (the panning head's aim needs it, and a
+/// locked-off camera ignores it); `look` is the world's verdict on one pose, the same answer
+/// [`plan_shot`] negotiates against. A caller with no occlusion data hands back [`Vantage::OPEN`] and
+/// this returns nothing at all.
+#[must_use]
+pub fn placed_camera_problems(
+    cut: &Cutscene,
+    mut subject_center: impl FnMut(usize, &ShotRecipe) -> [f32; 3],
+    mut look: impl FnMut(usize, &CameraSample) -> Vantage,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (index, shot) in cut.shots.iter().enumerate() {
+        let Some(camera) = shot.camera.filter(ShotCamera::is_usable) else {
+            continue;
+        };
+        let center = subject_center(index, shot);
+        let still = matches!(shot.motion, ShotMove::Hold) || shot.amount.clamp(0.0, 1.0) == 0.0;
+        let samples: &[f32] = if still {
+            &PLACED_PATH_SAMPLES[..1]
+        } else {
+            &PLACED_PATH_SAMPLES
+        };
+        // The worst moment decides, and WHICH moment it was changes the sentence: "your camera is in
+        // a wall" and "your push-in ends in a wall" are different faults with different fixes, and a
+        // message that cannot tell them apart sends the author to re-place a camera that was fine.
+        let mut worst: Option<(bool, Vantage)> = None;
+        for &progress in samples {
+            let pose = solve_placed_shot(shot, camera, center, ease_in_out(progress));
+            let vantage = look(index, &pose);
+            let moving = progress > 0.0;
+            match worst {
+                Some((_, held)) if held.score() <= vantage.score() => {}
+                _ => worst = Some((moving, vantage)),
+            }
+        }
+        let Some((moving, vantage)) = worst else {
+            continue;
+        };
+        let n = index + 1;
+        // At the authored pose the author is looking at the fault on the stage; anywhere else they are
+        // not, because what the stage shows them is the frame they placed and not the frame the move
+        // arrives at. Two sentences, because "your camera is in a wall" and "your push-in ends in a
+        // wall" are different faults with different fixes — one moves the tripod, the other softens
+        // the move — and a message that cannot tell them apart sends the author to the wrong control.
+        if vantage.eye_inside {
+            out.push(if moving {
+                format!(
+                    "shot {n}'s move takes its camera inside something — those frames will be solid \
+                     colour"
+                )
+            } else {
+                format!("shot {n}'s camera is inside something — that frame will be solid colour")
+            });
+        } else if vantage.clear < MIN_CLEAR_FRACTION {
+            let hidden = (1.0 - vantage.clear.clamp(0.0, 1.0)) * 100.0;
+            out.push(if moving {
+                format!(
+                    "shot {n}'s move puts {hidden:.0}% of its subject behind something else before it \
+                     ends"
+                )
+            } else {
+                format!(
+                    "shot {n}'s subject is mostly hidden from where its camera stands — {hidden:.0}% \
+                     of it is behind something else"
+                )
+            });
+        } else if vantage.crowded > MAX_CROWDED_FRACTION {
+            out.push(if moving {
+                format!(
+                    "shot {n}'s move takes its camera into a corner — most of the frame it ends on is \
+                     whatever it is standing against"
+                )
+            } else {
+                format!(
+                    "shot {n}'s camera is boxed in — most of that frame is whatever it is standing \
+                     against"
+                )
+            });
+        }
+    }
+    out
+}
+
 /// What the solver needs to know about the thing being filmed, sampled LIVE each tick.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SubjectSample {
@@ -932,7 +1123,7 @@ pub fn solve_shot(
     fov_deg: f32,
 ) -> CameraSample {
     if let Some(camera) = shot.camera.filter(ShotCamera::is_usable) {
-        return solve_placed_shot(shot, camera, progress);
+        return solve_placed_shot(shot, camera, subject.center, progress);
     }
     let p = progress.clamp(0.0, 1.0);
     let amount = shot.amount.clamp(0.0, 1.0);
@@ -989,7 +1180,16 @@ pub fn solve_shot(
 ///
 /// The aim is held fixed through every verb. A crane that re-aimed as it rose would be a camera on a
 /// boom with nobody operating the head, and the author's frame is the one thing this must preserve.
-fn solve_placed_shot(shot: &ShotRecipe, camera: ShotCamera, progress: f32) -> CameraSample {
+///
+/// ADR-195 — `subject_center` is consulted ONLY through [`ShotCamera::aim_at`], and that returns the
+/// authored point unless the author asked for a panning head. So a locked-off camera is still a pure
+/// function of its own pose: the subject can be sampled anywhere at all and the frame does not move.
+fn solve_placed_shot(
+    shot: &ShotRecipe,
+    camera: ShotCamera,
+    subject_center: [f32; 3],
+    progress: f32,
+) -> CameraSample {
     // THE MOVE SCALES OFF THE SHOT'S OWN STAND-OFF, not off the subject. On the card path a crane
     // rises `radius * 4.0` from a distance of roughly `radius * 4.9`, and falls `radius * 2.0` — so
     // the verbs are really "about eight tenths of the stand-off up" and "about four tenths down".
@@ -1004,8 +1204,19 @@ fn solve_placed_shot(shot: &ShotRecipe, camera: ShotCamera, progress: f32) -> Ca
 
     let p = progress.clamp(0.0, 1.0);
     let amount = shot.amount.clamp(0.0, 1.0);
-    let range = camera.range();
-    let look_at = camera.look_at;
+    // THE LIVE AIM, and every length below is measured against it. A push-in on a panning head
+    // closes a fifth of the distance to where the subject IS, not to where it was standing when the
+    // author pressed the button — the two are the same shot only while nothing moves, and a move
+    // solved against a stale sight line is a camera sliding past its subject.
+    let look_at = camera.aim_at(subject_center);
+    let range = {
+        let d = [
+            camera.eye[0] - look_at[0],
+            camera.eye[1] - look_at[1],
+            camera.eye[2] - look_at[2],
+        ];
+        d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt()
+    };
 
     let (dist_scale, height_extra, yaw_extra) = match shot.motion {
         ShotMove::Hold => (1.0, 0.0, 0.0),
@@ -2480,6 +2691,7 @@ mod tests {
                 eye: [6.0, 3.0, 8.0],
                 look_at: [0.0, 0.5, 0.0],
                 fov_deg: 45.0,
+                track: None,
             }),
             ..shot(ShotSize::Close, ShotAngle::Profile, ShotMove::Hold)
         }
@@ -2511,6 +2723,7 @@ mod tests {
             eye: [6.0, 3.0, 8.0],
             look_at: [0.0, 0.5, 0.0],
             fov_deg: 45.0,
+            track: None,
         };
         let mut poses = Vec::new();
         for size in [
@@ -2652,6 +2865,7 @@ mod tests {
             eye: [4.0, -3.0, 4.0],
             look_at: [0.0, 0.0, 0.0],
             fov_deg: 40.0,
+            track: None,
         };
         let s = ShotRecipe {
             camera: Some(underground),
@@ -2701,16 +2915,19 @@ mod tests {
                 eye: [1.0, 1.0, 1.0],
                 look_at: [1.0, 1.0, 1.0],
                 fov_deg: 45.0,
+                track: None,
             },
             ShotCamera {
                 eye: [f32::NAN, 0.0, 0.0],
                 look_at: [0.0, 0.0, 0.0],
                 fov_deg: 45.0,
+                track: None,
             },
             ShotCamera {
                 eye: [3.0, 0.0, 0.0],
                 look_at: [0.0, 0.0, 0.0],
                 fov_deg: 0.0,
+                track: None,
             },
         ] {
             assert!(!bad.is_usable());
@@ -2732,6 +2949,7 @@ mod tests {
             eye: [0.0, 2.0, 10.0],
             look_at: [0.0, 0.0, 0.0],
             fov_deg: 45.0,
+            track: None,
         };
         let swung = |degrees: f32| {
             let (sin, cos) = degrees.to_radians().sin_cos();
@@ -2801,6 +3019,7 @@ mod tests {
                 eye: [0.0, 2.0, 40.0],
                 look_at: [0.0, 0.0, 0.0],
                 fov_deg: 45.0,
+                track: None,
             }),
             ..tight
         })));
@@ -2835,5 +3054,421 @@ mod tests {
         );
         let back: ShotRecipe = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(back, s);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-195 — the head turns, the tripod does not move.
+    // ---------------------------------------------------------------------------------------------
+
+    /// The subject `cube()` describes, moved.
+    fn cube_at(center: [f32; 3]) -> SubjectSample {
+        SubjectSample { center, ..cube() }
+    }
+
+    #[test]
+    fn switching_the_head_on_changes_nothing_while_the_subject_is_where_it_was() {
+        // THE WHOLE PROMISE OF STORING AN OFFSET. If turning tracking on moved the frame, an author
+        // would have to re-compose every shot they asked to follow — and would learn that only when
+        // they played it back.
+        let locked = placed(ShotMove::Hold, 0.35);
+        let following = ShotRecipe {
+            camera: Some(locked.camera.unwrap().following(cube().center)),
+            ..locked.clone()
+        };
+        assert!(following.camera.unwrap().is_following());
+        for motion in [
+            ShotMove::Hold,
+            ShotMove::PushIn,
+            ShotMove::PullOut,
+            ShotMove::Orbit,
+            ShotMove::CraneUp,
+            ShotMove::CraneDown,
+        ] {
+            for progress in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let a = solve_shot(
+                    &ShotRecipe {
+                        motion,
+                        ..locked.clone()
+                    },
+                    cube(),
+                    progress,
+                    16.0 / 9.0,
+                    50.0,
+                );
+                let b = solve_shot(
+                    &ShotRecipe {
+                        motion,
+                        ..following.clone()
+                    },
+                    cube(),
+                    progress,
+                    16.0 / 9.0,
+                    50.0,
+                );
+                assert_eq!(a, b, "{motion:?} at {progress} moved when the head came on");
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "\"the tripod did not move\" is a BIT-IDENTICAL claim; a tolerance here would pass \
+                  an implementation that re-solved the eye and landed near it"
+    )]
+    fn a_following_head_re_aims_and_never_re_places() {
+        let locked = placed(ShotMove::Hold, 0.35);
+        let camera = locked.camera.unwrap();
+        let following = ShotRecipe {
+            camera: Some(camera.following(cube().center)),
+            ..locked.clone()
+        };
+        let walked = [4.0, 0.0, -2.0];
+        let pose = solve_shot(&following, cube_at(walked), 0.5, 16.0 / 9.0, 50.0);
+
+        // The tripod is bolted down: bit-identical to the pose the author placed.
+        assert_eq!(pose.eye, camera.eye, "the eye moved");
+        assert_eq!(pose.fov_deg, camera.fov_deg, "the lens changed");
+        // ...and the aim moved by exactly what the subject did, so the framing the author composed
+        // — a hair above centre, or wherever they put it — is preserved rather than re-derived.
+        for ((got, authored), moved) in pose.look_at.iter().zip(camera.look_at).zip(walked) {
+            assert!(
+                (got - (authored + moved)).abs() < 1.0e-4,
+                "{:?} is not the authored aim carried by the subject",
+                pose.look_at
+            );
+        }
+
+        // THE NEGATIVE CONTROL: the same subject walk, locked off, films the authored frame.
+        let held = solve_shot(&locked, cube_at(walked), 0.5, 16.0 / 9.0, 50.0);
+        assert_eq!(held.eye, camera.eye);
+        assert_eq!(
+            held.look_at, camera.look_at,
+            "a locked-off camera followed the subject"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the authored pose is preserved BIT-IDENTICALLY or it is not preserved"
+    )]
+    fn a_following_push_in_closes_on_where_the_subject_is_now() {
+        // A move solved against the stale sight line would slide past a subject that has walked.
+        let base = placed(ShotMove::PushIn, 1.0);
+        let camera = base.camera.unwrap();
+        let following = ShotRecipe {
+            camera: Some(camera.following(cube().center)),
+            ..base
+        };
+        let walked = [-6.0, 0.0, 0.0];
+        let end = solve_shot(&following, cube_at(walked), 1.0, 16.0 / 9.0, 50.0);
+        let live_aim = [
+            camera.look_at[0] + walked[0],
+            camera.look_at[1] + walked[1],
+            camera.look_at[2] + walked[2],
+        ];
+        // A full-strength push-in keeps a fifth of the stand-off — measured to the LIVE aim.
+        let started = dist(camera.eye, live_aim);
+        assert!(
+            (dist(end.eye, live_aim) - started * 0.2).abs() < 1.0e-3,
+            "the push-in closed on the wrong point: {end:?}"
+        );
+        assert_eq!(end.look_at, live_aim);
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the authored pose is preserved BIT-IDENTICALLY or it is not preserved"
+    )]
+    fn a_subject_that_walks_into_the_lens_falls_back_to_the_authored_aim() {
+        let base = placed(ShotMove::Hold, 0.0);
+        let camera = base.camera.unwrap().following(cube().center);
+        // Put the subject exactly where the offset lands the aim ON the eye.
+        let onto_the_lens = [
+            camera.eye[0] - camera.track.unwrap()[0],
+            camera.eye[1] - camera.track.unwrap()[1],
+            camera.eye[2] - camera.track.unwrap()[2],
+        ];
+        assert_eq!(camera.aim_at(onto_the_lens), camera.look_at);
+        let pose = solve_shot(
+            &ShotRecipe {
+                camera: Some(camera),
+                ..base
+            },
+            cube_at(onto_the_lens),
+            0.5,
+            16.0 / 9.0,
+            50.0,
+        );
+        assert_eq!(pose.eye, camera.eye);
+        assert_eq!(pose.look_at, camera.look_at);
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the authored pose is preserved BIT-IDENTICALLY or it is not preserved"
+    )]
+    fn a_head_can_be_switched_off_again_and_locking_off_is_the_inverse() {
+        let camera = placed(ShotMove::Hold, 0.0).camera.unwrap();
+        assert!(!camera.is_following());
+        let following = camera.following([1.0, 2.0, 3.0]);
+        assert!(following.is_following());
+        assert_eq!(following.locked_off(), camera);
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the authored pose is preserved BIT-IDENTICALLY or it is not preserved"
+    )]
+    fn a_cutscene_authored_before_heads_existed_opens_locked_off() {
+        // The one compatibility question: `track` must default, not fail, and must default to the
+        // behaviour every placed camera already had.
+        let json = r#"{"eye":[6.0,3.0,8.0],"lookAt":[0.0,0.5,0.0],"fovDeg":45.0}"#;
+        let back: ShotCamera = serde_json::from_str(json).expect("deserialise");
+        assert!(!back.is_following());
+        assert_eq!(back.aim_at([100.0, 100.0, 100.0]), back.look_at);
+    }
+
+    #[test]
+    fn a_following_head_survives_a_round_trip_through_the_document() {
+        let s = ShotRecipe {
+            camera: Some(
+                placed(ShotMove::Orbit, 0.6)
+                    .camera
+                    .unwrap()
+                    .following([1.0, 2.0, 3.0]),
+            ),
+            ..placed(ShotMove::Orbit, 0.6)
+        };
+        let json = serde_json::to_string(&s).expect("serialise");
+        assert!(json.contains("\"track\""), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ShotRecipe>(&json).expect("deserialise"),
+            s
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-195 — the world, asked about a camera the engine has promised not to move.
+    // ---------------------------------------------------------------------------------------------
+
+    fn cut_of(shots: Vec<ShotRecipe>) -> Cutscene {
+        Cutscene {
+            version: 1,
+            shots,
+            mood: Mood::Normal,
+            delivery: Delivery::Widescreen,
+            render: RenderSettings::default(),
+        }
+    }
+
+    /// A world that reports a solid ball of geometry centred on `blob`, as `SceneState::vantage`
+    /// would: buried inside it, and blind to the subject from anywhere within twice its radius.
+    fn world_with_a_blob_at(
+        blob: [f32; 3],
+        radius: f32,
+    ) -> impl FnMut(usize, &CameraSample) -> Vantage {
+        move |_, pose| {
+            let d = dist(pose.eye, blob);
+            Vantage {
+                eye_inside: d < radius,
+                clear: if d < radius * 2.0 { 0.1 } else { 1.0 },
+                backing: 0.5,
+                crowded: 0.0,
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_world_has_nothing_to_say_about_a_placed_camera() {
+        // THE NEGATIVE CONTROL, first: every message below has to be caused by the world objecting,
+        // not by the shot merely having a placed camera.
+        let cut = cut_of(vec![placed(ShotMove::PushIn, 0.8)]);
+        assert!(
+            placed_camera_problems(&cut, |_, _| cube().center, |_, _| Vantage::OPEN).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_camera_parked_in_a_wall_says_so_and_names_the_shot() {
+        let cut = cut_of(vec![placed(ShotMove::Hold, 0.0)]);
+        let eye = cut.shots[0].camera.unwrap().eye;
+        let said =
+            placed_camera_problems(&cut, |_, _| cube().center, world_with_a_blob_at(eye, 1.0));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].starts_with("shot 1's camera is inside something"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn the_move_is_judged_and_not_only_the_frame_on_the_stage() {
+        // A push-in that starts in clear air and ends inside the machine next door — the exact
+        // failure the card path's `PATH_SAMPLES` exists for, on the one path that is never planned.
+        let cut = cut_of(vec![placed(ShotMove::PushIn, 1.0)]);
+        let shot = &cut.shots[0];
+        let ends_at = solve_shot(shot, cube(), 1.0, 16.0 / 9.0, 50.0).eye;
+        let said = placed_camera_problems(
+            &cut,
+            |_, _| cube().center,
+            world_with_a_blob_at(ends_at, 0.5),
+        );
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("move takes its camera inside something"),
+            "the message must send the author to the move, not to the tripod: {said:?}"
+        );
+
+        // ...and a HOLD at the same placement is silent, because it never goes there.
+        let held = cut_of(vec![placed(ShotMove::Hold, 1.0)]);
+        assert!(placed_camera_problems(
+            &held,
+            |_, _| cube().center,
+            world_with_a_blob_at(ends_at, 0.5)
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_blocked_view_is_reported_with_how_much_of_the_subject_is_gone() {
+        let cut = cut_of(vec![placed(ShotMove::Hold, 0.0)]);
+        let said = placed_camera_problems(
+            &cut,
+            |_, _| cube().center,
+            |_, _| Vantage {
+                clear: 0.25,
+                ..Vantage::OPEN
+            },
+        );
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("75%"), "{said:?}");
+        // At the threshold itself the shot is acceptable and nothing is said.
+        assert!(placed_camera_problems(
+            &cut,
+            |_, _| cube().center,
+            |_, _| Vantage {
+                clear: MIN_CLEAR_FRACTION,
+                ..Vantage::OPEN
+            }
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_boxed_in_camera_is_reported_once_and_never_twice_for_one_shot() {
+        let cut = cut_of(vec![placed(ShotMove::Hold, 0.0)]);
+        let said = placed_camera_problems(
+            &cut,
+            |_, _| cube().center,
+            |_, _| Vantage {
+                eye_inside: true,
+                clear: 0.0,
+                backing: 0.0,
+                crowded: 0.9,
+            },
+        );
+        assert_eq!(
+            said.len(),
+            1,
+            "three faults on one camera are one sentence: {said:?}"
+        );
+        assert!(said[0].contains("inside something"), "{said:?}");
+        let crowded = placed_camera_problems(
+            &cut,
+            |_, _| cube().center,
+            |_, _| Vantage {
+                crowded: 0.9,
+                ..Vantage::OPEN
+            },
+        );
+        assert!(crowded[0].contains("boxed in"), "{crowded:?}");
+    }
+
+    #[test]
+    fn a_card_shot_is_never_reported_because_the_planner_already_moved_it() {
+        // The planner walks a ladder until the world stops objecting. Repeating its findings here
+        // would be advice about `size` and `angle` values the author did not choose.
+        let cut = cut_of(vec![shot(
+            ShotSize::Close,
+            ShotAngle::Front,
+            ShotMove::PushIn,
+        )]);
+        assert!(placed_camera_problems(
+            &cut,
+            |_, _| cube().center,
+            |_, _| Vantage {
+                eye_inside: true,
+                clear: 0.0,
+                backing: 0.0,
+                crowded: 1.0
+            }
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_world_is_asked_about_the_pose_a_following_head_actually_films() {
+        // The diagnostic has to measure the SAME camera the runtime films, or a shot that follows
+        // its subject into the open would keep being reported as buried where it used to point.
+        let base = placed(ShotMove::PushIn, 1.0);
+        let camera = base.camera.unwrap().following(cube().center);
+        let cut = cut_of(vec![ShotRecipe {
+            camera: Some(camera),
+            ..base
+        }]);
+        let walked = [-20.0, 0.0, 0.0];
+        // A blob where the LOCKED-OFF push-in would have ended. With the head following a subject
+        // that walked away, the move now ends somewhere else entirely.
+        let stale_end = solve_shot(
+            &cut_of(vec![ShotRecipe {
+                camera: Some(camera.locked_off()),
+                ..cut.shots[0].clone()
+            }])
+            .shots[0],
+            cube(),
+            1.0,
+            16.0 / 9.0,
+            50.0,
+        )
+        .eye;
+        assert!(placed_camera_problems(
+            &cut,
+            |_, _| cube_at(walked).center,
+            world_with_a_blob_at(stale_end, 0.5)
+        )
+        .is_empty());
+        // ...and it IS reported where the following move really goes.
+        let live_end = solve_shot(&cut.shots[0], cube_at(walked), 1.0, 16.0 / 9.0, 50.0).eye;
+        assert!(!placed_camera_problems(
+            &cut,
+            |_, _| cube_at(walked).center,
+            world_with_a_blob_at(live_end, 0.5)
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn every_placed_shot_in_a_cutscene_is_asked_about_and_numbered() {
+        let cut = cut_of(vec![
+            shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold),
+            placed(ShotMove::Hold, 0.0),
+            placed(ShotMove::Hold, 0.0),
+        ]);
+        let said = placed_camera_problems(
+            &cut,
+            |_, _| cube().center,
+            |_, _| Vantage {
+                eye_inside: true,
+                ..Vantage::OPEN
+            },
+        );
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].starts_with("shot 2's"), "{said:?}");
+        assert!(said[1].starts_with("shot 3's"), "{said:?}");
     }
 }

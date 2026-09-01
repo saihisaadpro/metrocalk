@@ -111,6 +111,20 @@ export type Expect = {
    *  Without it, "disable what a placed camera decides" is satisfiable by disabling the whole grid,
    *  and the scene would photograph a shot inspector with more dead in it than the ADR claims. */
   enabled?: string[];
+  /** Toggles that must be announcing themselves ON (`aria-pressed="true"`).
+   *
+   *  The state a toggle exists to communicate, and the one neither `present` nor `enabled` can see:
+   *  both are equally satisfied by a toggle that is off. Three scenes in this file asserted a pressed
+   *  state IN PROSE — "visibly PRESSED (aria-pressed), not merely present" — with nothing behind the
+   *  words, which is the same shape as a `looking_for` describing a control that is not there.
+   *
+   *  Read from `aria-pressed` and never from `.is-active`: a fill that has drifted from the announced
+   *  state is exactly the drift worth catching, and a button that paints itself on while telling a
+   *  screen reader it is off is off. */
+  pressed?: string[];
+  /** The dual, and `aria-pressed` ABSENT fails it: a control with no pressed state at all is not a
+   *  toggle, and a scene claiming it is off is describing something that is not there. */
+  unpressed?: string[];
   /** The exact dual: `a` and `b` are separate sentences, on separate lines, `a` above `b`.
    *
    *  `same_line` could only ever assert the defect it was written against here. The rig panel's
@@ -695,24 +709,33 @@ const PLACED_CAMERA = {
   // `CAMERA_FOV_DEG` — the lens the viewport actually draws through, and what `camera_probe` now
   // reports. It answered a bare 45 until this session, for a projection that has never used one.
   fovDeg: 55,
+  // ADR-195 — LOCKED OFF, which is what every placed camera was before this field existed and what
+  // the scene beside this one shows the other half of.
+  track: null as [number, number, number] | null,
 };
 
-const placedCameraClient = () => {
-  const rows = CUTSCENE.rows.map((row) =>
-    row.index === 0
-      ? {
-          ...row,
-          camera: PLACED_CAMERA,
-          reads: "a placed shot of Assembly Hall, pulling out — 2.5s",
-        }
-      : row,
-  );
+/** ADR-195 — the same camera with a panning head on it: the eye is bolted where the author put it
+ *  and the aim follows the subject, at the framing offset the engine resolved when they asked. */
+const FOLLOWING_CAMERA = {
+  ...PLACED_CAMERA,
+  track: [0.2, 1.35, 0.4] as [number, number, number],
+};
+
+const placedCameraClient = (
+  camera: typeof PLACED_CAMERA = PLACED_CAMERA,
+  extraProblems: string[] = [],
+) => {
+  const following = camera.track !== null;
+  const reads = following
+    ? "a placed shot of Assembly Hall, pulling out, keeping it framed — 2.5s"
+    : "a placed shot of Assembly Hall, pulling out — 2.5s";
+  const rows = CUTSCENE.rows.map((row) => (row.index === 0 ? { ...row, camera, reads } : row));
   const cut: CinemaReply = {
     ...CUTSCENE,
     rows,
     reads: rows.map((row) => row.reads),
     // The jump cut between shots 4 and 5 is still real; the placed shot simply is not part of it.
-    problems: CUTSCENE.problems,
+    problems: [...CUTSCENE.problems, ...extraProblems],
   };
   return {
     ...cutsceneClient(),
@@ -721,6 +744,8 @@ const placedCameraClient = () => {
       Promise.resolve({ ...cut, entity: id, message: `Shot ${index + 1} is now ${rows[index]?.reads ?? "placed"}` }),
     cinemaClearShotCamera: (id: string, index: number) =>
       Promise.resolve({ ...CUTSCENE, entity: id, message: `Shot ${index + 1} is now ${CUTSCENE.rows[index]?.reads ?? "back on its card"}` }),
+    cinemaSetShotTracking: (id: string, index: number) =>
+      Promise.resolve({ ...cut, entity: id, message: `Shot ${index + 1} is now ${rows[index]?.reads ?? "placed"}` }),
   } as unknown as EditorClient;
 };
 
@@ -1483,6 +1508,9 @@ export const SCENES: Scene[] = [
       disabled: ["[data-testid='cutscene-size']", "[data-testid='cutscene-angle']"],
       // ...while the two controls a placed camera does NOT take over stay usable.
       enabled: ["[data-testid='cutscene-motion']", "[data-testid='cutscene-amount']"],
+      // ADR-195 — the OTHER half of `cutscene-keep-framed`, photographed on the same panel: this
+      // camera is locked off, and the toggle says so rather than merely being there.
+      unpressed: ["[data-testid='cutscene-keep-framed']"],
       unclipped: [
         "[data-testid='cutscene-shoot-here']",
         "[data-testid='cutscene-use-card']",
@@ -1495,6 +1523,81 @@ export const SCENES: Scene[] = [
       same_line: [["[data-testid='cutscene-shoot-here']", "[data-testid='cutscene-use-card']"]],
     },
     render: () => <CutscenePanel client={placedCameraClient()} />,
+  },
+  {
+    id: "cutscene-keep-framed",
+    looking_for:
+      "A PLACED CAMERA THAT KEEPS ITS SUBJECT FRAMED. The gesture beside this one stores an " +
+      "ABSOLUTE pose — the author looked at a frame and said that one — and the engine promises " +
+      "never to reinterpret it. That promise had a cost nothing said out loud: the subject walks " +
+      "away and the shot films the empty floor it used to stand on, while a CARD shot re-solves " +
+      "around the same subject sixty times a second. Check four things. First, 'Keep Assembly Hall " +
+      "framed' sits INSIDE the same toolbar as 'Re-shoot from this view', because where a camera " +
+      "stands and whether its head turns are two halves of one decision, and it names the object " +
+      "rather than saying 'tracking'. Second, it is visibly PRESSED (aria-pressed), which is the " +
+      "state and not a label. Third, the read-out beside it has stopped printing 'looking at " +
+      "<coordinates>' and reads 'aim follows Assembly Hall' — the stored point is the framing the " +
+      "offset was taken from, not a place the camera still looks, and printing it would be a number " +
+      "that stops being true the moment the subject moves. The EYE is still there, because that is " +
+      "the half which does not move: the tripod is bolted down and only the head turns. Fourth, the " +
+      "shot's own sentence reads 'keeping it framed', so a shot list read at a glance distinguishes " +
+      "a locked-off camera from a following one — the difference is invisible until something moves",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-clip']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-keep-framed']", 1],
+        ["[data-testid='cutscene-placed-pose']", 1],
+      ],
+      pressed: ["[data-testid='cutscene-keep-framed']"],
+      text_present: ["Keep Assembly Hall framed", "aim follows Assembly Hall", "keeping it framed"],
+      // The coordinate the camera has stopped using, and the caption its leftover card would give.
+      text_absent: ["looking at", "a wide shot of Assembly Hall", "null", "undefined", "NaN"],
+      enabled: ["[data-testid='cutscene-keep-framed']"],
+      unclipped: ["[data-testid='cutscene-keep-framed']", "[data-testid='cutscene-placed-pose']"],
+      untruncated: ["[data-testid='cutscene-keep-framed']"],
+      same_line: [
+        ["[data-testid='cutscene-shoot-here']", "[data-testid='cutscene-keep-framed']"],
+      ],
+    },
+    render: () => <CutscenePanel client={placedCameraClient(FOLLOWING_CAMERA)} />,
+  },
+  {
+    id: "cutscene-placed-camera-in-a-wall",
+    looking_for:
+      "THE ENGINE SAYING WHAT IT CAN SEE. A placed camera is the one placement this engine " +
+      "deliberately does NOT correct — a card shot is negotiated against a ladder of alternatives " +
+      "until the world stops objecting, but an author who framed a shot by eye was staring at the " +
+      "obstruction when they pressed the button, and moving it would be the engine quietly filming " +
+      "a different shot. The promise not to interfere is exactly what obliges it to SPEAK: before " +
+      "this, a lens parked inside a machine produced a solid-colour frame weeks later with nothing " +
+      "said at the time. Check three things. First, the warning is in the SAME list as the jump-cut " +
+      "and pacing notes at the bottom of the panel — one place the author looks for what is wrong " +
+      "with this cut, not a second box for the world's half of it. Second, it names the SHOT NUMBER " +
+      "and what will happen ('that frame will be solid colour'), in the author's words, with no " +
+      "mechanism named. Third, it is a NOTE and not a refusal: nothing is disabled, the camera is " +
+      "not moved, and 'Re-shoot from this view' is still the way out",
+    viewport: { width: 1400, height: 900 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-clip']"],
+    expect: {
+      present: [["[data-testid='cutscene-shoot-here']", 1]],
+      text_present: [
+        "shot 1's camera is inside something",
+        "that frame will be solid colour",
+      ],
+      text_absent: ["eye_inside", "vantage", "null", "undefined", "NaN"],
+      // A NOTE, not a refusal. The way out of the fault is the control that caused it.
+      enabled: ["[data-testid='cutscene-shoot-here']", "[data-testid='cutscene-keep-framed']"],
+    },
+    render: () => (
+      <CutscenePanel
+        client={placedCameraClient(FOLLOWING_CAMERA, [
+          "shot 1's camera is inside something — that frame will be solid colour",
+        ])}
+      />
+    ),
   },
   {
     id: "cutscene-frame-guide",
@@ -1525,6 +1628,9 @@ export const SCENES: Scene[] = [
       // this claim the whole scene is satisfied by a button that is present, legible, correctly
       // placed and completely dead.
       enabled: ["[data-testid='cutscene-frame-guide']", "[data-testid='cutscene-delivery']"],
+      // ADR-195 — the claim this scene's own `looking_for` has always made in prose ("visibly
+      // PRESSED (aria-pressed), NOT merely present") and nothing in the driver could see.
+      pressed: ["[data-testid='cutscene-frame-guide']"],
       unclipped: ["[data-testid='cutscene-frame-guide']"],
       same_line: [["[data-testid='cutscene-delivery']", "[data-testid='cutscene-frame-guide']"]],
     },

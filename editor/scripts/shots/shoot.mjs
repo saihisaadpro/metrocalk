@@ -1487,6 +1487,45 @@ for (const scene of scenes) {
         );
       }
     }
+    // A TOGGLE THAT IS ON MUST SAY SO. `present` sees a button, `enabled` sees that it still
+    // takes a click, and neither can tell an ON toggle from an OFF one — which is the only thing a
+    // toggle exists to communicate. Three of this file's scenes already asserted a pressed state IN
+    // PROSE ("visibly PRESSED (aria-pressed), not merely present") with no claim behind the words,
+    // and prose is not a gate.
+    //
+    // Read from `aria-pressed`, which is the state a screen reader gets, not from `.is-active`,
+    // which is the styling hook: a fill that drifted from the announced state is exactly the drift
+    // worth catching, and a control that paints itself on while telling assistive technology it is
+    // off is off.
+    for (const sel of e.pressed ?? []) {
+      const el = qs(sel);
+      if (!el) {
+        out.push(`pressed needs \`${sel}\`, which matches nothing`);
+        continue;
+      }
+      const state = el.getAttribute?.("aria-pressed");
+      if (state !== "true") {
+        out.push(
+          `\`${sel}\` is claimed pressed and reads aria-pressed="${state ?? "(absent)"}" — a toggle ` +
+            `whose ON state is not announced is a toggle whose state the user has to guess`,
+        );
+      }
+    }
+    for (const sel of e.unpressed ?? []) {
+      const el = qs(sel);
+      if (!el) {
+        out.push(`unpressed needs \`${sel}\`, which matches nothing`);
+        continue;
+      }
+      // ABSENT IS NOT OFF. A control with no `aria-pressed` at all is not a toggle, and a scene
+      // claiming it is off is describing something that is not there.
+      const state = el.getAttribute?.("aria-pressed");
+      if (state !== "false") {
+        out.push(
+          `\`${sel}\` is claimed unpressed and reads aria-pressed="${state ?? "(absent)"}"`,
+        );
+      }
+    }
     for (const [sa, sb] of e.same_line ?? []) {
       const a = qs(sa);
       const b = qs(sb);

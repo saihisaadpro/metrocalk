@@ -694,6 +694,7 @@ describe("CutscenePanel", () => {
       eye: [7.4, 2.9, -5.1] as [number, number, number],
       lookAt: [0.2, 1.35, 0.4] as [number, number, number],
       fovDeg: 55,
+      track: null,
     };
 
     /** The same four shots with the opener placed — what the engine sends back after the gesture. */
@@ -793,6 +794,104 @@ describe("CutscenePanel", () => {
       const shoot = await screen.findByTestId("cutscene-shoot-here");
       await waitFor(() => expect(shoot.hasAttribute("disabled")).toBe(true));
       expect(shoot.getAttribute("title")).toMatch(/Stop Play first/i);
+    });
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-195 — KEEP THE SUBJECT FRAMED. The one thing a placed camera could not do.
+    // ---------------------------------------------------------------------------------------------
+
+    const withFollowingOpener: CinemaReply = {
+      ...FOUR_SHOTS,
+      rows: FOUR_SHOTS.rows.map((r) =>
+        r.index === 0
+          ? {
+              ...r,
+              camera: { ...PLACED, track: [0.2, 1.35, 0.4] as [number, number, number] },
+              reads: "a placed shot of Weld Gun 7, pulling out, keeping it framed — 2.0s",
+            }
+          : r,
+      ),
+    };
+
+    it("sends a BOOLEAN, not an offset — the engine is the only side that knows where the subject is", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve(withPlacedOpener));
+      client.cinemaSetShotTracking = vi.fn(() => Promise.resolve({ ...withFollowingOpener, entity: "e1", message: "keeps it framed" }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-keep-framed"));
+      await waitFor(() => expect(client.cinemaSetShotTracking).toHaveBeenCalledWith("e1", 0, true));
+      expect(vi.mocked(client.cinemaSetShotTracking).mock.calls[0]).toHaveLength(3);
+    });
+
+    it("is a toggle: pressed while the head is on, and pressing it again locks the camera off", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve(withFollowingOpener));
+      client.cinemaSetShotTracking = vi.fn(() => Promise.resolve({ ...withPlacedOpener, entity: "e1", message: "locked off" }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      const toggle = await screen.findByTestId("cutscene-keep-framed");
+      expect(toggle.getAttribute("aria-pressed")).toBe("true");
+      fireEvent.click(toggle);
+      await waitFor(() => expect(client.cinemaSetShotTracking).toHaveBeenCalledWith("e1", 0, false));
+    });
+
+    it("names the object it follows, on the control and in the read-out", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve(withFollowingOpener));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      const subject = withFollowingOpener.rows[0].subjectName;
+      expect((await screen.findByTestId("cutscene-keep-framed")).textContent).toContain(subject);
+      // AND `lookAt` IS GONE from the read-out. It is the framing the offset was taken from, not a
+      // point the camera still uses, and printing it as "looking at" would be a coordinate that
+      // stops being true the moment the subject moves.
+      const pose = screen.getByTestId("cutscene-placed-pose");
+      expect(pose.textContent).toMatch(/aim follows/);
+      expect(pose.textContent).not.toMatch(/looking at/);
+      expect(pose.textContent).toMatch(/7\.40, 2\.90, -5\.10/);
+    });
+
+    it("offers the head only where there is a camera to put it on", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve(withPlacedOpener));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      const clips = await screen.findAllByTestId("cutscene-clip");
+      fireEvent.click(clips[0]);
+      expect(await screen.findByTestId("cutscene-keep-framed")).toBeTruthy();
+      // Shot 2 films from its card, which already re-solves around its subject every tick.
+      fireEvent.click(clips[1]);
+      await waitFor(() => expect(screen.getByTestId("cutscene-shot-editor").textContent).toMatch(/Shot 2 of 4/));
+      expect(screen.queryByTestId("cutscene-keep-framed")).toBeNull();
+    });
+
+    it("puts the result on the stage, because a head that turns is invisible on a still frame", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve(withPlacedOpener));
+      client.cinemaSetShotTracking = vi.fn(() => Promise.resolve({ ...withFollowingOpener, entity: "e1", message: "keeps it framed" }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      fireEvent.click(await screen.findByTestId("cutscene-keep-framed"));
+      await waitFor(() =>
+        expect(client.cinemaPreview).toHaveBeenCalledWith("e1", withFollowingOpener.rows[0].openSeconds, true),
+      );
+    });
+
+    it("refuses during Play, with the same reason every other authoring control gives", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve(withPlacedOpener));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[0]);
+      act(() => playStore.getState().refresh({ playing: true, paused: false }));
+      const toggle = await screen.findByTestId("cutscene-keep-framed");
+      await waitFor(() => expect(toggle.hasAttribute("disabled")).toBe(true));
+      expect(toggle.getAttribute("title")).toMatch(/Stop Play first/i);
     });
   });
 

@@ -1480,7 +1480,16 @@ fn describe_shot_with_seconds(
     // `angle` leftovers of whatever card the shot was created from, and reading them back would be
     // this list's one job done wrong: "a close shot from below" over a hand-framed wide is a caption
     // that survives every test there is and is simply untrue.
-    if shot.camera.is_some_and(|camera| camera.is_usable()) {
+    if let Some(camera) = shot.camera.filter(ShotCamera::is_usable) {
+        // ADR-195 — and a following head is part of what decides the frame, for the same reason: a
+        // caption that reads the same locked off and tracking describes two different shots with one
+        // sentence, and the difference is the only thing that shows up when the subject moves.
+        if camera.is_following() {
+            return format!(
+                "a placed shot of {subject_name}, {motion}, keeping it framed — \
+                 {effective_seconds:.1}s"
+            );
+        }
         return format!("a placed shot of {subject_name}, {motion} — {effective_seconds:.1}s");
     }
     format!("{size} shot of {subject_name} {angle}, {motion} — {effective_seconds:.1}s")
@@ -4005,6 +4014,7 @@ mod tests {
             eye: [7.4, 2.9, -5.1],
             look_at: [0.2, 1.35, 0.4],
             fov_deg: 55.0,
+            track: None,
         }
     }
 
@@ -4041,16 +4051,19 @@ mod tests {
                 eye: [1.0, 1.0, 1.0],
                 look_at: [1.0, 1.0, 1.0],
                 fov_deg: 55.0,
+                track: None,
             },
             ShotCamera {
                 eye: [f32::INFINITY, 0.0, 0.0],
                 look_at: [0.0, 0.0, 0.0],
                 fov_deg: 55.0,
+                track: None,
             },
             ShotCamera {
                 eye: [3.0, 0.0, 0.0],
                 look_at: [0.0, 0.0, 0.0],
                 fov_deg: 200.0,
+                track: None,
             },
         ] {
             let error = set_shot_camera_ops(&engine, owner, 0, bad).expect_err("refuses");
@@ -4143,5 +4156,57 @@ mod tests {
         assert!(exactly(stored.eye[0], 7.4));
         assert!(exactly(stored.look_at[1], 1.35));
         assert!(exactly(stored.fov_deg, 55.0));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-195 — a placed camera whose head follows its subject.
+    // ---------------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_following_head_reaches_the_document_and_comes_back_on_the_row() {
+        let (mut engine, _scene) = world();
+        let owner = spawn(&mut engine);
+        three_shot_cut(&mut engine, owner);
+        // The shell resolves the offset against the live subject and stores a FINISHED camera, so
+        // this is the shape `set_shot_camera_ops` is asked to carry.
+        let following = a_camera().following([0.0, 0.35, 0.0]);
+        let (ops, _) = set_shot_camera_ops(&engine, owner, 0, following).expect("places");
+        engine.commit("cinema-camera", ops).expect("commits");
+
+        let stored = cutscene_of(&engine, owner).shots[0].camera.expect("stored");
+        assert!(stored.is_following());
+        // Through the component blob, which is the round trip a save-and-open makes.
+        let offset = stored.track.expect("the offset survived the JSON");
+        assert!(exactly(offset[0], 0.2), "{offset:?}");
+        assert!(exactly(offset[1], 1.0), "{offset:?}");
+        assert!(exactly(offset[2], 0.4), "{offset:?}");
+
+        let reply = reply_for(
+            owner,
+            &cutscene_of(&engine, owner),
+            "Weld Gun 7",
+            String::new(),
+        );
+        assert_eq!(reply.rows[0].camera, Some(stored));
+        // AND THE SENTENCE SAYS SO. A caption that reads the same locked off and following describes
+        // two different shots with one line, and the difference only shows up when something moves.
+        assert!(
+            reply.rows[0].reads.contains("keeping it framed"),
+            "{}",
+            reply.rows[0].reads
+        );
+        // The negative control: a locked-off placed shot is captioned exactly as it was.
+        let locked = describe_shot(
+            &ShotRecipe {
+                camera: Some(a_camera()),
+                ..cutscene_of(&engine, owner).shots[1].clone()
+            },
+            "Weld Gun 7",
+        );
+        assert!(
+            locked.starts_with("a placed shot of Weld Gun 7"),
+            "{locked}"
+        );
+        assert!(!locked.contains("keeping it framed"), "{locked}");
     }
 }

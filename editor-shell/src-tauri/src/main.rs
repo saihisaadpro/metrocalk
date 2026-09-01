@@ -2920,6 +2920,21 @@ enum EngineCmd {
         camera: Option<metrocalk_animation::shot::ShotCamera>,
         reply: Sender<metrocalk_editor_shell::CinemaReply>,
     },
+    /// Cinematics — ADR-195: put one placed camera's head on its subject, or lock it off again.
+    ///
+    /// A BOOLEAN and not a pose, unlike [`Self::CinemaSetShotCamera`], because the author is not
+    /// choosing a number here — they are answering "does this camera follow?". The framing offset
+    /// that answer implies is RESOLVED IN THE ENGINE LOOP, against where the subject is standing at
+    /// the moment they ask, and what lands in the document (and in the replay log) is the resolved
+    /// camera. A record that stored the boolean would re-resolve the offset against a differently
+    /// posed scene on replay and reconstruct a different shot.
+    CinemaSetShotTracking {
+        id: String,
+        index: usize,
+        /// `true` puts the head on the subject; `false` locks it off.
+        track: bool,
+        reply: Sender<metrocalk_editor_shell::CinemaReply>,
+    },
     /// Cinematics - the ranked, bounded list of objects a shot could frame. A read; changes nothing.
     CinemaSubjectCatalog {
         id: String,
@@ -5894,6 +5909,89 @@ fn shot_subject_name(engine: &Engine<FlecsWorld>, key: &str) -> Option<String> {
     EntityId::from_loro_key(key)
         .filter(|e| engine.entity_exists(*e))
         .map(|e| entity_display_name(engine, e))
+}
+
+/// EVERY cutscene reply this process sends. One producer, so the panel's warning list cannot be one
+/// thing after adding a shot and another after moving one.
+///
+/// It is `cinema_reply_named` plus the half that needs the world — see [`placed_camera_notes`]. The
+/// two halves are appended rather than merged because they answer different questions and only one of
+/// them can be answered by a crate that has never seen a scene.
+fn cinema_reply(
+    engine: &Engine<FlecsWorld>,
+    shared: &render::Shared,
+    entity: EntityId,
+    cut: &metrocalk_animation::shot::Cutscene,
+    owner_name: &str,
+    message: String,
+) -> metrocalk_editor_shell::CinemaReply {
+    let mut reply =
+        metrocalk_editor_shell::cinema_reply_named(entity, cut, owner_name, message, &|key| {
+            shot_subject_name(engine, key)
+        });
+    reply
+        .problems
+        .extend(placed_camera_notes(engine, shared, entity, cut));
+    reply
+}
+
+/// ADR-195 — ask the world about the cameras the author placed, and say what it answers.
+///
+/// THE PROMISE NOT TO INTERFERE IS WHAT OBLIGES THIS TO SPEAK. `plan_shot` and `solve_shot_adjusted`
+/// both return a placed camera untouched, on purpose: an author who framed a shot by eye was staring
+/// at the obstruction, the height and the wall when they pressed the button, and correcting that would
+/// be the engine quietly filming a different shot. But a lens parked inside a machine then produced a
+/// solid-colour frame weeks later with nothing said at the time — the same failure `ShotCamera::
+/// is_usable` exists to prevent, arriving from the outside instead of from the numbers.
+///
+/// CONTENT-AWARE, and that is not a nicety here: the answer needs a BVH over every drawn part of a
+/// 15,711-part import, and a cutscene with no placed camera cannot have this fault. The scan of the
+/// shot list is the whole cost in that case, which is every cutscene authored before ADR-192.
+fn placed_camera_notes(
+    engine: &Engine<FlecsWorld>,
+    shared: &render::Shared,
+    entity: EntityId,
+    cut: &metrocalk_animation::shot::Cutscene,
+) -> Vec<String> {
+    if !cut
+        .shots
+        .iter()
+        .any(|shot| shot.camera.is_some_and(|camera| camera.is_usable()))
+    {
+        return Vec::new();
+    }
+    let mut st = shared.lock().unwrap();
+    st.sync_mesh_bounds();
+    // Sampled for EVERY shot, placed or not, in list order — because `cinematic_shot_subject_sample`
+    // is what fills the `cinema_subtree` memo the obstruction test reads, and the two have to be
+    // talking about the same subject or the thing being filmed becomes the thing in the way.
+    let mut subjects: Vec<([f32; 3], f32, std::collections::HashSet<u32>)> =
+        Vec::with_capacity(cut.shots.len());
+    for shot in &cut.shots {
+        let sample = cinematic_shot_subject_sample(engine, &mut st, entity, shot);
+        let key = cinematic_shot_subject(engine, entity, shot).to_loro_key();
+        let parts = st
+            .cinema_subtree
+            .get(&key)
+            .map(|indices| {
+                indices
+                    .iter()
+                    .filter_map(|index| u32::try_from(*index).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        subjects.push((sample.center, sample.radius(), parts));
+    }
+    st.sync_occlusion();
+    let st = &*st;
+    metrocalk_animation::shot::placed_camera_problems(
+        cut,
+        |index, _| subjects[index].0,
+        |index, pose| {
+            let (center, radius, parts) = &subjects[index];
+            st.vantage(pose.eye, pose.look_at, *center, *radius, parts)
+        },
+    )
 }
 
 fn refresh_animation_plan(engine: &Engine<FlecsWorld>, preview: &mut AnimationPreviewState) {
@@ -10069,12 +10167,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             .last()
                             .map(|shot| metrocalk_editor_shell::describe_shot(shot, &name))
                             .unwrap_or_default();
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                        let _ = reply.send(cinema_reply(
+                            &engine,
+                            &shared,
                             entity,
                             &cut,
                             &name,
                             format!("Added {last}"),
-                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(e) => {
@@ -10116,12 +10215,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             send_proj!(ch, proj_full(&engine, &scene));
                         }
                         let name = entity_display_name(&engine, entity);
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                        let _ = reply.send(cinema_reply(
+                            &engine,
+                            &shared,
                             entity,
                             &cut,
                             &name,
                             "Shot removed".to_string(),
-                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(e) => {
@@ -10166,12 +10266,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             metrocalk_animation::shot::Mood::Normal => "Normal",
                             metrocalk_animation::shot::Mood::Tense => "Tense",
                         };
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                        let _ = reply.send(cinema_reply(
+                            &engine,
+                            &shared,
                             entity,
                             &cut,
                             &name,
                             format!("Cinematic pacing set to {label}"),
-                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(error) => {
@@ -10215,12 +10316,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             send_proj!(ch, proj_full(&engine, &scene));
                         }
                         let name = entity_display_name(&engine, entity);
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                        let _ = reply.send(cinema_reply(
+                            &engine,
+                            &shared,
                             entity,
                             &cut,
                             &name,
                             format!("Composing for {}", cut.delivery.label()),
-                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(error) => {
@@ -10280,7 +10382,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             Some(height) => format!("{height}"),
                             None => "as on screen".to_string(),
                         };
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                        let _ = reply.send(cinema_reply(
+                            &engine,
+                            &shared,
                             entity,
                             &cut,
                             &display,
@@ -10290,7 +10394,6 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 cut.render.fps,
                                 cut.render.stem_for(&display),
                             ),
-                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(error) => {
@@ -10347,12 +10450,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                             send_proj!(ch, proj_full(&engine, &scene));
                         }
                         let display = entity_display_name(&engine, entity);
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                        let _ = reply.send(cinema_reply(
+                            &engine,
+                            &shared,
                             entity,
                             &cut,
                             &display,
                             format!("Rendering into {folder}"),
-                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(error) => {
@@ -10400,12 +10504,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         }
                         let name = entity_display_name(&engine, entity);
                         let shown = cut.effective_shot_seconds(index).unwrap_or_default();
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                        let _ = reply.send(cinema_reply(
+                            &engine,
+                            &shared,
                             entity,
                             &cut,
                             &name,
                             format!("Shot {} now runs {shown:.1}s", index + 1),
-                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(error) => {
@@ -10452,12 +10557,13 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                         }
                         let name = entity_display_name(&engine, entity);
                         let landed = to.min(cut.shots.len().saturating_sub(1)) + 1;
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
+                        let _ = reply.send(cinema_reply(
+                            &engine,
+                            &shared,
                             entity,
                             &cut,
                             &name,
                             format!("Shot moved to position {landed}"),
-                            &|key| shot_subject_name(&engine, key),
                         ));
                     }
                     Err(error) => {
@@ -10516,13 +10622,95 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 )
                             })
                             .unwrap_or_else(|| "Shot re-framed".to_string());
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
-                            entity,
-                            &cut,
-                            &name,
-                            done,
-                            &|key| shot_subject_name(&engine, key),
-                        ));
+                        let _ =
+                            reply.send(cinema_reply(&engine, &shared, entity, &cut, &name, done));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(CinemaReply::refusal(error.to_string()));
+                    }
+                }
+            }
+            EngineCmd::CinemaSetShotTracking {
+                id,
+                index,
+                track,
+                reply,
+            } => {
+                use metrocalk_editor_shell::CinemaReply;
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
+                    continue;
+                };
+                if play_mode {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "stop Play first - how a shot films is authored, not live-edited",
+                    ));
+                    continue;
+                }
+                let current = metrocalk_editor_shell::cutscene_of(&engine, entity);
+                let Some(shot) = current.shots.get(index) else {
+                    let _ = reply.send(CinemaReply::refusal("there is no shot at that position"));
+                    continue;
+                };
+                // REFUSED, not silently ignored. Following is a property of a camera the author
+                // placed; a card shot already re-solves its placement around the subject every tick,
+                // so "make it follow" is a request that is either already true or meaningless, and
+                // saying so is how the author learns which.
+                let Some(camera) = shot.camera.filter(|c| c.is_usable()) else {
+                    let _ = reply.send(CinemaReply::refusal(
+                        "that shot films from its card, which already follows its subject - place a \
+                         camera first",
+                    ));
+                    continue;
+                };
+                // The offset is resolved HERE, against the subject as it stands right now, so what
+                // reaches the document and the log is a finished camera. See the command's doc.
+                let camera = if track {
+                    let center = {
+                        let mut st = shared.lock().unwrap();
+                        st.sync_mesh_bounds();
+                        cinematic_shot_subject_sample(&engine, &mut st, entity, shot).center
+                    };
+                    camera.following(center)
+                } else {
+                    camera.locked_off()
+                };
+                match metrocalk_editor_shell::set_shot_camera_ops(&engine, entity, index, camera) {
+                    Ok((ops, cut)) => {
+                        if let Err(error) = engine.commit("cinema-camera", ops) {
+                            let _ = reply.send(CinemaReply::refusal(format!(
+                                "the change was refused: {error}"
+                            )));
+                            continue;
+                        }
+                        log.append(&Record::CinemaShotCamera {
+                            id: id.clone(),
+                            index,
+                            camera: Some(camera),
+                        });
+                        if let Some(ch) = &channel {
+                            send_proj!(ch, proj_full(&engine, &scene));
+                        }
+                        let name = entity_display_name(&engine, entity);
+                        let who = cut
+                            .shots
+                            .get(index)
+                            .and_then(|shot| shot_subject_name(&engine, &shot.subject))
+                            .unwrap_or_else(|| name.clone());
+                        let done = if track {
+                            format!("Shot {} keeps {who} framed — the camera stays where it is and only the aim follows", index + 1)
+                        } else {
+                            format!(
+                                "Shot {} is locked off — it films exactly the frame you placed",
+                                index + 1
+                            )
+                        };
+                        let _ =
+                            reply.send(cinema_reply(&engine, &shared, entity, &cut, &name, done));
                     }
                     Err(error) => {
                         let _ = reply.send(CinemaReply::refusal(error.to_string()));
@@ -10588,13 +10776,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 )
                             })
                             .unwrap_or_else(|| "Shot re-aimed".to_string());
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
-                            entity,
-                            &cut,
-                            &name,
-                            done,
-                            &|key| shot_subject_name(&engine, key),
-                        ));
+                        let _ =
+                            reply.send(cinema_reply(&engine, &shared, entity, &cut, &name, done));
                     }
                     Err(error) => {
                         let _ = reply.send(CinemaReply::refusal(error.to_string()));
@@ -10622,6 +10805,32 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     ));
                     continue;
                 }
+                // ADR-195 — A RE-SHOOT KEEPS THE HEAD ON. "Shoot from this view" answers *where the
+                // camera stands*; whether it follows is a separate answer the author already gave,
+                // and dropping it would silently lock off a shot they had asked to track. The offset
+                // is RE-RESOLVED against the new aim rather than carried, because the old one was the
+                // framing of a camera that is no longer there.
+                let camera = camera.map(|placed| {
+                    let following = metrocalk_editor_shell::cutscene_of(&engine, entity)
+                        .shots
+                        .get(index)
+                        .and_then(|shot| shot.camera)
+                        .is_some_and(|previous| previous.is_following());
+                    if !following {
+                        return placed;
+                    }
+                    let center = {
+                        let mut st = shared.lock().unwrap();
+                        st.sync_mesh_bounds();
+                        metrocalk_editor_shell::cutscene_of(&engine, entity)
+                            .shots
+                            .get(index)
+                            .map(|shot| {
+                                cinematic_shot_subject_sample(&engine, &mut st, entity, shot).center
+                            })
+                    };
+                    center.map_or(placed, |center| placed.following(center))
+                });
                 let outcome = match camera {
                     Some(camera) => {
                         metrocalk_editor_shell::set_shot_camera_ops(&engine, entity, index, camera)
@@ -10660,13 +10869,8 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                                 )
                             })
                             .unwrap_or_else(|| "Shot re-framed".to_string());
-                        let _ = reply.send(metrocalk_editor_shell::cinema_reply_named(
-                            entity,
-                            &cut,
-                            &name,
-                            done,
-                            &|key| shot_subject_name(&engine, key),
-                        ));
+                        let _ =
+                            reply.send(cinema_reply(&engine, &shared, entity, &cut, &name, done));
                     }
                     Err(error) => {
                         let _ = reply.send(CinemaReply::refusal(error.to_string()));
@@ -10762,13 +10966,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .map(|entity| {
                         let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
                         let name = entity_display_name(&engine, entity);
-                        metrocalk_editor_shell::cinema_reply_named(
-                            entity,
-                            &cut,
-                            &name,
-                            String::new(),
-                            &|key| shot_subject_name(&engine, key),
-                        )
+                        cinema_reply(&engine, &shared, entity, &cut, &name, String::new())
                     })
                     .unwrap_or_default();
                 let _ = reply.send(info);
@@ -10843,13 +11041,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     &mut preview.plans,
                 );
                 let name = entity_display_name(&engine, entity);
-                let listing = metrocalk_editor_shell::cinema_reply_named(
-                    entity,
-                    &cut,
-                    &name,
-                    String::new(),
-                    &|key| shot_subject_name(&engine, key),
-                );
+                let listing = cinema_reply(&engine, &shared, entity, &cut, &name, String::new());
                 let row = listing.rows.get(playback.index);
                 let _ = reply.send(CinemaPreviewReply {
                     active: true,
@@ -24722,6 +24914,9 @@ fn cinema_set_shot_camera(
             eye,
             look_at,
             fov_deg,
+            // Locked off as read. Whether the head follows is not a fact about the viewport, so it is
+            // not this side's to answer — the engine loop carries the author's existing choice over.
+            track: None,
         }
     };
     cinema_shot_camera(&state, id, index, Some(camera))
@@ -24752,6 +24947,38 @@ fn cinema_shot_camera(
             id,
             index,
             camera,
+            reply,
+        })
+        .is_err()
+    {
+        return metrocalk_editor_shell::CinemaReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::CinemaReply::refusal("The camera change did not finish in time")
+    })
+}
+
+/// ADR-195 — KEEP THE SUBJECT FRAMED: put a placed camera's head on its subject, or lock it off.
+///
+/// The tripod never moves. `track: true` records the framing the shot has right now as an offset from
+/// its subject and re-aims through it every tick; `false` returns the camera to the exact aim it was
+/// placed with. Switching it on while the subject has not moved changes nothing at all, which is what
+/// makes it safe to try.
+#[tauri::command(async)]
+fn cinema_set_shot_tracking(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+    track: bool,
+) -> metrocalk_editor_shell::CinemaReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaSetShotTracking {
+            id,
+            index,
+            track,
             reply,
         })
         .is_err()
@@ -28089,6 +28316,7 @@ fn main() {
             cinema_set_shot_subject,
             cinema_set_shot_camera,
             cinema_clear_shot_camera,
+            cinema_set_shot_tracking,
             cinema_subject_catalog,
             cinema_subject_chain,
             cinema_set_mood,

@@ -9281,6 +9281,70 @@ mod tests {
         );
     }
 
+    /// ADR-195 — THE TWO HALVES, JOINED. `placed_camera_problems` is tested in `metrocalk-animation`
+    /// against a stubbed world and `vantage` is tested above against real instances; neither of those
+    /// says the words the author reads come from the geometry that is actually in the scene.
+    ///
+    /// The negative control is the whole test: the same cutscene, the same subject, one camera in the
+    /// neighbour and one in open air, and only the first is spoken about.
+    #[test]
+    fn the_words_a_placed_camera_gets_come_from_the_real_scene() {
+        use metrocalk_animation::shot::{
+            Cutscene, Delivery, Mood, RenderSettings, ShotAngle, ShotCamera, ShotMove, ShotRecipe,
+            ShotSize,
+        };
+        let mut st = crowded_scene(3);
+        st.sync_occlusion();
+        let subject = metrocalk_animation::shot::SubjectSample {
+            center: [0.0; 3],
+            half_extent: [0.5; 3],
+            forward: [0.0, 0.0, 1.0],
+            stage: metrocalk_animation::shot::Stage::OPEN,
+        };
+        let cut_from = |eye: [f32; 3]| Cutscene {
+            version: 1,
+            shots: vec![ShotRecipe {
+                id: "s1".into(),
+                subject: "1_1".into(),
+                size: ShotSize::Medium,
+                angle: ShotAngle::Front,
+                motion: ShotMove::Hold,
+                amount: 0.0,
+                seconds: 2.5,
+                camera: Some(ShotCamera {
+                    eye,
+                    look_at: [0.0; 3],
+                    fov_deg: 45.0,
+                    track: None,
+                }),
+            }],
+            mood: Mood::Normal,
+            delivery: Delivery::Widescreen,
+            render: RenderSettings::default(),
+        };
+        let ask = |cut: &Cutscene| {
+            metrocalk_animation::shot::placed_camera_problems(
+                cut,
+                |_, _| subject.center,
+                |_, pose| {
+                    st.vantage(
+                        pose.eye,
+                        pose.look_at,
+                        subject.center,
+                        subject.radius(),
+                        &subject_only(),
+                    )
+                },
+            )
+        };
+        // Dead centre of the first neighbour, the unit box at x = 3.
+        let buried = ask(&cut_from([3.0, 0.0, 0.0]));
+        assert_eq!(buried.len(), 1, "{buried:?}");
+        assert!(buried[0].contains("inside something"), "{buried:?}");
+        // ...and from open air on the far side, the engine has nothing to say.
+        assert!(ask(&cut_from([0.0, 0.0, -8.0])).is_empty());
+    }
+
     /// The defect that made the second film's worst frames score as its best: a wall a hand's breadth in
     /// front of the lens counted as a rich backdrop. Backing has to be measured from the SUBJECT
     /// outwards, so a near surface contributes nothing to it and is reported as crowding instead.

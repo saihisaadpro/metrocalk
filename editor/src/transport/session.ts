@@ -369,6 +369,13 @@ export interface EditorClient {
   cinemaSetShotCamera(id: string, index: number): Promise<CinemaReply>;
   /** Give one shot back to its card, restoring exactly the framing it was authored with. */
   cinemaClearShotCamera(id: string, index: number): Promise<CinemaReply>;
+  /** ADR-195 — KEEP THE SUBJECT FRAMED: put a placed camera's head on its subject, or lock it off.
+   *
+   *  A BOOLEAN, not an offset. The framing the camera has right now is what gets preserved, and the
+   *  engine is the only side that knows where the subject is standing to express it — an editor that
+   *  sent numbers would be composing the shot a second way. Refused on a shot that films from its
+   *  card, which already follows its subject every tick. */
+  cinemaSetShotTracking(id: string, index: number, track: boolean): Promise<CinemaReply>;
   /** The objects a shot could frame — ranked by the scene's own hierarchy, or searched by name.
    *  A read. `index` marks the shot being edited so its current subject comes back ticked. */
   cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog>;
@@ -1109,6 +1116,9 @@ export class TauriClient implements EditorClient {
   }
   cinemaClearShotCamera(id: string, index: number): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_clear_shot_camera", { id, index }).catch((e: unknown) => { console.error("cinema_clear_shot_camera failed", e); throw e; });
+  }
+  cinemaSetShotTracking(id: string, index: number, track: boolean): Promise<CinemaReply> {
+    return this.core.invoke<CinemaReply>("cinema_set_shot_tracking", { id, index, track }).catch((e: unknown) => { console.error("cinema_set_shot_tracking failed", e); throw e; });
   }
   cinemaSubjectCatalog(id: string, index: number | null, query: string): Promise<SubjectCatalog> {
     return this.core.invoke<SubjectCatalog>("cinema_subject_catalog", { id, index, query }).catch((e: unknown) => { console.error("cinema_subject_catalog failed", e); throw e; });
@@ -3055,6 +3065,9 @@ class MockClient implements EditorClient {
     return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaClearShotCamera(): Promise<CinemaReply> {
+    return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  cinemaSetShotTracking(): Promise<CinemaReply> {
     return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   /** An EMPTY list, not an invented one. The picker's whole value is the two facts only the native

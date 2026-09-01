@@ -279,6 +279,7 @@ fn a_placed_camera_survives_a_fresh_process_via_replay_log() {
         eye: [7.4, 2.9, -5.1],
         look_at: [0.2, 1.35, 0.4],
         fov_deg: 38.5,
+        track: None,
     };
 
     // "Run A": author a two-shot cut and place a camera on the second one.

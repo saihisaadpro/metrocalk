@@ -367,6 +367,7 @@ fn a_camera_the_author_placed_survives_save_and_open() {
         eye: [7.4, 2.9, -5.1],
         look_at: [0.2, 1.35, 0.4],
         fov_deg: 38.5,
+        track: None,
     };
     let (ops, _) =
         metrocalk_editor_shell::set_shot_camera_ops(&a, rig, 1, placed).expect("the pose stores");

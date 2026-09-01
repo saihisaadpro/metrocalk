@@ -419,6 +419,27 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
     void run(() => client.cinemaClearShotCamera(selected, row.index), "Use the card again");
   };
 
+  // ADR-195 — KEEP THE SUBJECT FRAMED. A placed camera is a tripod: this puts a panning head on it,
+  // and the head is the only thing that moves. Nothing is composed on this side — the offset that
+  // preserves the author's framing is resolved in the engine against where the subject is standing
+  // at the moment they press it, so switching it on while nothing has moved changes nothing at all.
+  //
+  // Re-posed like `shootFromView`, and for the same reason: the change is invisible on a still stage
+  // and completely visible the moment the shot plays.
+  const keepFramed = (row: ShotRow, track: boolean) => {
+    if (!selected) return;
+    void run(
+      () => client.cinemaSetShotTracking(selected, row.index, track),
+      track ? "Keep the subject framed" : "Lock the camera off",
+      (reply) => {
+        if (!reply.entity) return;
+        const at = reply.rows.find((shot) => shot.index === row.index)?.openSeconds ?? row.openSeconds;
+        setPlayhead(at);
+        void poseAt(reply.entity, at);
+      },
+    );
+  };
+
   // AND POINTING AT IT IS THE SAME EDIT. `store/subjectAim` carries only the CHOICE a click on the
   // stage made; the commit is this panel's own `run`, so aiming by pointing and aiming from the list
   // are one transaction, one toast, one re-pose and one Ctrl-Z rather than two paths that drift.
@@ -888,14 +909,51 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
             {active.camera && (
               <>
                 <ToolbarSeparator />
+                {/* ADR-195 — THE ONE THING A PLACED CAMERA COULD NOT DO. Beside the gesture that
+                    placed it, because it is the second half of the same decision: where the camera
+                    stands, and whether it turns. A toggle and not a checkbox — it belongs to the
+                    toolbar that owns the placement, and its pressed state is the answer. */}
+                <Button
+                  data-testid="cutscene-keep-framed"
+                  variant="toggle"
+                  compact
+                  active={active.camera.track !== null}
+                  aria-pressed={active.camera.track !== null}
+                  disabled={locked}
+                  disabledReason={lockReason}
+                  title={
+                    locked
+                      ? lockReason
+                      : active.camera.track !== null
+                        ? `The camera stays where you put it and only its aim follows ${active.subjectName}. Press to lock it off.`
+                        : `Keep ${active.subjectName} framed as it moves — the camera stays exactly where you put it and only its aim follows.`
+                  }
+                  onClick={() => keepFramed(active, active.camera?.track === null)}
+                >
+                  <Icon name="frame" size="md" /> Keep {active.subjectName} framed
+                </Button>
+                <ToolbarSeparator />
                 {/* The NUMBERS, not a badge. "Placed" is a claim; an eye and an aim the author can
                     read against the preview's own read-out above is evidence. */}
                 <ReadOut
                   data-testid="cutscene-placed-pose"
-                  title="Where this shot's camera stands, the point it aims at, and the lens it was framed through"
+                  title={
+                    active.camera.track === null
+                      ? "Where this shot's camera stands, the point it aims at, and the lens it was framed through"
+                      : `Where this shot's camera stands and the lens it was framed through. Its aim is not a fixed point any more — it follows ${active.subjectName}.`
+                  }
                 >
                   eye <span style={{ font: font.mono }}>{xyz(active.camera.eye)}</span>
-                  {" · "}looking at <span style={{ font: font.mono }}>{xyz(active.camera.lookAt)}</span>
+                  {" · "}
+                  {/* WHEN THE HEAD IS ON, `lookAt` IS NOT WHERE IT LOOKS. It is the framing the
+                      offset was taken from, and printing it as "looking at" would be a coordinate
+                      the camera stops using the moment the subject moves — the exact class of
+                      caption ADR-192 removed from the shot sentence. */}
+                  {active.camera.track === null ? (
+                    <>looking at <span style={{ font: font.mono }}>{xyz(active.camera.lookAt)}</span></>
+                  ) : (
+                    <>aim follows {active.subjectName}</>
+                  )}
                   {" · "}<span style={{ font: font.mono }}>{active.camera.fovDeg.toFixed(0)}°</span> lens
                 </ReadOut>
               </>

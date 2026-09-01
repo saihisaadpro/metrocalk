@@ -2070,6 +2070,11 @@ export interface ShotCamera {
   lookAt: [number, number, number];
   /** Vertical field of view, degrees — the lens they framed through. */
   fovDeg: number;
+  /** ADR-195 — `null` is a locked-off camera: it films `lookAt` exactly as placed however far the
+   *  subject walks. Non-null is a camera on a panning head — the eye stays bolted down and only the
+   *  aim follows, at the subject's live centre plus this offset, which is the framing the author had
+   *  when they switched it on. The panel reads it as a boolean; the numbers are the engine's. */
+  track: [number, number, number] | null;
 }
 
 /** One object a shot could be pointed at, with the two facts that decide whether it is the right one. */
