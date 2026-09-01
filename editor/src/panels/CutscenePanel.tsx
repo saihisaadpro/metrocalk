@@ -35,7 +35,7 @@ import { subjectAimStore, useSubjectAim } from "../store/subjectAim";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
-import { Button, ReadOut, SelectField, Slider, SliderField, Toolbar, ToolbarGroup, ToolbarSeparator } from "../theme/primitives";
+import { Button, ReadOut, SelectField, Slider, Toolbar, ToolbarGroup, ToolbarSeparator } from "../theme/primitives";
 import { Callout, Field, FieldGrid } from "../theme/fields";
 import { EmptyPanelState } from "../theme/workspace";
 import {
@@ -1147,71 +1147,98 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
               aria-label={`Walk shot ${active.index + 1}'s move`}
               style={{ display: "grid", gap: space.xxs, maxWidth: 1100, minWidth: 0 }}
             >
-              <SliderField
+              <Field
                 label="Walk the move"
-                data-testid="cutscene-walk-slider"
-                ariaLabel={`How far through shot ${active.index + 1}'s move to stand`}
-                value={walkAt}
-                min={0}
-                max={1}
-                step={0.01}
+                htmlFor={`${fieldId}-walk`}
                 disabled={locked}
-                title={
-                  locked
-                    ? lockReason
-                    : `Stand the camera anywhere along this shot's ${standing.travel.toFixed(1)} m move — orbit from wherever you stop, and shoot from there.`
-                }
-                valueLabel={`${Math.round(walkAt * 100)}%`}
-                onChange={(event) => {
-                  const at = Number(event.currentTarget.value);
-                  setWalkAt(at);
-                  void walkTo(active.index, at);
-                }}
-              />
-              <div
-                data-testid="cutscene-walk-track"
-                role="img"
-                aria-label={walkTrackReads(standing.path)}
-                title={walkTrackReads(standing.path)}
-                style={{ position: "relative", height: 10, marginInline: space.xs }}
               >
-                <span
-                  aria-hidden
-                  style={{
-                    position: "absolute",
-                    insetInline: 0,
-                    top: 4,
-                    height: 2,
-                    borderRadius: radius.sm,
-                    background: color.border.subtle,
-                  }}
-                />
-                {standing.path.map((sample) => (
-                  <span
-                    key={sample.progress}
-                    aria-hidden
-                    data-testid="cutscene-walk-mark"
-                    data-progress={sample.progress}
-                    data-clear={sample.acceptable ? "yes" : "no"}
-                    style={{
-                      position: "absolute",
-                      left: `${sample.progress * 100}%`,
-                      top: 1,
-                      width: 8,
-                      height: 8,
-                      marginLeft: -4,
-                      borderRadius: "50%",
-                      background: sample.acceptable ? color.success.solid : color.warn.solid,
-                      // The worst instant is ringed rather than recoloured: it is already one of the
-                      // objectionable ones, and a third colour would read as a third verdict.
-                      outline:
-                        Math.abs(sample.progress - standing.worst) < 1e-6
-                          ? `2px solid ${color.accent.border}`
-                          : undefined,
+                {/* THE TRACK IS IN THE SLIDER'S OWN COLUMN, not beside it. The first build put it in
+                    the section's grid and photographed a picture whose dots did not line up with the
+                    thumb they annotate — a diagram of a different control. Stacked inside one flex
+                    child, the two are the same width by construction rather than by arithmetic. */}
+                <div style={{ display: "grid", gap: 2, flex: "1 1 auto", minWidth: 0 }}>
+                  <Slider
+                    id={`${fieldId}-walk`}
+                    data-testid="cutscene-walk-slider"
+                    aria-label={`How far through shot ${active.index + 1}'s move to stand`}
+                    value={walkAt}
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    disabled={locked}
+                    title={
+                      locked
+                        ? lockReason
+                        : `Stand the camera anywhere along this shot's ${standing.travel.toFixed(1)} m move — orbit from wherever you stop, and shoot from there.`
+                    }
+                    onChange={(event) => {
+                      const at = Number(event.currentTarget.value);
+                      setWalkAt(at);
+                      void walkTo(active.index, at);
                     }}
                   />
-                ))}
-              </div>
+                  <div
+                    data-testid="cutscene-walk-track"
+                    role="img"
+                    aria-label={walkTrackReads(standing.path)}
+                    title={walkTrackReads(standing.path)}
+                    // The THUMB'S OWN TRAVEL, not the element's: a range thumb's centre runs from
+                    // half its width to the width less half, and `global.css` draws it at 14px. An
+                    // uninset track puts its end dots seven pixels outside the positions the thumb
+                    // can actually reach.
+                    style={{ position: "relative", height: 8, marginInline: 7 }}
+                  >
+                    <span
+                      aria-hidden
+                      style={{
+                        position: "absolute",
+                        insetInline: 0,
+                        top: 3,
+                        height: 2,
+                        borderRadius: radius.sm,
+                        background: color.border.subtle,
+                      }}
+                    />
+                    {standing.path.map((sample) => (
+                      <span
+                        key={sample.progress}
+                        aria-hidden
+                        data-testid="cutscene-walk-mark"
+                        data-progress={sample.progress}
+                        data-clear={sample.acceptable ? "yes" : "no"}
+                        style={{
+                          position: "absolute",
+                          left: `${sample.progress * 100}%`,
+                          top: 0,
+                          width: 8,
+                          height: 8,
+                          marginLeft: -4,
+                          borderRadius: "50%",
+                          background: sample.acceptable ? color.success.solid : color.warn.solid,
+                          // The worst instant is ringed rather than recoloured: it is already one of
+                          // the objectionable ones, and a third colour would read as a third verdict.
+                          outline:
+                            Math.abs(sample.progress - standing.worst) < 1e-6
+                              ? `2px solid ${color.accent.border}`
+                              : undefined,
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+                <output
+                  htmlFor={`${fieldId}-walk`}
+                  data-testid="cutscene-walk-value"
+                  style={{
+                    fontSize: fontSize.meta,
+                    color: color.text.secondary,
+                    minWidth: 40,
+                    textAlign: "right",
+                  }}
+                >
+                  {Math.round(walkAt * 100)}%
+                </output>
+              </Field>
               <div style={{ display: "flex", alignItems: "center", gap: space.xs, flexWrap: "wrap" }}>
                 {/* THE READ-OUT IS THE ENGINE'S SENTENCE, not a number this panel formatted. It
                     changes as the author walks — "clear here", "78% of the subject is hidden here",
