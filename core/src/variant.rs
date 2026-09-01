@@ -29,8 +29,19 @@ use std::collections::{BTreeMap, HashMap};
 
 /// The component that records an instance root's link to the [`Composition`] it was instantiated from
 /// — the *reference that is never lost* (deliverable 4: save-for-reuse keeps the source link).
-/// Excluded from a re-snapshot so provenance doesn't compound.
+///
+/// It is **not only** provenance: the editor keeps an entity's user-facing `name` and its primitive
+/// `kind` in the same component, because both are metadata about the object rather than a component
+/// of it. Only [`COMPOSITION_FIELD`] is dropped from a re-snapshot; see [`Engine::save_composition`].
 pub const INSTANCE_META: &str = "__meta__";
+
+/// The one [`INSTANCE_META`] field a snapshot must NOT carry: the link back to the composition an
+/// instance came from. Re-snapshotting an instance would otherwise record it as an instance of its
+/// own source, and each generation would inherit the last one's provenance.
+///
+/// It is named here rather than written twice because [`Engine::save_composition`] drops it and
+/// [`Engine::instantiate_composition`] writes it — one spelling, one field.
+pub const COMPOSITION_FIELD: &str = "composition";
 
 /// A reusable, pre-componentized asset: a snapshot of a composed character's subtree with its
 /// **resolved** components (the edited state baked in), addressable by id. The nodes are in pre-order
@@ -145,8 +156,14 @@ impl<W: World> Engine<W> {
 
     /// **Save this character for reuse** (deliverable 3): snapshot the subtree rooted at `root` into a
     /// reusable [`Composition`], baking in the **resolved** state (base ⊕ current overrides) so the
-    /// *edited* composition is what gets saved. The provenance [`INSTANCE_META`] component is excluded
+    /// *edited* composition is what gets saved. The [`COMPOSITION_FIELD`] provenance link is excluded
     /// so a re-snapshot doesn't compound source links. Pure read — no commit.
+    ///
+    /// It used to exclude the whole [`INSTANCE_META`] component, which reads as the same statement and
+    /// is not: the user-facing **name** and the primitive **kind** live in that component too, so a
+    /// snapshot dropped the object's name and its shape along with the provenance nobody wanted. An
+    /// instance re-created from a saved composition came back nameless, and — because the editor's
+    /// clipboard IS this machinery — so did every paste.
     #[must_use]
     pub fn save_composition(&self, root: EntityId, id: &str) -> Composition {
         let nodes = self.instance_nodes(root);
@@ -163,10 +180,17 @@ impl<W: World> Engine<W> {
                 let mut components: BTreeMap<String, BTreeMap<String, FieldValue>> =
                     BTreeMap::new();
                 for (comp, fields) in self.resolved_components(*eid) {
+                    let mut fields: BTreeMap<String, FieldValue> = fields.into_iter().collect();
                     if comp == INSTANCE_META {
-                        continue;
+                        fields.remove(COMPOSITION_FIELD);
+                        // A component with nothing left in it is not a component: writing an empty
+                        // map back would make the instantiated node carry a `__meta__` that says
+                        // nothing, which every `components_of` reader would then have to skip.
+                        if fields.is_empty() {
+                            continue;
+                        }
                     }
-                    components.insert(comp, fields.into_iter().collect());
+                    components.insert(comp, fields);
                 }
                 CompositionNode {
                     path: path.clone(),
@@ -225,7 +249,7 @@ impl<W: World> Engine<W> {
         ops.push(Op::SetField {
             entity: root,
             component: INSTANCE_META.into(),
-            field: "composition".into(),
+            field: COMPOSITION_FIELD.into(),
             value: FieldValue::Str(comp.id.clone()),
         });
         self.commit("instantiate-composition", ops)?;
@@ -235,7 +259,7 @@ impl<W: World> Engine<W> {
     /// The composition id an instance root was instantiated from (the preserved link), or `None`.
     #[must_use]
     pub fn composition_of(&self, instance_root: EntityId) -> Option<String> {
-        match self.get_field(instance_root, INSTANCE_META, "composition") {
+        match self.get_field(instance_root, INSTANCE_META, COMPOSITION_FIELD) {
             Some(FieldValue::Str(s)) => Some(s),
             _ => None,
         }

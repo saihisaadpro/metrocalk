@@ -68,7 +68,10 @@ pub use state_machine::{
     Transition, ENTER_STATE_ACTION,
 };
 pub use taxonomy::{bucket_of, is_standard_category, Category, STD_CATEGORIES};
-pub use variant::{Composition, CompositionNode, ResolvedNode, Variant, VariantOp};
+pub use variant::{
+    Composition, CompositionNode, ResolvedNode, Variant, VariantOp, COMPOSITION_FIELD,
+    INSTANCE_META,
+};
 
 /// Engine identifier — one constant shared by downstream crates, logs, and file headers.
 pub const ENGINE_NAME: &str = "metrocalk";
