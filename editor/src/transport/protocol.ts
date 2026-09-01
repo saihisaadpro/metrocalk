@@ -229,6 +229,39 @@ export interface DuplicateOutcome {
   missing: number;
 }
 
+/** `copy_selection(ids)` — what went onto the clipboard (ADR-198).
+ *
+ *  The clipboard held ONE subtree until then, so `Copy` over a selection of fourteen took one of them
+ *  — the same defect ADR-196 closed for `Duplicate`, in the verb beside it. `objects` is how many
+ *  roots are now held and `parts` how many entities they hold in total; the two differ whenever
+ *  anything has children, and reporting only one of them is the lie in either direction.
+ *
+ *  `nested` and `missing` are the same two counts `DuplicateOutcome` carries, for the same reason: a
+ *  selection that holds a parent and its child copies the parent once, and a stale id must not inflate
+ *  a number the caller is about to print. */
+export interface CopyOutcome {
+  objects: number;
+  parts: number;
+  nested: number;
+  missing: number;
+}
+
+/** `cut_selection(ids)` — a copy plus the delete, so the caller can dim exactly the rows that went. */
+export interface CutOutcome extends CopyOutcome {
+  /** The ids the engine confirmed it deactivated. Empty on a refusal. */
+  gone: string[];
+}
+
+/** `paste_clipboard()` — what the paste made.
+ *
+ *  `created` is the root of each pasted subtree, in clipboard order, and it is what the caller
+ *  selects: a paste is almost never the last step. `entities` counts everything the transaction
+ *  created, the `DuplicateOutcome` distinction again. */
+export interface PasteOutcome {
+  created: string[];
+  entities: number;
+}
+
 /** `entity_details(id)` — the hover tooltip read (M3.3): name + component names + provided/required caps
  *  + the entities it's bound to. */
 export interface EntityDetails {

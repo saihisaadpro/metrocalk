@@ -13,7 +13,7 @@ import { createSession, isTauri, type EditorClient } from "../transport/session"
 import { projectionStore, useDisplayedEntity, useEntityOrder, useMultiSelect, useSelectedId } from "../store/projection";
 import { thumbnailStore, startThumbnailPump } from "../store/thumbnails";
 import { playStore, usePlaying, usePaused } from "../store/play";
-import { setStatus } from "../store/ui";
+import { setStatus, useClipboard } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Modal, Popover } from "../theme/Popover";
 import { Icon } from "../theme/icons";
@@ -47,6 +47,7 @@ import { StageMarquee } from "./StageMarquee";
 import { selectionSentence, entityLabel, focusSentence, focusSubject } from "../store/selectionText";
 import { deleteSelection } from "./deleteSelection";
 import { duplicateSelection } from "./duplicateSelection";
+import { copySelection, cutSelection, pasteClipboard } from "./clipboard";
 import { selectAllWith, selectionCommands } from "./selectionCommands";
 import { environmentOutcome } from "./environmentOutcome";
 import { stateSelection } from "./stateSelection";
@@ -153,6 +154,19 @@ function PlayBadge({ paused, onStop }: { paused: boolean; onStop: () => void }) 
   );
 }
 
+/** Whether the person has actually highlighted some text somewhere on the page.
+ *
+ *  The scene chords take Ctrl-C and Ctrl-X, and a highlighted part number in the CAD report or a
+ *  reason in a rejection is text a person copies with exactly those keys. `editingText` does not see
+ *  it — a selection inside a plain `<div>` is not an editing context — so this is the second half of
+ *  the same guard, and it is the difference between "the scene owns this chord" and "the scene has
+ *  taken this chord away from the rest of the window". */
+function hasTextSelection(): boolean {
+  if (typeof window === "undefined") return false;
+  const selection = window.getSelection();
+  return !!selection && !selection.isCollapsed && selection.toString().trim().length > 0;
+}
+
 function effectiveViewportWidth(): number {
   if (typeof window === "undefined" || typeof document === "undefined") return 1440;
   const cssZoom = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("zoom"));
@@ -248,6 +262,7 @@ export function App() {
   const order = useEntityOrder();
   const selectedId = useSelectedId();
   const multiSelect = useMultiSelect();
+  const clipboard = useClipboard();
   const selectedEntity = useDisplayedEntity(selectedId ?? "");
   const editablePipeId = selectedId && selectedEntity?.components.PipeRecipe ? selectedId : null;
   const sceneEmpty = order.length === 0;
@@ -530,6 +545,40 @@ export function App() {
         });
         return;
       }
+      // **CTRL/CMD-C · X · V — the three most universal chords in any editor, all unbound** (ADR-198).
+      // The only route to the clipboard was a row inside a popup menu in the left dock, and the two
+      // that took anything took the PRIMARY out of however many objects were selected. Guarded on
+      // `editingText` like their neighbours — a text field owns the browser's own clipboard — and, for
+      // copy and cut, on a live text SELECTION as well: a person highlighting a part number in the CAD
+      // report and pressing Ctrl-C means that text, and the scene is not what they are pointing at.
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key.toLowerCase() === "c" || e.key.toLowerCase() === "x")) {
+        if (editingText || hasTextSelection()) return;
+        const cutting = e.key.toLowerCase() === "x";
+        // Cut writes to the document; copy does not — so only the cut is refused during Play, for the
+        // reason Delete is: a disposable runtime session is not the document.
+        if (cutting && (playing || pipeActive)) return;
+        e.preventDefault();
+        const ids = projectionStore.getState().multiSelect;
+        if (!ids.length) {
+          setStatus(cutting ? "Select an object to cut" : "Select an object to copy");
+          return;
+        }
+        void (cutting ? cutSelection(client, ids) : copySelection(client, ids)).then((outcome) => {
+          setStatus(outcome.sentence);
+          pushToast(outcome.sentence, outcome.ok ? "info" : "error");
+        });
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "v") {
+        if (editingText) return;
+        e.preventDefault();
+        if (playing || pipeActive) return;
+        void pasteClipboard(client).then((outcome) => {
+          setStatus(outcome.sentence);
+          pushToast(outcome.sentence, outcome.ok ? "success" : "error");
+        });
+        return;
+      }
       // **DELETE / BACKSPACE — the most-pressed key in any editor, and it was not bound at all**
       // (ADR-183). The only two routes to deleting anything were a row inside a popup menu in the left
       // dock and a right-click row that destroyed one object; a person who selected 378 bolts and
@@ -774,6 +823,58 @@ export function App() {
       disabledReason: "Select an object first",
       execute: async () => {
         const outcome = await duplicateSelection(client, projectionStore.getState().multiSelect);
+        setStatus(outcome.sentence);
+        pushToast(outcome.sentence, outcome.ok ? "success" : "error");
+      },
+    },
+    {
+      // The three chords every person already has, and the only route to any of them was a row inside
+      // a popup menu in the left dock (ADR-198). A palette row is where a person LEARNS the chord, so
+      // each one carries it.
+      id: "edit-copy",
+      label: "Copy",
+      category: "Edit",
+      shortcut: ["Ctrl", "C"],
+      description: "Put every selected object on the clipboard, with everything inside it",
+      keywords: ["clipboard"],
+      disabled: multiSelect.length === 0,
+      disabledReason: "Select an object first",
+      execute: async () => {
+        const outcome = await copySelection(client, projectionStore.getState().multiSelect);
+        setStatus(outcome.sentence);
+        pushToast(outcome.sentence, outcome.ok ? "info" : "error");
+      },
+    },
+    {
+      id: "edit-cut",
+      label: "Cut",
+      category: "Edit",
+      shortcut: ["Ctrl", "X"],
+      description: "Copy every selected object, then remove it — recoverable with Ctrl-Z",
+      keywords: ["clipboard", "move"],
+      disabled: multiSelect.length === 0,
+      disabledReason: "Select an object first",
+      execute: async () => {
+        const outcome = await cutSelection(client, projectionStore.getState().multiSelect);
+        setStatus(outcome.sentence);
+        pushToast(outcome.sentence, outcome.ok ? "info" : "error");
+      },
+    },
+    {
+      id: "edit-paste",
+      label: "Paste",
+      category: "Edit",
+      shortcut: ["Ctrl", "V"],
+      // WHAT IS HELD, IN THE ROW. Paste is the one verb whose subject is not on screen anywhere, so a
+      // row reading only "Paste" leaves the person to remember what they took a minute ago.
+      description: clipboard.objects
+        ? `Paste ${clipboard.label}${clipboard.cut ? " back where it was" : " beside the original"}`
+        : "Paste what was copied or cut",
+      keywords: ["clipboard"],
+      disabled: clipboard.objects === 0,
+      disabledReason: "Copy or cut something first",
+      execute: async () => {
+        const outcome = await pasteClipboard(client);
         setStatus(outcome.sentence);
         pushToast(outcome.sentence, outcome.ok ? "success" : "error");
       },

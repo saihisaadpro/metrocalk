@@ -47,6 +47,7 @@ import { PosePreview, type PoseDocument } from "../../src/panels/PosePreview";
 import POSE_PREVIEW from "../../src/panels/__fixtures__/pose-preview.json";
 import { assetShelfStore } from "../../src/store/assetShelf";
 import { projectionStore } from "../../src/store/projection";
+import { uiStore } from "../../src/store/ui";
 import type {
   AnimationPropertyInfo,
   AnimationTrackInfo,
@@ -2369,6 +2370,55 @@ function contextMenuScenes(): Scene[] {
         projectionStore
           .getState()
           .setSelection(Array.from({ length: 378 }, (_, i) => `bolt-${i}`));
+      },
+      render: () => (
+        <div style={{ width: 320, padding: 12 }}>
+          <AuthoringToolbar client={{} as unknown as EditorClient} />
+        </div>
+      ),
+    },
+    {
+      id: "authoring-clipboard-scope",
+      looking_for:
+        "THE OTHER TWO ROWS THAT ADMITTED IT (ADR-198). The same Actions menu, the Clipboard group " +
+        "below the Selection one: `Copy` and `Cut` read *Copy Bolt M12 - one subtree at a time* over " +
+        "a selection of 378, which is the ADR-196 narrowing said out loud twice more. They now count " +
+        "the set like `Duplicate` does. `Paste` is the row with the opposite problem: its subject is " +
+        "the CLIPBOARD, which is not on screen anywhere, so a row reading only *Paste* left the " +
+        "person to remember what they took - it now names what it holds and whether it will land " +
+        "back in place or beside the original. What a reader checks: all three descriptions promise " +
+        "the whole selection or name the held set; nothing anywhere says *one subtree at a time*; " +
+        "and no description wraps into its neighbour's label, because in this menu the description " +
+        "is what carries the scope",
+      viewport: { width: 520, height: 760 },
+      click: ["[data-testid='authoring-more']"],
+      expect: {
+        present: [
+          ["[data-testid='authCopy']", 1],
+          ["[data-testid='authCut']", 1],
+          ["[data-testid='authPaste']", 1],
+        ],
+        text_present: [
+          "Actions \u00b7 378",
+          "Copy every selected object",
+          "then remove it",
+          "Paste 378 objects (379 parts)",
+        ],
+        // The vocabulary of the narrowing, which has to be GONE from the product rather than merely
+        // absent from a happier fixture - and the coincident paste's own copy with it.
+        text_absent: ["one subtree at a time", "null", "undefined", "NaN"],
+        unclipped: ["[data-testid='authPaste']", "[data-testid='authCopy']"],
+      },
+      setup: () => {
+        seedAssembly();
+        projectionStore
+          .getState()
+          .setSelection(Array.from({ length: 378 }, (_, i) => `bolt-${i}`));
+        // A FILLED CLIPBOARD, because an empty one photographs a refusal. The label and the two
+        // counts are exactly what `copySelection` records, so the row draws what a real copy makes.
+        uiStore
+          .getState()
+          .setClipboard({ objects: 378, parts: 379, cut: false, label: "378 objects" });
       },
       render: () => (
         <div style={{ width: 320, padding: 12 }}>

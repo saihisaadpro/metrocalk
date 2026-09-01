@@ -27,6 +27,7 @@ import { PopoverSurface } from "../theme/Popover";
 import { PopupMenuItem } from "../theme/workspace";
 import { color, font, fontSize, space } from "../theme/tokens";
 import { deleteSelection } from "../app/deleteSelection";
+import { copySelection, cutSelection, pasteClipboard } from "../app/clipboard";
 import { similarTo } from "../app/selectSimilar";
 import type { EditorClient } from "../transport/session";
 import type { ActionItem, PickCandidate, SelectionActions } from "../transport/protocol";
@@ -45,6 +46,10 @@ function plainReason(reason: string): string {
  *  row would be noise; over a set, `Duplicate` acting on one of 378 and `Make dynamic` acting on 12
  *  of them are both facts a person needs BEFORE they click, not in the toast afterwards. */
 function scopeNote(action: ActionItem, count: number): string | null {
+  // `Paste` is the one verb in the menu that is not about the selection at all — its `appliesTo` is
+  // how many objects are on the CLIPBOARD, so measuring it against the selected count would print
+  // "2 of 14" about two facts that have nothing to do with each other.
+  if (action.action === "paste") return null;
   if (!action.available || count <= 1) return null;
   if (action.appliesTo >= count) return null;
   if (action.appliesTo === 1) return "this one only";
@@ -266,6 +271,18 @@ export function ContextMenu({
         projectionStore.getState().select(primary);
         void client.gizmoSelect(primary).catch((error) => console.error("gizmoSelect failed (engine selection may be out of sync)", error));
         feedback(`binding ${entityLabel(primary)}`, "info");
+        break;
+      case "copy":
+        // THE WHOLE SELECTION, exactly as `duplicate` above — through the same `copySelection` the
+        // toolbar row, the palette row and Ctrl-C call.
+        void copySelection(client, all).then((outcome) => feedback(outcome.sentence, outcome.ok ? "info" : "error"));
+        break;
+      case "cut":
+        void cutSelection(client, all).then((outcome) => feedback(outcome.sentence, outcome.ok ? "info" : "error"));
+        break;
+      case "paste":
+        // The one row here that does not read the selection: what it pastes is what was copied.
+        void pasteClipboard(client).then((outcome) => feedback(outcome.sentence, outcome.ok ? "success" : "error"));
         break;
       case "makedynamic":
         // `appliesTo` is the engine's own count of which members qualify, so a mixed selection makes

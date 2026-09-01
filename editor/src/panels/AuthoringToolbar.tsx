@@ -4,9 +4,10 @@
 
 import { useRef, useState } from "react";
 import { projectionStore, useMultiSelect, useSelectedId } from "../store/projection";
-import { setStatus, setClipboard, useClipboardHasContent } from "../store/ui";
+import { setStatus, useClipboard } from "../store/ui";
 import { deleteSelection } from "../app/deleteSelection";
 import { duplicateSelection } from "../app/duplicateSelection";
+import { clipboardSubject, copySelection, cutSelection, pasteClipboard } from "../app/clipboard";
 import { entityLabel } from "../store/selectionText";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
@@ -18,7 +19,7 @@ import type { EditorClient } from "../transport/session";
 export function AuthoringToolbar({ client }: { client: EditorClient }) {
   const multiSelection = useMultiSelect();
   const primary = useSelectedId();
-  const hasClipboard = useClipboardHasContent();
+  const clipboard = useClipboard();
   const ids = multiSelection.length ? multiSelection : primary ? [primary] : [];
   const hasMultiple = multiSelection.length >= 2;
   const hasSelection = ids.length > 0;
@@ -292,39 +293,32 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
                 {action(
                   "authCopy",
                   "Copy",
-                  () => {
-                    if (!primary) return;
-                    client.copySubtree(primary);
-                    setClipboard(true);
-                    pushToast("copied", "info");
+                  async () => {
+                    // THE WHOLE SELECTION, exactly as `Duplicate` above (ADR-196) — through the same
+                    // `copySelection` the chord, the menu row and the palette call. This row sat under
+                    // a trigger reading `Actions · 14` and copied one of them, and said so.
+                    const outcome = await copySelection(client, ids);
+                    setStatus(outcome.sentence);
+                    pushToast(outcome.sentence, outcome.ok ? "info" : "error");
                   },
                   close,
-                  !!primary,
-                  hasMultiple ? `Copy ${entityLabel(primary ?? "")} — one subtree at a time` : "Copy the selected subtree",
+                  hasSelection,
+                  "Copy every selected object, with everything inside it",
                   "Select an object to copy",
+                  "ghost",
+                  "Copying…",
                 )}
                 {action(
                   "authCut",
                   "Cut",
                   async () => {
-                    if (!primary) return;
-                    const ok = await client.cutSubtree(primary);
-                    if (!ok) {
-                      setStatus("couldn't cut the selection");
-                      pushToast("couldn't cut the selection", "error");
-                      return;
-                    }
-                    setClipboard(true);
-                    projectionStore.getState().markDeactivated([primary]);
-                    projectionStore.getState().select(null);
-                    setStatus("cut · recoverable with Ctrl-Z");
-                    pushToast("cut (recoverable)", "info");
+                    const outcome = await cutSelection(client, ids);
+                    setStatus(outcome.sentence);
+                    pushToast(outcome.sentence, outcome.ok ? "info" : "error");
                   },
                   close,
-                  !!primary,
-                  hasMultiple
-                    ? `Cut ${entityLabel(primary ?? "")} — one subtree at a time`
-                    : "Copy then deactivate the selected subtree",
+                  hasSelection,
+                  "Copy every selected object, then remove it — recoverable with Ctrl-Z",
                   "Select an object to cut",
                   "ghost",
                   "Cutting…",
@@ -333,15 +327,20 @@ export function AuthoringToolbar({ client }: { client: EditorClient }) {
                   "authPaste",
                   "Paste",
                   async () => {
-                    const pasted = await client.pasteClipboard();
-                    select(pasted);
-                    if (!pasted) return;
-                    setStatus("pasted · Ctrl-Z to undo");
-                    pushToast("pasted · Ctrl-Z to undo", "success");
+                    const outcome = await pasteClipboard(client);
+                    setStatus(outcome.sentence);
+                    pushToast(outcome.sentence, outcome.ok ? "success" : "error");
                   },
                   close,
-                  hasClipboard,
-                  "Paste a fresh copy",
+                  clipboard.objects > 0,
+                  // WHAT IT WOULD PASTE, NOT THAT IT WOULD PASTE. The subject of this verb is the one
+                  // thing not on screen anywhere: the selection has moved on since the copy, so a row
+                  // reading only "Paste" leaves the person to remember what they took.
+                  clipboard.objects > 0
+                    ? `Paste ${clipboardSubject(clipboard.objects, clipboard.parts, clipboard.label)}${
+                        clipboard.cut ? " back" : " beside the original"
+                      }`
+                    : "Paste a fresh copy",
                   "Copy or cut something first",
                   "ghost",
                   "Pasting…",

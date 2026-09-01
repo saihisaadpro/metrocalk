@@ -9,7 +9,7 @@ afterEach(() => {
   act(() => {
     projectionStore.getState().reset();
     uiStore.getState().setStatus("");
-    uiStore.getState().setClipboard(false);
+    uiStore.getState().setClipboard({ objects: 0, parts: 0, cut: false, label: "" });
   });
 });
 
@@ -164,4 +164,61 @@ test("Duplicate acts on the WHOLE selection, and its description counts what it 
   // And the copies are what is selected, so the drag that follows moves them.
   await waitFor(() => expect(projectionStore.getState().multiSelect).toEqual(["a-copy", "b-copy"]));
   expect(uiStore.getState().status).toContain("2 objects");
+});
+
+test("Copy and Cut act on the WHOLE selection, and Paste names what it holds", async () => {
+  // The last two verbs in this toolbar still taking the primary out of however many objects the
+  // trigger counted (ADR-198) - their own descriptions said so: "Copy Bolt - one subtree at a time".
+  const copySelection = vi.fn((ids: string[]) =>
+    Promise.resolve({ objects: ids.length, parts: ids.length + 1, nested: 0, missing: 0 }),
+  );
+  const cutSelection = vi.fn((ids: string[]) =>
+    Promise.resolve({ objects: ids.length, parts: ids.length, nested: 0, missing: 0, gone: ids }),
+  );
+  act(() => {
+    projectionStore.getState().bulkLoad([
+      { id: "a", name: "Bolt", parentId: null, components: {} },
+      { id: "b", name: "Nut", parentId: null, components: {} },
+    ]);
+    projectionStore.getState().setSelection(["a", "b"]);
+  });
+  render(<AuthoringToolbar client={fakeClient({ copySelection, cutSelection })} />);
+  fireEvent.click(screen.getByRole("button", { name: /^actions/i }));
+
+  // PASTE BEFORE THE COPY: an empty clipboard refuses, and says which fact refused it.
+  expect(screen.getByTestId("authPaste").getAttribute("aria-disabled")).toBe("true");
+
+  fireEvent.click(screen.getByTestId("authCopy"));
+  await waitFor(() => expect(copySelection).toHaveBeenCalledWith(["a", "b"]));
+  // Two counts, and the parts count only when it says something the object count does not.
+  await waitFor(() => expect(uiStore.getState().status).toBe("copied 2 objects (3 parts)"));
+  expect(uiStore.getState().clipboard.objects).toBe(2);
+
+  // AND THE PASTE ROW NOW NAMES WHAT IT WOULD PASTE. Paste is the one verb whose subject is not on
+  // screen anywhere - the selection has moved on since the copy.
+  fireEvent.click(screen.getByRole("button", { name: /^actions/i }));
+  expect(screen.getByTestId("authPaste").getAttribute("aria-disabled")).toBeNull();
+  expect(screen.getByTestId("authPaste").textContent).toContain("Paste 2 objects (3 parts)");
+});
+
+test("Cut deactivates exactly the rows the engine confirmed, and clears the selection", async () => {
+  const cutSelection = vi.fn((ids: string[]) =>
+    Promise.resolve({ objects: ids.length, parts: ids.length, nested: 0, missing: 0, gone: ids.slice(0, 1) }),
+  );
+  act(() => {
+    projectionStore.getState().bulkLoad([
+      { id: "a", name: "Bolt", parentId: null, components: {} },
+      { id: "b", name: "Nut", parentId: null, components: {} },
+    ]);
+    projectionStore.getState().setSelection(["a", "b"]);
+  });
+  render(<AuthoringToolbar client={fakeClient({ cutSelection })} />);
+  fireEvent.click(screen.getByRole("button", { name: /^actions/i }));
+  fireEvent.click(screen.getByTestId("authCut"));
+
+  await waitFor(() => expect(cutSelection).toHaveBeenCalledWith(["a", "b"]));
+  // The ENGINE says which ids went - dimming the list we sent would badge a row that is still there.
+  await waitFor(() => expect(projectionStore.getState().deactivated).toEqual({ a: true }));
+  expect(projectionStore.getState().multiSelect).toEqual([]);
+  expect(uiStore.getState().clipboard.cut).toBe(true);
 });

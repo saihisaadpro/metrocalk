@@ -15,7 +15,10 @@ import type {
   AddResponse,
   PickCandidate,
   FocusOutcome,
+  CopyOutcome,
+  CutOutcome,
   DuplicateOutcome,
+  PasteOutcome,
   AuthoredMatch,
   CatalogItem,
   CookedMatch,
@@ -392,12 +395,17 @@ export interface EditorClient {
    *  ids rather than a count is what lets the caller dim exactly those rows instead of assuming its own
    *  list is what happened. */
   deleteDeactivateMany(ids: string[]): Promise<string[]>;
-  /** Copy a sub-tree to the clipboard (cross-project = the serde Composition). */
-  copySubtree(id: string): void;
-  /** Cut = copy + delete(deactivate) → applied. */
-  cutSubtree(id: string): Promise<boolean>;
-  /** Paste the clipboard under fresh deterministic ids → the new root id. */
-  pasteClipboard(): Promise<string | null>;
+  /** **Copy a whole SELECTION** to the clipboard (ADR-198) — every selected object with everything
+   *  inside it, as the serde `Composition`s that cross a project boundary. A pure read.
+   *
+   *  Takes ids for the same reason `deleteDeactivateMany` does: the caller knows which set the gesture
+   *  was made over, and a menu opened on fourteen rows must not act on a fifteenth. */
+  copySelection(ids: string[]): Promise<CopyOutcome>;
+  /** **Cut a whole SELECTION** — copy it, then deactivate the sources in ONE undoable transaction. */
+  cutSelection(ids: string[]): Promise<CutOutcome>;
+  /** Paste everything on the clipboard under fresh deterministic ids, as ONE undoable transaction →
+   *  the pasted roots (what to select) and how many entities it created. */
+  pasteClipboard(): Promise<PasteOutcome>;
 
   // ── M8 physics (the React PhysicsPanel; the sim runs natively off the JS hot path — invariant 4) ─────
   /** Drop / spawn a dynamic body at a world position → the new body's id (or null). */
@@ -1111,14 +1119,23 @@ export class TauriClient implements EditorClient {
   deleteDeactivateMany(ids: string[]): Promise<string[]> {
     return this.core.invoke<string[]>("delete_deactivate_many", { ids }).catch((e: unknown) => { console.error("delete_deactivate_many failed", e); throw e; });
   }
-  copySubtree(id: string): void {
-    void this.core.invoke("copy_subtree", { id }).catch((e: unknown) => console.error("copy_subtree failed", e));
+  copySelection(ids: string[]): Promise<CopyOutcome> {
+    return this.core.invoke<CopyOutcome>("copy_selection", { ids }).catch((e: unknown) => {
+      console.error("copy_selection failed", e);
+      return { objects: 0, parts: 0, nested: 0, missing: ids.length };
+    });
   }
-  cutSubtree(id: string): Promise<boolean> {
-    return this.core.invoke<boolean>("cut_subtree", { id }).catch((e: unknown) => { console.error("cut_subtree failed", e); throw e; });
+  cutSelection(ids: string[]): Promise<CutOutcome> {
+    return this.core.invoke<CutOutcome>("cut_selection", { ids }).catch((e: unknown) => {
+      console.error("cut_selection failed", e);
+      return { objects: 0, parts: 0, nested: 0, missing: ids.length, gone: [] };
+    });
   }
-  pasteClipboard(): Promise<string | null> {
-    return this.core.invoke<string | null>("paste_clipboard").catch((e: unknown) => { console.error("paste_clipboard failed", e); throw e; });
+  pasteClipboard(): Promise<PasteOutcome> {
+    return this.core.invoke<PasteOutcome>("paste_clipboard").catch((e: unknown) => {
+      console.error("paste_clipboard failed", e);
+      return { created: [], entities: 0 };
+    });
   }
 
   // ── M8 physics ──
@@ -3099,12 +3116,14 @@ class MockClient implements EditorClient {
     this.selection = this.selection.filter((id) => !ids.includes(id));
     return Promise.resolve(ids);
   }
-  copySubtree(): void {}
-  cutSubtree(): Promise<boolean> {
-    return Promise.resolve(true);
+  copySelection(ids: string[]): Promise<CopyOutcome> {
+    return Promise.resolve({ objects: 0, parts: 0, nested: 0, missing: ids.length });
   }
-  pasteClipboard(): Promise<string | null> {
-    return Promise.resolve(null);
+  cutSelection(ids: string[]): Promise<CutOutcome> {
+    return Promise.resolve({ objects: 0, parts: 0, nested: 0, missing: ids.length, gone: [] });
+  }
+  pasteClipboard(): Promise<PasteOutcome> {
+    return Promise.resolve({ created: [], entities: 0 });
   }
   // M8 physics / M9 transform / M3.3 focus are Tauri-only (the dev MockCore has no sim/gizmo/native camera)
   // — inert, deterministic stubs so the panels render + the dev view never throws. The live behavior is

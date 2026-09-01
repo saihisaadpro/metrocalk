@@ -300,9 +300,11 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     ungroupEntity: () => Promise.resolve(true),
     multiEdit: vi.fn(() => Promise.resolve(true)),
     deleteDeactivate: vi.fn(() => Promise.resolve(true)),
-    copySubtree: vi.fn(),
-    cutSubtree: () => Promise.resolve(true),
-    pasteClipboard: () => Promise.resolve("paste-1"),
+    copySelection: vi.fn((ids: string[]) => Promise.resolve({ objects: ids.length, parts: ids.length, nested: 0, missing: 0 })),
+    cutSelection: vi.fn((ids: string[]) =>
+      Promise.resolve({ objects: ids.length, parts: ids.length, nested: 0, missing: 0, gone: ids }),
+    ),
+    pasteClipboard: vi.fn(() => Promise.resolve({ created: ["paste-1"], entities: 1 })),
     // M8 physics / M9 transform / focus (Tauri-only; inert defaults — a test overrides what it exercises).
     spawnBody: () => Promise.resolve("body-1"),
     setSimRunning: vi.fn(),

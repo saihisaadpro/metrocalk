@@ -252,6 +252,34 @@ describe("editor app — end-to-end wiring", () => {
     await waitFor(() => expect(palette.textContent).toContain("Duplicate"));
   });
 
+  it("Ctrl/Cmd+C, X and V are BOUND, and a text selection still owns the copy chord (ADR-198)", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByTestId("engine-scene")).toBeTruthy());
+
+    // None of the three did anything at all before this: the only route to the clipboard was a row
+    // inside a popup menu in the left dock. A refusal that says what to do is the proof the chord is
+    // bound - silence is what it used to do.
+    fireEvent.keyDown(window, { key: "c", ctrlKey: true });
+    await waitFor(() => expect(uiStore.getState().status).toBe("Select an object to copy"));
+    fireEvent.keyDown(window, { key: "x", ctrlKey: true });
+    await waitFor(() => expect(uiStore.getState().status).toBe("Select an object to cut"));
+    // An empty clipboard is a state with a next step, not a failure.
+    fireEvent.keyDown(window, { key: "v", ctrlKey: true });
+    await waitFor(() => expect(uiStore.getState().status).toBe("Copy or cut something first"));
+
+    // A HIGHLIGHTED PIECE OF TEXT OWNS Ctrl-C. The scene took the chord; a person copying a part
+    // number out of the CAD report means that text, and the scene is not what they are pointing at.
+    uiStore.getState().setStatus("");
+    const range = document.createRange();
+    range.selectNodeContents(screen.getByTestId("engine-scene"));
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    fireEvent.keyDown(window, { key: "c", ctrlKey: true });
+    expect(uiStore.getState().status).toBe("");
+    selection.removeAllRanges();
+  });
+
   it("uses header-triggered focus-managed drawers at phone width", () => {
     Object.defineProperty(window, "innerWidth", { value: 500, configurable: true });
     render(<App />);

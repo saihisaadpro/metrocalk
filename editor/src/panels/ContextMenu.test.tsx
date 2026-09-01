@@ -133,6 +133,51 @@ test("the menu states the scope it acts on, and Delete acts on the WHOLE selecti
   await waitFor(() => expect(projectionStore.getState().multiSelect).toEqual([]));
 });
 
+test("Copy and Cut take the WHOLE selection, and Paste is scoped to the clipboard instead", async () => {
+  loadScene([{ id: "b1", name: "Bolt" }, { id: "b2", name: "Nut" }]);
+  const copySelection = vi.fn((ids: string[]) =>
+    Promise.resolve({ objects: ids.length, parts: ids.length, nested: 0, missing: 0 }),
+  );
+  const cutSelection = vi.fn((ids: string[]) =>
+    Promise.resolve({ objects: ids.length, parts: ids.length, nested: 0, missing: 0, gone: ids }),
+  );
+  const pasteClipboard = vi.fn(() => Promise.resolve({ created: ["p1"], entities: 3 }));
+  const client = fakeClient({
+    // Two selected; the clipboard holds FIVE. `Paste` is the one row here whose scope has nothing to
+    // do with the selection, which is why the menu must not print "5 of 2" beside it.
+    entityActionsFor: () =>
+      Promise.resolve(
+        answer(2, [
+          act("copy", "Copy", 2, false),
+          act("cut", "Cut", 2, true),
+          act("paste", "Paste", 5, true),
+        ]),
+      ),
+    copySelection,
+    cutSelection,
+    pasteClipboard,
+  });
+
+  render(<ContextMenu client={client} ids={["b1", "b2"]} onClose={vi.fn()} />);
+  const rows = await screen.findAllByTestId("ctxitem");
+  const row = (name: string) => rows.find((r) => r.dataset.action === name)!;
+
+  expect(row("copy").textContent).toBe("Copy");
+  expect(row("paste").dataset.appliesTo).toBe("5");
+  expect(row("paste").textContent).toBe("Paste");
+
+  fireEvent.click(row("copy"));
+  await waitFor(() => expect(copySelection).toHaveBeenCalledWith(["b1", "b2"]));
+
+  fireEvent.click(row("paste"));
+  await waitFor(() => expect(pasteClipboard).toHaveBeenCalled());
+  // A paste selects what it put down, so the drag that follows moves the new objects.
+  await waitFor(() => expect(projectionStore.getState().multiSelect).toEqual(["p1"]));
+
+  fireEvent.click(row("cut"));
+  await waitFor(() => expect(cutSelection).toHaveBeenCalledWith(["b1", "b2"]));
+});
+
 test("a partially-applicable verb prints how many of the selection it reaches", async () => {
   const client = fakeClient({
     entityActionsFor: () =>
