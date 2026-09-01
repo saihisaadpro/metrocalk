@@ -417,16 +417,28 @@ export function App() {
         return;
       }
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
-        // Don't hijack TEXT undo while the user is typing in a field — only undo the SCENE otherwise.
-        if (editing) return;
-        e.preventDefault();
-        if (pipeActive && !pipeBusy) {
+        // THE ROUTE BRANCH GOES FIRST, AND THE PANEL THAT ADVERTISES IT IS WHY. `editing` counts
+        // `button` and `select` as command scopes — deliberately, so W/E/R cannot switch tools from a
+        // toolbar — but EVERY control in Pipe Forge is one of those, and the panel prints "Ctrl+Z undo
+        // a point" on itself. So the branch below was unreachable from the moment the user touched the
+        // panel promising it: the shortcut worked only while focus happened to be on the bare stage.
+        // Only a real TEXT field owns Ctrl+Z against a live route; a button does not.
+        const typingText = !!el && !!el.closest("input, textarea, [contenteditable='true']");
+        if (pipeActive && !typingText) {
+          e.preventDefault();
+          if (pipeBusy) {
+            setStatus("One moment — the route is still building");
+            return;
+          }
           void client.pipeForgeUndo().then((status) => {
             setPipeStatus(status);
             setStatus(status.message);
           });
           return;
         }
+        // Don't hijack TEXT undo while the user is typing in a field — only undo the SCENE otherwise.
+        if (editing) return;
+        e.preventDefault();
         // Honest feedback: only say "undo" when a transaction was actually reverted (the shell reports it),
         // else "nothing to undo" — never claim a revert on an empty history.
         void client.undo().then((did) => setStatus(did ? "undo" : "nothing to undo"));

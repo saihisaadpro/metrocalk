@@ -131,7 +131,7 @@ test("an active run displays the engine-authoritative recipe after reconnect", (
   );
   expect(screen.getByText("Copper")).toBeTruthy();
   expect(screen.getByText("12 cm")).toBeTruthy();
-  expect(screen.getByText("hero")).toBeTruthy();
+  expect(screen.getByText("Hero")).toBeTruthy();
   expect(screen.getByText("Manual fittings")).toBeTruthy();
 });
 
@@ -178,9 +178,12 @@ test("Bake Asset returns the complete build report to the host", async () => {
   await waitFor(() => expect(pipeForgeBake).toHaveBeenCalledTimes(1));
   expect(onBaked).toHaveBeenCalledWith(BAKED);
   expect(screen.getByTestId("pipe-forge-report").textContent).toContain("Asset ready");
-  expect(screen.getByTestId("pipe-forge-report").textContent).toContain("8,000 triangles");
-  expect(screen.getByTestId("pipe-forge-report").textContent).toContain("3 LODs");
-  expect(screen.getByTestId("pipe-forge-report").textContent).toContain("PBR 256px");
+  // PER TILE, NOT PER REPORT. `toContain("8,000 triangles")` over the whole report was satisfied by
+  // the collision sentence ("Triangle mesh collision · 8,000 triangles"), so it stayed green whatever
+  // the triangle tile said — including saying nothing.
+  expect(screen.getByTestId("pipe-forge-report-triangles").textContent).toContain("8,000");
+  expect(screen.getByTestId("pipe-forge-report-lods").textContent).toContain("3");
+  expect(screen.getByTestId("pipe-forge-report-texture").textContent).toContain("256px");
   expect(screen.getByTestId("pipe-forge-report").textContent).toContain("Watertight");
   expect(screen.getByTestId("pipe-forge-report").textContent).toContain("Triangle mesh collision · 8,000 triangles");
 
@@ -243,7 +246,7 @@ test("reopens the selected baked PipeRecipe for post-bake route editing", async 
     />,
   );
 
-  expect(screen.getByText(/restore its route handles/i)).toBeTruthy();
+  expect(screen.getByText(/points, branches and fittings all come back/i)).toBeTruthy();
   fireEvent.click(screen.getByTestId("pipe-forge-edit"));
   await waitFor(() => expect(pipeForgeEdit).toHaveBeenCalledWith("pipe-42"));
   expect(onStatus).toHaveBeenCalledWith(edited);
@@ -293,11 +296,11 @@ test("route network moves a stable handle and starts and ends a viewport branch"
   const onStatus = vi.fn();
   const { rerender } = render(<PipeForge client={client} status={ACTIVE} onStatus={onStatus} onBaked={vi.fn()} />);
 
-  fireEvent.click(screen.getByTestId("pipe-forge-network").querySelector("summary")!);
+  fireEvent.click(screen.getByTestId("pipe-forge-network").querySelector(".mtk-disclosure__toggle")!);
   fireEvent.change(screen.getByTestId("pipe-forge-handle"), { target: { value: "1" } });
-  fireEvent.focus(screen.getByTestId("pipe-forge-handle-x"));
-  fireEvent.change(screen.getByTestId("pipe-forge-handle-x"), { target: { value: "3.5" } });
-  fireEvent.blur(screen.getByTestId("pipe-forge-handle-x"));
+  fireEvent.focus(screen.getByTestId("pipe-forge-handle-position-x"));
+  fireEvent.change(screen.getByTestId("pipe-forge-handle-position-x"), { target: { value: "3.5" } });
+  fireEvent.blur(screen.getByTestId("pipe-forge-handle-position-x"));
   fireEvent.click(screen.getByTestId("pipe-forge-move-handle"));
   await waitFor(() => expect(pipeForgeMoveHandle).toHaveBeenCalledWith(1, 3.5, 0, 0));
 
@@ -308,7 +311,7 @@ test("route network moves a stable handle and starts and ends a viewport branch"
   await waitFor(() => expect(pipeForgeBeginBranch).toHaveBeenCalledWith(1, 2.5));
 
   rerender(<PipeForge client={client} status={branchStatus} onStatus={onStatus} onBaked={vi.fn()} />);
-  expect(screen.getByTestId("pipe-forge-branch-mode").textContent).toContain("handle 1");
+  expect(screen.getByTestId("pipe-forge-branch-mode").textContent).toContain("point 1");
   fireEvent.click(screen.getByTestId("pipe-forge-end-branch"));
   await waitFor(() => expect(pipeForgeEndBranch).toHaveBeenCalledTimes(1));
 });
@@ -333,14 +336,14 @@ test("semantic fitting controls place and remove a user-catalog valve", async ()
   const client = fakeClient({ pipeForgePlaceFitting, pipeForgeRemoveFitting });
   const { rerender } = render(<PipeForge client={client} status={withCatalog} onStatus={vi.fn()} onBaked={vi.fn()} />);
 
-  fireEvent.click(screen.getByTestId("pipe-forge-fittings").querySelector("summary")!);
+  fireEvent.click(screen.getByTestId("pipe-forge-fittings").querySelector(".mtk-disclosure__toggle")!);
   fireEvent.change(screen.getByTestId("pipe-forge-fitting-kind"), { target: { value: "valve" } });
   fireEvent.change(screen.getByTestId("pipe-forge-fitting-catalog"), { target: { value: entry.id } });
   fireEvent.click(screen.getByTestId("pipe-forge-place-fitting"));
   await waitFor(() => expect(pipeForgePlaceFitting).toHaveBeenCalledWith(1, "valve", "isolation-valve"));
 
   rerender(<PipeForge client={client} status={placed} onStatus={vi.fn()} onBaked={vi.fn()} />);
-  fireEvent.click(screen.getByTestId("pipe-forge-fittings").querySelector("summary")!);
+  fireEvent.click(screen.getByTestId("pipe-forge-fittings").querySelector(".mtk-disclosure__toggle")!);
   fireEvent.click(screen.getByTestId("pipe-forge-remove-fitting-9"));
   await waitFor(() => expect(pipeForgeRemoveFitting).toHaveBeenCalledWith(9));
 });
@@ -360,7 +363,7 @@ test("catalog flow saves bounded fitting metadata and removes an unused entry", 
   const client = fakeClient({ pipeForgeUpsertCatalog, pipeForgeRemoveCatalog });
   const { rerender } = render(<PipeForge client={client} status={ACTIVE} onStatus={vi.fn()} onBaked={vi.fn()} />);
 
-  fireEvent.click(screen.getByTestId("pipe-forge-catalog").querySelector("summary")!);
+  fireEvent.click(screen.getByTestId("pipe-forge-catalog").querySelector(".mtk-disclosure__toggle")!);
   fireEvent.change(screen.getByTestId("pipe-forge-catalog-label"), { target: { value: "Isolation valve" } });
   fireEvent.change(screen.getByTestId("pipe-forge-catalog-kind"), { target: { value: "valve" } });
   fireEvent.change(screen.getByTestId("pipe-forge-catalog-asset"), { target: { value: "mtkasset:valve-hero" } });
@@ -373,7 +376,7 @@ test("catalog flow saves bounded fitting metadata and removes an unused entry", 
   await waitFor(() => expect(pipeForgeUpsertCatalog).toHaveBeenCalledWith(entry));
 
   rerender(<PipeForge client={client} status={saved} onStatus={vi.fn()} onBaked={vi.fn()} />);
-  fireEvent.click(screen.getByTestId("pipe-forge-catalog").querySelector("summary")!);
+  fireEvent.click(screen.getByTestId("pipe-forge-catalog").querySelector(".mtk-disclosure__toggle")!);
   fireEvent.click(screen.getByTestId("pipe-forge-remove-catalog-isolation-valve"));
   await waitFor(() => expect(pipeForgeRemoveCatalog).toHaveBeenCalledWith("isolation-valve"));
 });

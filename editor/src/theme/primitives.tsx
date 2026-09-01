@@ -340,6 +340,113 @@ export function NumericField({
   );
 }
 
+/** One component of a vector — the wire field it edits, the tag drawn inside its cell, and the schema
+ *  facts a `NumericField` needs. `label` is the FULL accessible name ("Position X (m)"), because the
+ *  tag is a position marker and a position marker names nothing when read out of the row it sits in. */
+export interface VectorAxisSpec {
+  /** The wire field: `px`, `r`, `halfX`. Also the key, and what a commit is reported against. */
+  field: string;
+  /** The one-character mark drawn inside the cell — `X`, `Y`, `Z`, `R`, `G`, `B`. */
+  tag: string;
+  label: string;
+  value: number;
+  min?: number;
+  max?: number;
+  integer?: boolean;
+  /** No projected value yet — the same unbound cue every scalar row carries (C6). */
+  unbound?: boolean;
+}
+
+export interface VectorFieldProps {
+  axes: VectorAxisSpec[];
+  /** One axis committed — one transaction, exactly as typing into a single scalar row is. */
+  onCommit: (field: string, value: number) => void;
+  /** Live during a scrub-drag: local visual feedback only, no IPC and no transaction. */
+  onScrub?: (field: string, value: number) => void;
+  /** The DOM id for an axis cell, so the row's one visible label can point at the first of them. */
+  idFor?: (field: string) => string;
+  step?: number;
+  disabled?: boolean;
+  /** 0–255 per channel. Present only for a colour triple; draws the swatch that makes it a colour. */
+  swatch?: { r: number; g: number; b: number };
+  /** Read back beside the swatch, so the colour is identifiable and not merely visible. */
+  swatchTitle?: string;
+  "data-testid"?: string;
+}
+
+/**
+ * **The vector editor — the control the constitution names and this editor did not have.**
+ *
+ * A `Transform` is nine scalars on the wire because `FieldType` is scalar-only, and until now it was
+ * also nine ROWS in the inspector: nine labels, nine full-width boxes, nine units, ~1,000px of scroll
+ * for the one component every object carries, and below 760px each of those rows stacked its label
+ * onto its own line as well. Three numbers that are read together, edited together and reset together
+ * are one property, and the panel is the only place that can say so — the wire cannot.
+ *
+ * The tag lives INSIDE the cell rather than beside it: a separate letter column is a fourth grid track
+ * that every non-vector row in the same sheet would have to reserve and leave empty. `aria-hidden` on
+ * it, and the axis's full name on the input, so the reading order is "Position X, metres" and not "X".
+ *
+ * Each cell is an ordinary `NumericField`, so drag-to-scrub, keyboard nudge, type-to-set, the revert
+ * on invalid input and the one-transaction-per-scrub coalescing are all inherited rather than
+ * re-implemented — this component is a layout and a naming convention, not a second number control.
+ */
+export function VectorField({
+  axes,
+  onCommit,
+  onScrub,
+  idFor,
+  step,
+  disabled = false,
+  swatch,
+  swatchTitle,
+  ...rest
+}: VectorFieldProps) {
+  const testid = (rest as { "data-testid"?: string })["data-testid"];
+  return (
+    <div className="mtk-vector" data-axes={axes.length} data-testid={testid}>
+      {swatch && (
+        <span
+          className="mtk-vector__swatch"
+          title={swatchTitle}
+          // THE CHANNELS ARE HANDED OVER AS NUMBERS AND COMPOSED IN THE STYLESHEET. `rgb()` written
+          // here would be a literal colour in a component, which is the one thing the colour token
+          // layer exists to prevent; written in `global.css` it is the colour authority doing its job.
+          style={{
+            ["--mtk-swatch-r" as string]: swatch.r,
+            ["--mtk-swatch-g" as string]: swatch.g,
+            ["--mtk-swatch-b" as string]: swatch.b,
+          }}
+          data-testid={testid ? `${testid}-swatch` : undefined}
+        />
+      )}
+      {axes.map((axis) => (
+        <div className="mtk-vector__axis" key={axis.field}>
+          <span className="mtk-vector__tag" aria-hidden="true">
+            {axis.tag}
+          </span>
+          <NumericField
+            id={idFor?.(axis.field)}
+            value={axis.value}
+            integer={axis.integer}
+            step={step ?? (axis.integer ? 1 : 0.1)}
+            min={axis.min}
+            max={axis.max}
+            disabled={disabled}
+            invalid={axis.unbound}
+            title={axis.unbound ? `${axis.label}: no value set yet` : undefined}
+            ariaLabel={axis.label}
+            data-testid={testid ? `${testid}-${axis.field}` : undefined}
+            onCommit={(v) => onCommit(axis.field, v)}
+            onScrub={onScrub ? (v) => onScrub(axis.field, v) : undefined}
+            style={{ width: "100%" }}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** A styled text field (integrated dark) — the shared input the command bar + forms use. */
 export function TextField({ style, mono = false, ...rest }: Omit<InputHTMLAttributes<HTMLInputElement>, "type" | "className"> & { mono?: boolean }) {
   return <input type="text" className={mono ? "mtk-input mtk-input--mono" : "mtk-input"} style={style} {...rest} />;

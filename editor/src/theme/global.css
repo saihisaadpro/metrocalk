@@ -320,9 +320,26 @@ body {
   box-shadow: none;
   cursor: not-allowed;
 }
-.mtk-input:read-only,
+/* A `<select>` IS ALWAYS `:read-only`, AND THAT ERASED EVERY DROPDOWN ARROW IN THE EDITOR.
+   `:read-only` matches any element the user cannot type into — which is every `<select>`, always, by
+   definition — and `SelectField` puts `mtk-input` on the element beside `mtk-select`. So this rule
+   matched every dropdown in the editor at specificity (0,2,0), beating `.mtk-select` at (0,1,0), and
+   it did two things it never meant to: it painted the control in the READ-ONLY fill, and — because
+   `background` is a SHORTHAND — it reset `background-image` to `none`, deleting the chevron three
+   rules below. With `appearance: none` already having removed the platform's own arrow, the result is
+   a dropdown with NO affordance of any kind: measured on the live page as
+   `background-image: none` while the `.mtk-select` rule declaring it was matched and parsed.
+   Invisible to every gate here — `check-class-hooks` sees both classes emitted and both rules
+   present, and no invariant asks whether a control still looks like the control it is.
+
+   Two changes, and both are load-bearing. `:not(.mtk-select)` because a select is not read-only in
+   the sense this rule means, and `background-color` because the fill is the only thing it ever wanted
+   to change — a shorthand here silently owns five longhands it has no opinion about. The same
+   shorthand trap is already documented four rules down, where `.mtk-select:disabled` has to restate
+   `background-repeat`/`-position`/`-size` after the `:disabled` shorthand tiled the chevron. */
+.mtk-input:read-only:not(.mtk-select),
 .mtk-textarea:read-only,
-.mtk-search:read-only { background: var(--mtk-bg-panel); }
+.mtk-search:read-only { background-color: var(--mtk-bg-panel); }
 /* The chevron is OURS, not the platform's. A native `<select>` paints an OS arrow that changes with
    the desktop theme and matches nothing else in the editor -- in the animate dock it was the only
    Windows widget on a row of design-system controls. `appearance: none` removes it; the replacement
@@ -668,6 +685,96 @@ progress { accent-color: var(--mtk-accent-solid); }
 }
 .mtk-property-row[data-invalid="true"] .mtk-property-row__help,
 .mtk-property-row[aria-invalid="true"] .mtk-property-row__help { color: var(--mtk-danger); }
+
+/* ── THE VECTOR CELL, AND THE ROW OF AN EDITABLE LIST ──────────────────────────────────────────────
+   Both of these are ADOPTED VERBATIM from the two concurrent lanes that wrote them first — the
+   component source is byte-identical to `claude/jolly-chatelet-6dfc2d` (`VectorField`, ADR-155) and
+   `claude/dazzling-elgamal-3acebf` (`ListRow`, ADR-159). A third spelling of a control two other
+   branches already have is the collision this repository has now paid for twice, so the rule is
+   adopt-and-extend rather than invent-and-reconcile: when those branches land, these merge into one
+   component instead of three.
+
+   FLEX, NOT A THREE-COLUMN GRID, and a 336px floating panel is the reason (the 300px Inspector track
+   was the other lane's). Fixed columns divide whatever they are given, so at the width these surfaces
+   really ship at, a third of the control cell is a box too narrow to read a signed decimal in. A
+   basis with a floor wraps instead: the cells stay legible and the row grows a line. */
+.mtk-vector {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--mtk-space-2);
+  min-width: 0;
+}
+.mtk-vector__axis {
+  position: relative;
+  flex: 1 1 64px;
+  min-width: 64px;
+}
+/* The tag is drawn INSIDE the cell. Beside it, it would be a fourth grid track that every scalar row
+   in the same sheet has to reserve and leave empty — and the sheet's alignment is the whole point of
+   the sheet. It is positioned, so it paints over the static input; it takes no pointer events, so the
+   drag-to-scrub gesture still starts anywhere in the cell. */
+.mtk-vector__tag {
+  position: absolute;
+  top: 50%;
+  left: 9px;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: var(--mtk-text-faint);
+  font: 600 10px/1 var(--mtk-font-ui);
+  letter-spacing: 0.4px;
+}
+.mtk-vector__axis > .mtk-numfield {
+  width: 100%;
+  padding-left: 21px;
+}
+/* The one honest colour control the core's vocabulary allows. `Light.r/g/b` are three separate
+   Numbers — there is no `format: color` field anywhere in the registry — so a colour picker keyed on
+   that format could never fire. What CAN be true is that the three channels being edited are shown as
+   the colour they make. The channels arrive as numbers in custom properties and are composed HERE,
+   because this file is the colour authority. */
+.mtk-vector__swatch {
+  flex: none;
+  box-sizing: border-box;
+  width: 26px;
+  min-height: var(--mtk-control-default);
+  align-self: stretch;
+  border: 1px solid var(--mtk-border);
+  border-radius: var(--mtk-radius-md);
+  background: rgb(var(--mtk-swatch-r) var(--mtk-swatch-g) var(--mtk-swatch-b));
+  box-shadow: inset 0 1px 2px rgba(21, 34, 50, 0.12);
+}
+
+/* ONE ROW OF AN EDITABLE LIST. The shape every authoring list in the editor is made of, and the one
+   every such list had been writing by hand as `display: flex; justify-content: space-between` — which
+   is why a delete button lands at a different distance from its row's edge in each of them, and why
+   Pipe Forge's catalog rows were measured losing 53px of name and 49px of their Remove button off the
+   right edge of a panel that is `overflow-x: hidden`. `flex-wrap` plus `min-width: 0` is the whole
+   repair: the controls WRAP rather than escape the panel. */
+.mtk-list-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--mtk-space-3);
+  min-width: 0;
+  padding: var(--mtk-space-2) var(--mtk-space-3);
+  border: 1px solid transparent;
+  border-radius: var(--mtk-radius-lg);
+  transition: background var(--mtk-motion-fast) var(--mtk-ease-standard);
+}
+.mtk-list-row:hover { background: var(--mtk-bg-hover); }
+/* A row holding a nested editor is a surface of its own, so the rows inside it read as being inside
+   something rather than as more siblings of the row above. */
+.mtk-list-row--card {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--mtk-space-3);
+  padding: var(--mtk-space-4);
+  border-color: var(--mtk-border-subtle);
+  background: var(--mtk-bg-panel);
+  box-shadow: var(--mtk-shadow-1);
+}
+.mtk-list-row--card:hover { background: var(--mtk-bg-panel); }
 
 /* ── A SETTINGS SHEET IS COLUMNS, NOT ONE STACKED COLUMN (ADR-147) ─────────────────────────────────
    `.mtk-property-row` is the INSPECTOR's anatomy: one control per line, label left, in a 300px track.

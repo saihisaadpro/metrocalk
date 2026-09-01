@@ -48,12 +48,17 @@ async function setNumeric(selector, value) {
   await browser.keys(["Enter"]);
 }
 
+// The three sections are `DisclosureSection`s, not raw `<details>`: a real button with `aria-expanded`
+// and a `data-state` on the section, instead of a `<summary>` and an `open` attribute. The swap is what
+// makes the panel visible to the screenshot gate at all — Chrome gives a closed `<details>` body
+// `content-visibility: hidden`, so every descendant reports a collapsed rect and the geometry
+// invariants report confident nonsense about controls that are not on screen (ADR-160).
 async function openDetails(testId) {
-  const details = await $(`[data-testid="${testId}"]`);
-  if ((await details.getAttribute("open")) === null) {
-    await details.$("summary").click();
+  const section = await $(`[data-testid="${testId}"]`);
+  if ((await section.getAttribute("data-state")) !== "open") {
+    await section.$(".mtk-disclosure__toggle").click();
   }
-  expect(await details.getAttribute("open")).not.toBeNull();
+  expect(await section.getAttribute("data-state")).toBe("open");
 }
 
 async function exposeSceneCount() {
@@ -418,7 +423,7 @@ describe("packaged editor / Pipe Forge direct viewport asset", () => {
     const editedY = Number((restoredTip.position[1] + 0.75).toFixed(3));
     await openDetails("pipe-forge-network");
     await $('[data-testid="pipe-forge-handle"]').selectByAttribute("value", String(branchTip.nodeId));
-    await setNumeric('[data-testid="pipe-forge-handle-y"]', String(editedY));
+    await setNumeric('[data-testid="pipe-forge-handle-position-y"]', String(editedY));
     await $('[data-testid="pipe-forge-move-handle"]').click();
     await browser.waitUntil(async () => {
       const current = await invoke("pipe_forge_status");
