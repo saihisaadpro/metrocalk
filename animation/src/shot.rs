@@ -1143,9 +1143,9 @@ pub fn card_shot_problems(
             continue;
         };
         let vantage = plan.settled;
-        if vantage.acceptable() {
+        let Some(fault) = vantage.fault() else {
             continue;
-        }
+        };
         let n = index + 1;
         // ONE LEAD, THREE SPECIFICS, and the lead is the half that matters. What the author must
         // learn is that the search has already been done — otherwise the obvious response to any of
@@ -1166,31 +1166,31 @@ pub fn card_shot_problems(
         // stands there.
         let out_of = "press \"Take me there\" to stand where it tried, then frame it \
                       yourself with \"Shoot from this view\" — or film a different part";
-        if vantage.eye_inside {
-            out.push(ShotProblem::about(
+        match fault {
+            VantageFault::Inside => out.push(ShotProblem::about(
                 index,
                 format!(
-                "{lead} in the best one it found the camera is inside something, so those frames \
-                 will be solid colour; {out_of}"
-            ),
-            ));
-        } else if vantage.clear < MIN_CLEAR_FRACTION {
-            let hidden = (1.0 - vantage.clear.clamp(0.0, 1.0)) * 100.0;
-            out.push(ShotProblem::about(
-                index,
-                format!(
-                "{lead} in the best one it found {hidden:.0}% of the subject is behind something \
-                 else; {out_of}"
-            ),
-            ));
-        } else if vantage.crowded > MAX_CROWDED_FRACTION {
-            out.push(ShotProblem::about(
+                    "{lead} in the best one it found the camera is inside something, so those \
+                     frames will be solid colour; {out_of}"
+                ),
+            )),
+            VantageFault::Hidden(hidden) => {
+                let hidden = hidden * 100.0;
+                out.push(ShotProblem::about(
+                    index,
+                    format!(
+                        "{lead} in the best one it found {hidden:.0}% of the subject is behind \
+                         something else; {out_of}"
+                    ),
+                ));
+            }
+            VantageFault::Crowded(_) => out.push(ShotProblem::about(
                 index,
                 format!(
                     "{lead} in the best one it found most of the frame is whatever the camera is \
-                 standing against rather than the subject; {out_of}"
+                     standing against rather than the subject; {out_of}"
                 ),
-            ));
+            )),
         }
     }
     out
@@ -1604,6 +1604,19 @@ pub struct Vantage {
     pub crowded: f32,
 }
 
+/// ADR-201 — the one fault a placement has, when it has one. See [`Vantage::fault`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VantageFault {
+    /// The camera stands inside — or within touching distance of — something that is not its
+    /// subject. Those frames are solid colour.
+    Inside,
+    /// This much of the subject is behind something else, `0..=1`.
+    Hidden(f32),
+    /// This much of the frame is whatever the camera is standing against rather than the subject,
+    /// `0..=1`.
+    Crowded(f32),
+}
+
 impl Vantage {
     /// A vantage with nothing in the way and nothing behind — what an empty world reports, and the
     /// value a caller with no occlusion data should hand back so behaviour is unchanged.
@@ -1623,6 +1636,30 @@ impl Vantage {
     #[must_use]
     pub fn acceptable(&self) -> bool {
         !self.eye_inside && self.clear >= MIN_CLEAR_FRACTION && self.crowded <= MAX_CROWDED_FRACTION
+    }
+
+    /// ADR-201 — WHICH of the three faults this placement has, worst first, or `None` when it has
+    /// none.
+    ///
+    /// [`Self::acceptable`] is the same question answered as a boolean, and this is exactly its
+    /// negation — the three tests are the three clauses of it, in the order a sentence about them has
+    /// to be written: a camera buried in a machine cannot see its subject either, so saying both is
+    /// saying the same thing twice.
+    ///
+    /// It exists because two places now write that sentence — [`card_shot_problems`], about a shot,
+    /// and the walk, about one instant of one — and a second copy of the branch order is a second
+    /// place for the two to disagree about what a frame's problem is.
+    #[must_use]
+    pub fn fault(&self) -> Option<VantageFault> {
+        if self.eye_inside {
+            Some(VantageFault::Inside)
+        } else if self.clear < MIN_CLEAR_FRACTION {
+            Some(VantageFault::Hidden(1.0 - self.clear.clamp(0.0, 1.0)))
+        } else if self.crowded > MAX_CROWDED_FRACTION {
+            Some(VantageFault::Crowded(self.crowded.clamp(0.0, 1.0)))
+        } else {
+            None
+        }
     }
 
     /// Rank among acceptable placements. Seeing the subject dominates; having something behind it is a
@@ -1843,23 +1880,150 @@ pub fn worst_moment(
     subject: SubjectSample,
     aspect: f32,
     fov_deg: f32,
-    mut look: impl FnMut(&CameraSample, f32) -> Vantage,
+    look: impl FnMut(&CameraSample, f32) -> Vantage,
 ) -> (f32, CameraSample, Vantage) {
-    let mut worst: Option<(f32, CameraSample, Vantage)> = None;
-    for progress in PATH_SAMPLES {
-        let pose = solve_shot_adjusted(shot, adjustment, subject, progress, aspect, fov_deg);
-        let vantage = look(&pose, progress);
-        if worst.is_none_or(|(_, _, held)| vantage.score() < held.score()) {
-            worst = Some((progress, pose, vantage));
+    let path = path_moments(shot, adjustment, subject, aspect, fov_deg, look);
+    worst_of(&path).map_or_else(
+        || {
+            // PATH_SAMPLES is a non-empty constant, so this is unreachable; written as a value
+            // rather than an unwrap so a future edit to that constant cannot turn a diagnostic into
+            // a panic.
+            let pose = solve_shot_adjusted(shot, adjustment, subject, 0.0, aspect, fov_deg);
+            (0.0, pose, Vantage::OPEN)
+        },
+        |worst| (worst.progress, worst.pose, worst.vantage),
+    )
+}
+
+/// ADR-201 — one instant of a shot's camera path, solved and judged.
+///
+/// The unit the whole walk is built out of. Before this the path existed only *inside* the planner's
+/// loop: five poses were solved, five verdicts were taken, four were thrown away and the fifth was
+/// reported as a number. So the engine knew a push-in was clear for its first half and buried for its
+/// second, and the only thing anyone outside could ask was "how bad does it get".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PathMoment {
+    /// How far through the shot's move this is, `0.0` at its opening and `1.0` at its end.
+    pub progress: f32,
+    /// The camera pose the shot is filmed from at this instant, as [`solve_shot_adjusted`] solves it.
+    pub pose: CameraSample,
+    /// What the world says about that pose.
+    pub vantage: Vantage,
+}
+
+/// ADR-201 — the whole camera path, at the instants the planner judged it on.
+///
+/// [`plan_shot`] scores every candidate at [`PATH_SAMPLES`] and keeps one verdict. This walks the same
+/// samples for a placement already chosen and keeps **all** of them, which is the difference between
+/// "this shot has a problem" and "this shot has a problem from here to here".
+///
+/// The sample set is deliberately the planner's own and not a finer one: these are the instants the
+/// engine actually judged, and a track drawn at twenty points would claim a resolution the placement
+/// search does not have. [`moment_at`] is how any instant *between* them is asked about — measured
+/// there and then, rather than interpolated from neighbours that were never a promise about the
+/// middle.
+#[must_use]
+pub fn path_moments(
+    shot: &ShotRecipe,
+    adjustment: ShotAdjustment,
+    subject: SubjectSample,
+    aspect: f32,
+    fov_deg: f32,
+    mut look: impl FnMut(&CameraSample, f32) -> Vantage,
+) -> Vec<PathMoment> {
+    PATH_SAMPLES
+        .iter()
+        .map(|&progress| {
+            let pose = solve_shot_adjusted(shot, adjustment, subject, progress, aspect, fov_deg);
+            let vantage = look(&pose, progress);
+            PathMoment {
+                progress,
+                pose,
+                vantage,
+            }
+        })
+        .collect()
+}
+
+/// ADR-201 — the shot at ONE instant the author chose, judged there.
+///
+/// The scrub's own solve. `progress` is clamped rather than refused: a slider hands over whatever its
+/// track's arithmetic produced, and a shot has a pose at `0.0` and at `1.0` — a refusal at `1.0000001`
+/// would be a control that stops working at its own end stop.
+#[must_use]
+pub fn moment_at(
+    shot: &ShotRecipe,
+    adjustment: ShotAdjustment,
+    subject: SubjectSample,
+    aspect: f32,
+    fov_deg: f32,
+    progress: f32,
+    mut look: impl FnMut(&CameraSample, f32) -> Vantage,
+) -> PathMoment {
+    // NaN clamps to the opening, not to the end: `f32::clamp` panics on a NaN bound but propagates a
+    // NaN value, and a NaN progress reaching `solve_shot_eased` is a camera at no position at all.
+    let progress = if progress.is_nan() {
+        0.0
+    } else {
+        progress.clamp(0.0, 1.0)
+    };
+    let pose = solve_shot_adjusted(shot, adjustment, subject, progress, aspect, fov_deg);
+    let vantage = look(&pose, progress);
+    PathMoment {
+        progress,
+        pose,
+        vantage,
+    }
+}
+
+/// The worst of a walked path, by the planner's own comparison. `None` only for an empty path.
+///
+/// **`score() <` is strict, deliberately**, so ties go to the earliest sample exactly as they do
+/// inside [`plan_shot`]. A function that agreed with the planner about the verdict but not about
+/// which frame produced it would take an author to a frame that looks fine and tell them it is the
+/// problem.
+#[must_use]
+pub fn worst_of(path: &[PathMoment]) -> Option<PathMoment> {
+    let mut worst: Option<PathMoment> = None;
+    for moment in path {
+        if worst.is_none_or(|held| moment.vantage.score() < held.vantage.score()) {
+            worst = Some(*moment);
         }
     }
-    worst.unwrap_or_else(|| {
-        // PATH_SAMPLES is a non-empty constant, so this is unreachable; written as a value rather
-        // than an unwrap so a future edit to that constant cannot turn a diagnostic into a panic.
-        let pose = solve_shot_adjusted(shot, adjustment, subject, 0.0, aspect, fov_deg);
-        (0.0, pose, Vantage::OPEN)
-    })
+    worst
 }
+
+/// ADR-201 — how far the camera actually travels across a walked path, in metres.
+///
+/// **The measured answer to "does this shot move", and neither `motion != Hold` nor
+/// `camera.is_none()`.** Both of those readings are wrong, in opposite directions. A push-in whose
+/// strength is zero, and an orbit inside a room so tight that [`Stage::confine`] pins every sample to
+/// the same wall, are authored as moves and sweep nothing — a scrub over either is a control that
+/// moves and changes nothing. And a PLACED camera with a move sweeps a path like any other:
+/// [`solve_placed_shot`] keeps all six verbs working around the stored pose, so "put the camera here
+/// and push in" is a journey an author can walk. Only the poses know which is which.
+#[must_use]
+pub fn path_travel(path: &[PathMoment]) -> f32 {
+    let Some(first) = path.first() else {
+        return 0.0;
+    };
+    path.iter()
+        .map(|moment| {
+            let d = [
+                moment.pose.eye[0] - first.pose.eye[0],
+                moment.pose.eye[1] - first.pose.eye[1],
+                moment.pose.eye[2] - first.pose.eye[2],
+            ];
+            d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt()
+        })
+        .fold(0.0_f32, f32::max)
+}
+
+/// The shortest travel that counts as a move a camera can be walked along, metres.
+///
+/// A millimetre. Below it the poses are the same pose to any eye, and the difference is the
+/// arithmetic of an eased curve rather than a journey anyone could film.
+pub const PATH_TRAVEL_EPSILON: f32 = 1.0e-3;
 
 /// Swing the eye around the subject's vertical axis, keeping its height and its distance. The aim is
 /// untouched, so the subject stays exactly as framed — only the side we look from changes.
@@ -4222,7 +4386,12 @@ mod tests {
             a_world_that_is_always(Vantage::OPEN),
         );
         assert!(progress.abs() < 1.0e-6, "ties go to the earliest sample");
-        assert!(dist(pose.eye, solve_shot(&card, cube(), 0.0, 16.0 / 9.0, 50.0).eye) < 1.0e-4);
+        assert!(
+            dist(
+                pose.eye,
+                solve_shot(&card, cube(), 0.0, 16.0 / 9.0, 50.0).eye
+            ) < 1.0e-4
+        );
     }
 
     #[test]
@@ -4248,6 +4417,217 @@ mod tests {
         assert!(
             dist(pose.eye, camera.eye) < 1.0e-4,
             "an adjustment must not move a placed camera"
+        );
+    }
+
+    // ── ADR-201, the walk ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn naming_the_fault_and_answering_whether_there_is_one_can_never_disagree() {
+        // `acceptable()` is a boolean and `fault()` names which of its three clauses failed, and two
+        // functions with the same three thresholds written out twice is two places for them to
+        // drift. Swept rather than spot-checked: every combination that straddles all three.
+        for &eye_inside in &[false, true] {
+            for clear in [0.0_f32, 0.4, 0.55, 0.6, 0.75, 1.0] {
+                for crowded in [0.0_f32, 0.3, 0.5, 0.7, 0.9, 1.0] {
+                    let v = Vantage {
+                        eye_inside,
+                        clear,
+                        backing: 0.3,
+                        crowded,
+                    };
+                    assert_eq!(
+                        v.fault().is_none(),
+                        v.acceptable(),
+                        "the two readings of one placement disagree: {v:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_walk_reports_every_instant_the_planner_scored_and_no_others() {
+        let card = shot(ShotSize::Medium, ShotAngle::Front, ShotMove::PushIn);
+        let plan = ShotAdjustment::authored(&card);
+        let path = path_moments(
+            &card,
+            plan,
+            cube(),
+            16.0 / 9.0,
+            50.0,
+            a_world_that_is_always(Vantage::OPEN),
+        );
+        assert_eq!(
+            path.iter().map(|m| m.progress).collect::<Vec<_>>(),
+            PATH_SAMPLES.to_vec(),
+            "the track is the planner's own sample set, not a finer one it never judged"
+        );
+        for moment in &path {
+            assert!(
+                dist(
+                    moment.pose.eye,
+                    solve_shot_adjusted(&card, plan, cube(), moment.progress, 16.0 / 9.0, 50.0).eye
+                ) < 1.0e-4,
+                "every moment must be the pose the runtime films at that instant: {moment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_walk_says_where_along_the_move_the_trouble_starts() {
+        // THE WHOLE POINT OF KEEPING ALL FIVE. `plan_shot` reduces this shot to one word — the
+        // camera is buried — and an author reading that has no way to know it is buried for the
+        // second half of the move and clean for the first. The walk is the difference between
+        // "this shot has a problem" and "this shot has a problem from here to here".
+        let card = shot(ShotSize::Medium, ShotAngle::Front, ShotMove::PushIn);
+        let plan = ShotAdjustment::authored(&card);
+        let path = path_moments(&card, plan, cube(), 16.0 / 9.0, 50.0, |_, progress| {
+            if progress > 0.5 {
+                NOWHERE_TO_STAND
+            } else {
+                Vantage::OPEN
+            }
+        });
+        assert_eq!(
+            path.iter()
+                .map(|m| m.vantage.acceptable())
+                .collect::<Vec<_>>(),
+            vec![true, true, true, false, false],
+            "the verdicts have to read as a stretch, in order"
+        );
+        let worst = worst_of(&path).expect("a non-empty walk");
+        assert!(
+            (worst.progress - 0.75).abs() < 1.0e-6,
+            "ties among the equally-bad go to the earliest, exactly as inside the search: {worst:?}"
+        );
+    }
+
+    #[test]
+    fn the_worst_moment_is_the_worst_of_the_walk() {
+        // `worst_moment` is now a `worst_of` over `path_moments`, and this is the assertion that
+        // the refactor did not quietly change which frame the warning is about.
+        let card = shot(ShotSize::Wide, ShotAngle::ThreeQuarter, ShotMove::Orbit);
+        let mut world = |_: &CameraSample, progress: f32| Vantage {
+            eye_inside: false,
+            clear: 1.0 - progress * 0.5,
+            backing: 0.4,
+            crowded: 0.0,
+        };
+        let plan = plan_shot(&card, cube(), 16.0 / 9.0, 50.0, &mut world);
+        let (progress, pose, vantage) =
+            worst_moment(&card, plan, cube(), 16.0 / 9.0, 50.0, &mut world);
+        let walked = worst_of(&path_moments(
+            &card,
+            plan,
+            cube(),
+            16.0 / 9.0,
+            50.0,
+            &mut world,
+        ))
+        .expect("a non-empty walk");
+        assert!((walked.progress - progress).abs() < 1.0e-6, "{walked:?}");
+        assert_eq!(walked.vantage, vantage, "{walked:?}");
+        assert!(dist(walked.pose.eye, pose.eye) < 1.0e-4, "{walked:?}");
+    }
+
+    #[test]
+    fn a_moment_between_the_samples_is_measured_there_rather_than_interpolated() {
+        // The scrub's own solve. 0.4 is deliberately not in PATH_SAMPLES: an author who stops
+        // between two of the engine's own judgements is entitled to the reading AT the pose they
+        // are standing at, not to the nearer neighbour's.
+        let card = shot(ShotSize::Medium, ShotAngle::Front, ShotMove::PushIn);
+        let plan = ShotAdjustment::authored(&card);
+        let seen = std::cell::Cell::new(f32::NAN);
+        let moment = moment_at(&card, plan, cube(), 16.0 / 9.0, 50.0, 0.4, |_, progress| {
+            seen.set(progress);
+            Vantage::OPEN
+        });
+        assert!((moment.progress - 0.4).abs() < 1.0e-6, "{moment:?}");
+        assert!(
+            (seen.get() - 0.4).abs() < 1.0e-6,
+            "the world was asked about the instant stood at, not about a sample near it"
+        );
+        assert!(
+            dist(
+                moment.pose.eye,
+                solve_shot_adjusted(&card, plan, cube(), 0.4, 16.0 / 9.0, 50.0).eye
+            ) < 1.0e-4
+        );
+        assert!(
+            !PATH_SAMPLES.iter().any(|&p| dist(
+                moment.pose.eye,
+                solve_shot_adjusted(&card, plan, cube(), p, 16.0 / 9.0, 50.0).eye
+            ) < 1.0e-4),
+            "0.4 must genuinely be between the samples for this test to mean anything"
+        );
+    }
+
+    #[test]
+    fn a_walk_clamps_at_its_own_end_stops_rather_than_refusing_them() {
+        let card = shot(ShotSize::Medium, ShotAngle::Front, ShotMove::PushIn);
+        let plan = ShotAdjustment::authored(&card);
+        let at = |progress| {
+            moment_at(
+                &card,
+                plan,
+                cube(),
+                16.0 / 9.0,
+                50.0,
+                progress,
+                a_world_that_is_always(Vantage::OPEN),
+            )
+            .progress
+        };
+        assert!((at(1.5) - 1.0).abs() < 1.0e-6, "past the end is the end");
+        assert!(at(-0.2).abs() < 1.0e-6, "before the opening is the opening");
+        // A slider's own arithmetic produces a NaN from a zero-width track, and a NaN reaching the
+        // eased solve is a camera at no position at all.
+        assert!(at(f32::NAN).abs() < 1.0e-6, "a NaN lands at the opening");
+    }
+
+    #[test]
+    fn what_moves_is_measured_from_the_poses_not_read_off_the_card() {
+        let walk = |card: &ShotRecipe| {
+            path_travel(&path_moments(
+                card,
+                ShotAdjustment::authored(card),
+                cube(),
+                16.0 / 9.0,
+                50.0,
+                a_world_that_is_always(Vantage::OPEN),
+            ))
+        };
+        assert!(
+            walk(&shot(ShotSize::Medium, ShotAngle::Front, ShotMove::PushIn)) > PATH_TRAVEL_EPSILON,
+            "a push-in with strength travels"
+        );
+        assert!(
+            walk(&shot(ShotSize::Medium, ShotAngle::Front, ShotMove::Hold)) <= PATH_TRAVEL_EPSILON,
+            "a locked-off shot does not"
+        );
+        // AUTHORED AS A MOVE AND SWEEPING NOTHING — the case a `motion != Hold` test would call
+        // moving, and over which a scrub would move and change nothing.
+        let inert = ShotRecipe {
+            amount: 0.0,
+            ..shot(ShotSize::Medium, ShotAngle::Front, ShotMove::PushIn)
+        };
+        assert!(
+            walk(&inert) <= PATH_TRAVEL_EPSILON,
+            "a push-in of zero strength travels nothing"
+        );
+        // AND THE CASE A `camera.is_none()` TEST WOULD CALL STILL. ADR-192 kept all six verbs working
+        // on a placed camera — `solve_placed_shot` applies the move around the stored pose — so a
+        // placed push-in sweeps a path exactly as a card one does, and it is walkable for the same
+        // reason. Reading the answer off the recipe would have got this backwards; measuring it
+        // cannot.
+        assert!(
+            walk(&placed(ShotMove::PushIn, 0.6)) > PATH_TRAVEL_EPSILON,
+            "a placed camera with a move still sweeps a path"
+        );
+        assert!(
+            walk(&placed(ShotMove::Hold, 0.6)) <= PATH_TRAVEL_EPSILON,
+            "a locked-off placed camera does not"
         );
     }
 

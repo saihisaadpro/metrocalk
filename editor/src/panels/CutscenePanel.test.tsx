@@ -16,7 +16,7 @@ import { stageHighlightStore } from "../store/stageHighlight";
 import { frameGuideStore } from "../store/frameGuide";
 import { toastStore } from "../store/toasts";
 import { DEFAULT_RENDER_SETTINGS } from "../transport/protocol";
-import type { CinemaReply, ShotRow } from "../transport/protocol";
+import type { CinemaReply, ShotRow, StandAtReply } from "../transport/protocol";
 
 function row(over: Partial<ShotRow> & Pick<ShotRow, "id" | "index" | "startSeconds">): ShotRow {
   return {
@@ -999,6 +999,11 @@ describe("CutscenePanel", () => {
           placed: false,
           steps: 0,
           acceptable: true,
+          hidden: 0,
+          moving: false,
+          travel: 0,
+          worst: 0,
+          path: [],
           message: "Play is driving the camera",
           reason: "Play is driving the camera",
         }),
@@ -1007,6 +1012,159 @@ describe("CutscenePanel", () => {
       render(<CutscenePanel client={client} />);
       fireEvent.click(await screen.findByTestId("cutscene-take-me-there"));
       expect(await screen.findByTestId("cutscene-refusal")).toBeTruthy();
+    });
+  });
+
+  // -----------------------------------------------------------------------------------------------
+  // ADR-201 - WALK THE MOVE. "Take me there" lands at ONE instant of a camera path and says which;
+  // the rest of the path was reachable only through a preview, which holds the viewport and cannot
+  // be orbited from. These check the four things that make the walk a capability rather than a
+  // slider: it only appears when there is a path to walk, it asks the engine for the instant the
+  // thumb is at, it draws the engine's own five verdicts, and it can get back to the worst one.
+  // -----------------------------------------------------------------------------------------------
+  describe("walking a shot's move", () => {
+    /** A stand-at reply for a shot whose move is clear for its first half and buried for its second
+     *  - the shape a single verdict cannot express, and the whole reason the track exists. */
+    function walked(over: Partial<StandAtReply> = {}): StandAtReply {
+      return {
+        moved: true,
+        stood: [6, 3, 8],
+        lookAt: [0, 0.5, 0],
+        fovDeg: 40,
+        offBy: 0,
+        progress: 0.75,
+        placed: false,
+        steps: 0,
+        acceptable: false,
+        hidden: 0.78,
+        moving: true,
+        travel: 12.4,
+        worst: 0.75,
+        path: [
+          { progress: 0, acceptable: true, inside: false, hidden: 0, crowded: 0 },
+          { progress: 0.25, acceptable: true, inside: false, hidden: 0.05, crowded: 0 },
+          { progress: 0.5, acceptable: true, inside: false, hidden: 0.1, crowded: 0 },
+          { progress: 0.75, acceptable: false, inside: false, hidden: 0.78, crowded: 0 },
+          { progress: 1, acceptable: false, inside: false, hidden: 0.7, crowded: 0 },
+        ],
+        message:
+          "Standing where shot 2 films from — 75% through its move — 78% of the subject is hidden here.",
+        reason: null,
+        ...over,
+      };
+    }
+
+    /** A client whose engine answers a walk, and answers about the instant it was asked for. */
+    function walking(first: StandAtReply = walked()) {
+      const client = loaded();
+      client.cinemaStandAtShot = vi.fn((_id: string, _index: number, progress?: number) =>
+        Promise.resolve(
+          progress === undefined
+            ? first
+            : walked({
+                progress,
+                acceptable: progress < 0.7,
+                hidden: progress < 0.7 ? 0.05 : 0.78,
+                message:
+                  progress < 0.7
+                    ? `Standing where shot 2 films from — ${Math.round(progress * 100)}% through its move — clear here.`
+                    : `Standing where shot 2 films from — ${Math.round(progress * 100)}% through its move — 78% of the subject is hidden here.`,
+              }),
+        ),
+      );
+      return client;
+    }
+
+    /** Open shot 2, stand at it, and wait for the strip. */
+    async function stood(client: ReturnType<typeof walking>) {
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[1]);
+      fireEvent.click(await screen.findByTestId("cutscene-stand-here"));
+      return screen.findByTestId("cutscene-walk");
+    }
+
+    it("is not offered until the author is standing on the path", async () => {
+      const client = walking();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[1]);
+      // The shot MOVES - it is the push-in - and there is still nothing to scrub, because a walk is
+      // the camera stepping along a path it is not on yet.
+      await screen.findByTestId("cutscene-stand-here");
+      expect(screen.queryByTestId("cutscene-walk")).toBeNull();
+    });
+
+    it("is not offered for a shot that sweeps nothing, however it was authored", async () => {
+      // `moving` is the ENGINE's measurement of the poses, not this panel's reading of the card.
+      const client = walking(walked({ moving: false, travel: 0, path: [], progress: 0, worst: 0 }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[2]);
+      fireEvent.click(await screen.findByTestId("cutscene-stand-here"));
+      await waitFor(() => expect(client.cinemaStandAtShot).toHaveBeenCalled());
+      expect(screen.queryByTestId("cutscene-walk")).toBeNull();
+    });
+
+    it("asks the engine for the instant the thumb is at, and says what it found there", async () => {
+      const client = walking();
+      await stood(client);
+      fireEvent.change(await screen.findByTestId("cutscene-walk-slider"), {
+        target: { value: "0.25" },
+      });
+      await waitFor(() => expect(client.cinemaStandAtShot).toHaveBeenCalledWith("e1", 1, 0.25));
+      // AND THE READ-OUT IS THE ENGINE'S SENTENCE. An author dragging a track whose caption does not
+      // change cannot tell a walk from a stuck slider.
+      await waitFor(() =>
+        expect(screen.getByTestId("cutscene-walk-reads").textContent).toMatch(
+          /25% through its move .* clear here/,
+        ),
+      );
+    });
+
+    it("draws the engine's own five verdicts, so a bad stretch is visible before it is walked", async () => {
+      const client = walking();
+      await stood(client);
+      const marks = await screen.findAllByTestId("cutscene-walk-mark");
+      expect(marks.map((m) => m.getAttribute("data-clear"))).toEqual([
+        "yes",
+        "yes",
+        "yes",
+        "no",
+        "no",
+      ]);
+      // ...and in words, because a picture with no text behind it is that information withheld from
+      // everyone not looking at it.
+      expect(screen.getByTestId("cutscene-walk-track").getAttribute("aria-label")).toMatch(
+        /objected at 75%, 100%/,
+      );
+    });
+
+    it("can get back to the frame the shot was judged on", async () => {
+      const client = walking();
+      await stood(client);
+      fireEvent.change(await screen.findByTestId("cutscene-walk-slider"), {
+        target: { value: "0.25" },
+      });
+      await waitFor(() => expect(client.cinemaStandAtShot).toHaveBeenCalledWith("e1", 1, 0.25));
+      fireEvent.click(await screen.findByTestId("cutscene-walk-worst"));
+      await waitFor(() => expect(client.cinemaStandAtShot).toHaveBeenCalledWith("e1", 1, 0.75));
+    });
+
+    it("ends when a framing edit changes the path under it", async () => {
+      // The camera has not moved; the SHOT has. A track still drawn from the old placement would be
+      // describing a move that no longer exists.
+      const client = walking();
+      await stood(client);
+      fireEvent.change(await screen.findByTestId("cutscene-motion"), { target: { value: "orbit" } });
+      await waitFor(() => expect(screen.queryByTestId("cutscene-walk")).toBeNull());
+    });
+
+    it("ends when Play takes the camera", async () => {
+      const client = walking();
+      await stood(client);
+      act(() => playStore.getState().refresh({ playing: true, paused: false }));
+      await waitFor(() => expect(screen.queryByTestId("cutscene-walk")).toBeNull());
     });
   });
 });

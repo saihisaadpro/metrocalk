@@ -783,6 +783,64 @@ const cutsceneClientWithProblems = (extraProblems: ShotProblem[]) => {
   } as unknown as EditorClient;
 };
 
+/** ADR-201 — the same five-shot cut, plus an engine that can be asked WHERE ALONG a shot's move to
+ *  stand.
+ *
+ *  The opener is a pull-out, so it sweeps a real camera path — and the path this answers about is the
+ *  shape a single verdict cannot express: clear for its first half, and with three quarters of the
+ *  subject behind something else for its second. That is the whole reason the track draws five dots
+ *  instead of printing one number.
+ *
+ *  `progress === undefined` is the arrival — what a warning's "Take me there" asks for — and lands at
+ *  the worst instant, exactly as the engine does. */
+const WALK_PATH = [
+  { progress: 0, acceptable: true, inside: false, hidden: 0.02, crowded: 0.1 },
+  { progress: 0.25, acceptable: true, inside: false, hidden: 0.08, crowded: 0.12 },
+  { progress: 0.5, acceptable: true, inside: false, hidden: 0.18, crowded: 0.14 },
+  { progress: 0.75, acceptable: false, inside: false, hidden: 0.74, crowded: 0.2 },
+  { progress: 1, acceptable: false, inside: false, hidden: 0.78, crowded: 0.22 },
+];
+
+const walkingClient = () => {
+  const said = (progress: number) => {
+    const here = WALK_PATH.reduce((best, sample) =>
+      Math.abs(sample.progress - progress) < Math.abs(best.progress - progress) ? sample : best,
+    );
+    const where =
+      progress <= 0
+        ? " — at the opening of its move"
+        : progress >= 1
+          ? " — at the end of its move"
+          : ` — ${Math.round(progress * 100)}% through its move`;
+    const found = here.acceptable
+      ? " — clear here"
+      : ` — ${Math.round(here.hidden * 100)}% of the subject is hidden here`;
+    return {
+      moved: true,
+      stood: [7.4, 2.9, -5.1] as [number, number, number],
+      lookAt: [0.2, 1.35, 0.4] as [number, number, number],
+      fovDeg: 55,
+      offBy: 0,
+      progress,
+      placed: false,
+      steps: 0,
+      acceptable: here.acceptable,
+      hidden: here.hidden,
+      moving: true,
+      travel: 18.6,
+      worst: 0.75,
+      path: WALK_PATH,
+      message: `Standing where shot 1 films from${where}${found}.`,
+      reason: null,
+    };
+  };
+  return {
+    ...cutsceneClient(),
+    cinemaStandAtShot: (_id: string, _index: number, progress?: number) =>
+      Promise.resolve(said(progress ?? 0.75)),
+  } as unknown as EditorClient;
+};
+
 /** Nothing rendered yet - the zero row every render answer in this file is built from. */
 const RENDER_IDLE = {
   running: false,
@@ -1717,6 +1775,68 @@ export const SCENES: Scene[] = [
         ])}
       />
     ),
+  },
+  {
+    id: "cutscene-walk-the-move",
+    looking_for:
+      "A SHOT IS A PATH, AND UNTIL NOW ONLY ONE FRAME OF IT WAS STANDABLE. 'Take me there' puts the "
+      + "author at the instant a warning is about and says which — '75% through its move' — and the "
+      + "other four fifths of that path were reachable only through Preview, which HOLDS the "
+      + "viewport: the camera is taken, the next tick overwrites any drag, and the frames an author "
+      + "most needs to judge are the ones they cannot orbit from or shoot from. The engine could "
+      + "always solve any instant; nothing outside it could ask. Check five things. First, 'Walk the "
+      + "move' has appeared BELOW the toolbar that stood them there and did not exist before the "
+      + "click — it is the second half of 'Take me there', not a third framing control, and a scrub "
+      + "over a path the camera is not on would be a lie. Second, the TRACK under it is the engine's "
+      + "own judgement, drawn at the five instants the placement search actually scored: three green "
+      + "then two amber, so a push-in that is clear for its first half and buried for its second "
+      + "reads differently from one that is buried throughout — which is exactly what a single "
+      + "percentage in a single sentence could not say. The worst of them is ringed. Third, the "
+      + "read-out is the ENGINE'S sentence and it names the instant and what is wrong AT it ('75% "
+      + "through its move — 74% of the subject is hidden here'), so an author dragging the thumb can "
+      + "tell a walk from a stuck slider. Fourth, 'Worst frame' is DISABLED with its reason, because "
+      + "arriving lands on the worst instant and a control that moves nothing is worse than one that "
+      + "is not there. Fifth, nothing about the shot has changed: 'Shoot from this view' is live, the "
+      + "framing controls are live, and walking is a camera move that writes nothing",
+    viewport: { width: 1400, height: 980 },
+    setup: selectAnimatedEntity,
+    click: ["[data-testid='cutscene-clip']", "[data-testid='cutscene-stand-here']"],
+    expect: {
+      present: [
+        ["[data-testid='cutscene-walk']", 1],
+        ["[data-testid='cutscene-walk-slider']", 1],
+        // FIVE, because the planner scores five. A track drawn at twenty points would claim a
+        // resolution the placement search does not have.
+        ["[data-testid='cutscene-walk-mark']", 5],
+        ["[data-testid='cutscene-walk-reads']", 1],
+      ],
+      text_present: [
+        "Walk the move",
+        "75% through its move",
+        "74% of the subject is hidden here",
+        "Worst frame",
+        // Still the shot's own controls, untouched: a walk edits nothing.
+        "Shoot from this view",
+      ],
+      text_absent: ["vantage", "acceptable", "eye_inside", "crowded", "null", "undefined", "NaN"],
+      enabled: [
+        "[data-testid='cutscene-walk-slider']",
+        "[data-testid='cutscene-shoot-here']",
+        "[data-testid='cutscene-stand-here']",
+      ],
+      // Arriving IS the worst instant, so the control that goes back to it has nowhere to go.
+      disabled: ["[data-testid='cutscene-walk-worst']"],
+      unclipped: [
+        "[data-testid='cutscene-walk']",
+        "[data-testid='cutscene-walk-slider']",
+        "[data-testid='cutscene-walk-reads']",
+      ],
+      untruncated: ["[data-testid='cutscene-walk-worst']"],
+      // The track sits UNDER its slider, not beside it: the dots line up with the positions the
+      // thumb travels through, and a side-by-side layout would make that alignment meaningless.
+      stacked: [["[data-testid='cutscene-walk-slider']", "[data-testid='cutscene-walk-track']"]],
+    },
+    render: () => <CutscenePanel client={walkingClient()} />,
   },
   {
     id: "cutscene-frame-guide",

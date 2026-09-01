@@ -35,7 +35,7 @@ import { subjectAimStore, useSubjectAim } from "../store/subjectAim";
 import { setStatus } from "../store/ui";
 import { pushToast } from "../store/toasts";
 import { Icon } from "../theme/icons";
-import { Button, ReadOut, SelectField, Slider, Toolbar, ToolbarGroup, ToolbarSeparator } from "../theme/primitives";
+import { Button, ReadOut, SelectField, Slider, SliderField, Toolbar, ToolbarGroup, ToolbarSeparator } from "../theme/primitives";
 import { Callout, Field, FieldGrid } from "../theme/fields";
 import { EmptyPanelState } from "../theme/workspace";
 import {
@@ -52,7 +52,7 @@ import {
 import { frameGuideStore, useFrameGuide } from "../store/frameGuide";
 import { color, font, fontSize, radius, space } from "../theme/tokens";
 import { DEFAULT_RENDER_SETTINGS } from "../transport/protocol";
-import type { CinemaPreviewReply, CinemaReply, DeliveryFrame, FramingCatalog, FramingEdit, ShotRow, ShotSpec } from "../transport/protocol";
+import type { CinemaPreviewReply, CinemaReply, DeliveryFrame, FramingCatalog, FramingEdit, PathSample, ShotRow, ShotSpec, StandAtReply } from "../transport/protocol";
 import type { EditorClient } from "../transport/session";
 import { RenderDialog } from "./RenderDialog";
 import { ShotCatalogue } from "./ShotCatalogue";
@@ -131,6 +131,27 @@ function xyz(v: readonly [number, number, number]): string {
 
 /** The word a framing value reads as, from the catalogue that also validates it. Falls back to the
  *  wire value rather than to nothing: an unlabelled option is still an option a user can pick. */
+/** ADR-201 — the walk's track, said in words.
+ *
+ *  The dots ARE the information — five verdicts laid out along the move, so a push-in that is clear
+ *  for its first half reads differently from one that is buried throughout — and a picture with no
+ *  text behind it is that information withheld from everyone not looking at it. Written as one
+ *  sentence rather than five, because five is a list of coordinates and one is a shape.
+ */
+function walkTrackReads(path: PathSample[]): string {
+  if (path.length === 0) return "The engine has not judged this move.";
+  const bad = path.filter((sample) => !sample.acceptable);
+  const n = path.length;
+  if (bad.length === 0) {
+    return `The engine found nothing in the way at any of the ${n} moments it judged along this move.`;
+  }
+  if (bad.length === n) {
+    return `The engine objected at every one of the ${n} moments it judged along this move.`;
+  }
+  const at = bad.map((sample) => `${Math.round(sample.progress * 100)}%`).join(", ");
+  return `Of the ${n} moments the engine judged along this move it objected at ${at}, and found the rest clear.`;
+}
+
 function labelOf(options: { value: string; label: string }[], value: string): string {
   return options.find((option) => option.value === value)?.label ?? value;
 }
@@ -154,6 +175,16 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
   /** Whether the render dialog is open. ADR-175. */
   const [rendering, setRendering] = useState(false);
   const [draftAmount, setDraftAmount] = useState<number | null>(null);
+  // ADR-201 — WHERE THE AUTHOR IS STANDING, when they are standing in a shot. Set by "Take me
+  // there" and by every step of the walk that follows it; `null` whenever the stage camera is not on
+  // a shot's path, which is the only state in which a scrub over that path would be a lie.
+  const [standing, setStanding] = useState<StandAtReply & { index: number } | null>(null);
+  // The slider's own position, kept locally so the control stays under the pointer while the engine
+  // answers. The READ-OUT beside it is the engine's, so the two can legitimately differ for a frame:
+  // one is where the author has dragged to, the other is where the camera has got to.
+  const [walkAt, setWalkAt] = useState(0);
+  const walkPending = useRef<number | null>(null);
+  const walkInFlight = useRef(false);
   const scroller = useRef<HTMLDivElement | null>(null);
   const [laneRoom, setLaneRoom] = useState(0);
   const previewInfo = useCinemaPreview();
@@ -438,11 +469,14 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
       if (row) setActiveId(row.id);
       const reply = await client.cinemaStandAtShot(selected, index);
       if (reply.reason) {
+        setStanding(null);
         setRefusal(reply.reason);
         pushToast(reply.reason, "error");
         return;
       }
       setRefusal(null);
+      setStanding({ ...reply, index });
+      setWalkAt(reply.progress);
       setStatus(reply.message);
       pushToast(reply.message, "info");
     } catch (e) {
@@ -452,6 +486,62 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
       setBusy(false);
     }
   };
+
+  // ADR-201 — WALK THE MOVE. "Take me there" lands at ONE instant of a camera path and says which:
+  // *"— 60% through its move"*. The other four fifths of that path were reachable only through a
+  // preview, which HOLDS the viewport and is overwritten on the next tick — so the frames an author
+  // most needs to judge were the ones they could not stand in and could not orbit from.
+  //
+  // The engine could always solve any instant. Nothing outside it could ask.
+  //
+  // LATEST WINS, ONE IN FLIGHT. A drag emits an event per pixel and each one is an IPC round trip
+  // that reads an occlusion BVH; queuing them would walk the camera through every intermediate
+  // position seconds after the pointer stopped. This keeps only the newest request and sends it as
+  // soon as the previous answer lands, which is what makes the camera track the thumb.
+  const walkTo = useCallback(
+    async (index: number, progress: number) => {
+      if (!selected) return;
+      walkPending.current = progress;
+      if (walkInFlight.current) return;
+      walkInFlight.current = true;
+      try {
+        while (walkPending.current !== null) {
+          const at = walkPending.current;
+          walkPending.current = null;
+          const reply = await client.cinemaStandAtShot(selected, index, at);
+          if (reply.reason) {
+            // A refusal here is Play or a preview taking the camera mid-walk. The strip goes with
+            // it: a scrub whose camera someone else is holding moves nothing.
+            setStanding(null);
+            setRefusal(reply.reason);
+            pushToast(reply.reason, "error");
+            return;
+          }
+          setRefusal(null);
+          setStanding({ ...reply, index });
+          setStatus(reply.message);
+        }
+      } catch (e) {
+        console.error("Walk the move failed", e);
+        pushToast("Walking the move failed — please try again", "error");
+      } finally {
+        walkInFlight.current = false;
+      }
+    },
+    [client, selected],
+  );
+
+  // THE WALK ENDS WHEN THE CAMERA STOPS BEING THE AUTHOR'S. Play and a preview both take the
+  // viewport, and a strip still offering to stand somewhere would be a control whose every step is
+  // overwritten on the next tick. A framing edit ends it too — for the opposite reason: the camera
+  // has not moved, but the PATH under it has, so the track would be describing a shot that no longer
+  // exists. Selecting another object ends it because the cutscene on screen is a different one.
+  useEffect(() => {
+    setStanding(null);
+  }, [selected, playing, revision]);
+  useEffect(() => {
+    if (previewing) setStanding(null);
+  }, [previewing]);
 
   const useTheCardAgain = (row: ShotRow) => {
     if (!selected) return;
@@ -966,9 +1056,18 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
               title={
                 locked
                   ? lockReason
-                  : active.camera
-                    ? "Stand the stage camera at this shot's own camera"
-                    : "Stand the stage camera where the engine films this shot from"
+                  : // ADR-201 — AND THE WALK IS NAMED HERE, because it is the only place an author
+                    // who has not pressed this yet can find out it exists: the strip appears once
+                    // they are standing on the path, which is after this click. `stillMotions` is
+                    // the engine's own list of moves that go nowhere, so the promise is not made
+                    // about a shot that cannot keep it.
+                    catalog.stillMotions.includes(active.motion)
+                    ? active.camera
+                      ? "Stand the stage camera at this shot's own camera"
+                      : "Stand the stage camera where the engine films this shot from"
+                    : active.camera
+                      ? "Stand the stage camera at this shot's own camera, then walk its move from there"
+                      : "Stand the stage camera where the engine films this shot from, then walk its move from there"
               }
               onClick={() => void takeMeThere(active.index)}
             >
@@ -1027,6 +1126,123 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
               </>
             )}
           </Toolbar>
+
+          {/* ADR-201 — WALK THE MOVE. The strip appears once the author is standing on this shot's
+              path and that path goes somewhere, which is the only state in which it means anything:
+              a scrub over a camera Play is holding moves nothing, and a scrub over a locked-off shot
+              moves and changes nothing.
+
+              WHY IT IS NOT ALWAYS ON SCREEN. It is the second half of "Take me there", not a third
+              framing control — the author has to BE on the path before walking it is a thing they
+              can do. That is also why it sits directly under the toolbar that put them there rather
+              than in the framing grid: the grid edits the shot, and this edits nothing at all.
+
+              THE TRACK IS THE ENGINE'S OWN JUDGEMENT, drawn at the five instants the placement
+              search actually scored. Before this, the whole of it reached the author as one number
+              in one sentence — so a push-in that is clear for its first half and buried for its
+              second read exactly like one that is buried throughout. */}
+          {standing && standing.index === active.index && standing.moving && (
+            <section
+              data-testid="cutscene-walk"
+              aria-label={`Walk shot ${active.index + 1}'s move`}
+              style={{ display: "grid", gap: space.xxs, maxWidth: 1100, minWidth: 0 }}
+            >
+              <SliderField
+                label="Walk the move"
+                data-testid="cutscene-walk-slider"
+                ariaLabel={`How far through shot ${active.index + 1}'s move to stand`}
+                value={walkAt}
+                min={0}
+                max={1}
+                step={0.01}
+                disabled={locked}
+                title={
+                  locked
+                    ? lockReason
+                    : `Stand the camera anywhere along this shot's ${standing.travel.toFixed(1)} m move — orbit from wherever you stop, and shoot from there.`
+                }
+                valueLabel={`${Math.round(walkAt * 100)}%`}
+                onChange={(event) => {
+                  const at = Number(event.currentTarget.value);
+                  setWalkAt(at);
+                  void walkTo(active.index, at);
+                }}
+              />
+              <div
+                data-testid="cutscene-walk-track"
+                role="img"
+                aria-label={walkTrackReads(standing.path)}
+                title={walkTrackReads(standing.path)}
+                style={{ position: "relative", height: 10, marginInline: space.xs }}
+              >
+                <span
+                  aria-hidden
+                  style={{
+                    position: "absolute",
+                    insetInline: 0,
+                    top: 4,
+                    height: 2,
+                    borderRadius: radius.sm,
+                    background: color.border.subtle,
+                  }}
+                />
+                {standing.path.map((sample) => (
+                  <span
+                    key={sample.progress}
+                    aria-hidden
+                    data-testid="cutscene-walk-mark"
+                    data-progress={sample.progress}
+                    data-clear={sample.acceptable ? "yes" : "no"}
+                    style={{
+                      position: "absolute",
+                      left: `${sample.progress * 100}%`,
+                      top: 1,
+                      width: 8,
+                      height: 8,
+                      marginLeft: -4,
+                      borderRadius: "50%",
+                      background: sample.acceptable ? color.success.solid : color.warn.solid,
+                      // The worst instant is ringed rather than recoloured: it is already one of the
+                      // objectionable ones, and a third colour would read as a third verdict.
+                      outline:
+                        Math.abs(sample.progress - standing.worst) < 1e-6
+                          ? `2px solid ${color.accent.border}`
+                          : undefined,
+                    }}
+                  />
+                ))}
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: space.xs, flexWrap: "wrap" }}>
+                {/* THE READ-OUT IS THE ENGINE'S SENTENCE, not a number this panel formatted. It
+                    changes as the author walks — "clear here", "78% of the subject is hidden here",
+                    "the camera is inside something here" — which is the whole reason a walk beats a
+                    single verdict. */}
+                <span
+                  data-testid="cutscene-walk-reads"
+                  role="status"
+                  style={{ fontSize: fontSize.meta, color: color.text.secondary, minWidth: 0 }}
+                >
+                  {standing.message}
+                </span>
+                <Button
+                  data-testid="cutscene-walk-worst"
+                  variant="secondary"
+                  compact
+                  disabled={locked || Math.abs(walkAt - standing.worst) < 1e-6}
+                  disabledReason={
+                    locked ? lockReason : "You are already standing at the worst frame of this move."
+                  }
+                  title="Go back to the frame the engine judged this shot on"
+                  onClick={() => {
+                    setWalkAt(standing.worst);
+                    void walkTo(active.index, standing.worst);
+                  }}
+                >
+                  <Icon name="warning" size="md" /> Worst frame
+                </Button>
+              </div>
+            </section>
+          )}
 
           {/* Capped rather than spanning the dock. `FieldGrid` is `auto-fit` + `1fr`, so five fields in
               a 2000px dock become five 400px tracks holding a select that reads "Wide" — the same

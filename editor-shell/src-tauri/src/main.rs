@@ -2986,6 +2986,9 @@ enum EngineCmd {
         id: String,
         /// Which shot to stand at, zero-based.
         index: usize,
+        /// ADR-201 — which instant of that shot's move, `0..1`. `None` is its worst one, which is
+        /// where a warning's own control lands; `Some` is the walk along the rest of the path.
+        at: Option<f32>,
         reply: Sender<metrocalk_editor_shell::StandAtReply>,
     },
     /// Cinematics (ADR-175) — start writing a cutscene out as a numbered PNG sequence.
@@ -6076,6 +6079,18 @@ fn cutscene_problems(
 /// **The delivery frame, not the live composition** — the same reasoning [`shot_placement_notes`]
 /// records. This runs with the ordinary editor view up, so reading the live composition would solve a
 /// 2.39:1 shot at 16:9 and stand the author at a placement the film never uses.
+///
+/// **ADR-201 — `at` is which instant of the move to stand at.** `None` is the worst one, which is
+/// where every warning's own "Take me there" lands and is the whole of the behaviour before this.
+/// `Some(p)` is the walk: the author has arrived at the worst frame of a move, and the four fifths of
+/// the path either side of it were previously reachable only through a preview, which takes the
+/// camera and cannot be orbited from. The engine could always solve any instant — nothing outside
+/// could ask it to.
+///
+/// **The track is measured on every reply, not only on arrival.** Five extra `vantage` calls against
+/// a BVH the planner has just fired 270 rays at, and the alternative is a field a caller has to
+/// remember across replies — which is how a track ends up describing a shot the author has since
+/// re-framed.
 fn stand_at_shot(
     engine: &Engine<FlecsWorld>,
     shared: &render::Shared,
@@ -6083,6 +6098,7 @@ fn stand_at_shot(
     cut: &metrocalk_animation::shot::Cutscene,
     index: usize,
     shot: &metrocalk_animation::shot::ShotRecipe,
+    at: Option<f32>,
 ) -> metrocalk_editor_shell::StandAtReply {
     use metrocalk_editor_shell::StandAtReply;
     let mut st = shared.lock().unwrap();
@@ -6110,17 +6126,50 @@ fn stand_at_shot(
         st.planned_placement(&key, shot, sample, aspect, &parts)
     };
     let radius = sample.radius();
-    let (progress, pose, vantage) = {
+    let (path, here) = {
         let world = &*st;
-        metrocalk_animation::shot::worst_moment(
+        let mut look = |pose: &metrocalk_animation::shot::CameraSample, _: f32| {
+            world.vantage(pose.eye, pose.look_at, sample.center, radius, &parts)
+        };
+        let path = metrocalk_animation::shot::path_moments(
             shot,
             plan,
             sample,
             aspect,
             render::CINEMATIC_FOV_DEG,
-            |pose, _| world.vantage(pose.eye, pose.look_at, sample.center, radius, &parts),
-        )
+            &mut look,
+        );
+        // THE WORST IS STILL THE DEFAULT, and it is taken from the walked path rather than solved a
+        // second time — `worst_of` is the same strict comparison the placement search used, so the
+        // frame this lands on is the one the warning beside the button is about.
+        let here = match at {
+            Some(progress) => metrocalk_animation::shot::moment_at(
+                shot,
+                plan,
+                sample,
+                aspect,
+                render::CINEMATIC_FOV_DEG,
+                progress,
+                &mut look,
+            ),
+            None => metrocalk_animation::shot::worst_of(&path).unwrap_or_else(|| {
+                metrocalk_animation::shot::moment_at(
+                    shot,
+                    plan,
+                    sample,
+                    aspect,
+                    render::CINEMATIC_FOV_DEG,
+                    0.0,
+                    &mut look,
+                )
+            }),
+        };
+        (path, here)
     };
+    let travel = metrocalk_animation::shot::path_travel(&path);
+    let moving = travel > metrocalk_animation::shot::PATH_TRAVEL_EPSILON;
+    let worst = metrocalk_animation::shot::worst_of(&path).map_or(0.0, |m| m.progress);
+    let (progress, pose, vantage) = (here.progress, here.pose, here.vantage);
     // `stand_at` also leaves an axis view behind. Landing in a parallel projection would draw a
     // diagram of the frame rather than the frame, and `cinema_set_shot_camera` refuses to store from
     // one — so the next thing the advice tells the author to press would refuse.
@@ -6148,11 +6197,41 @@ fn stand_at_shot(
     } else {
         format!("Standing where shot {n} films from")
     };
-    if progress > 0.0 {
-        message.push_str(&format!(" — {:.0}% through its move", progress * 100.0));
+    // WHICH INSTANT, ON EVERY REPLY OF A MOVING SHOT. Before the walk this was appended only when
+    // the progress was non-zero, because the only instant that could ever be reported was the worst
+    // one and "0% through its move" was noise. An author walking a path has deliberately taken it to
+    // the opening, and a read-out that goes silent exactly there reads as a control that stopped
+    // answering.
+    if moving {
+        if progress <= 0.0 {
+            message.push_str(" — at the opening of its move");
+        } else if progress >= 1.0 {
+            message.push_str(" — at the end of its move");
+        } else {
+            message.push_str(&format!(" — {:.0}% through its move", progress * 100.0));
+        }
     }
-    if !vantage.acceptable() {
-        message.push_str(" — this is the best placement the engine found");
+    // WHAT THE FRAME IS LIKE **HERE**, in the same three words the warning uses, because the whole
+    // point of standing on the path is that this reading changes as you walk it. `Vantage::fault`
+    // is the one place that branch order lives, so the sentence about an instant and the sentence
+    // about a shot can never call the same frame's problem two different things.
+    match vantage.fault() {
+        Some(metrocalk_animation::shot::VantageFault::Inside) => {
+            message
+                .push_str(" — the camera is inside something here, so this frame is solid colour");
+        }
+        Some(metrocalk_animation::shot::VantageFault::Hidden(hidden)) => {
+            message.push_str(&format!(
+                " — {:.0}% of the subject is hidden here",
+                hidden * 100.0
+            ));
+        }
+        Some(metrocalk_animation::shot::VantageFault::Crowded(_)) => {
+            message
+                .push_str(" — most of the frame here is whatever the camera is standing against");
+        }
+        None if moving => message.push_str(" — clear here"),
+        None => {}
     }
     if off_by > 0.01 {
         message.push_str(&format!(
@@ -6160,6 +6239,12 @@ fn stand_at_shot(
         ));
     }
     message.push('.');
+    // AND THE CAVEAT ABOUT THE SHOT, as a second sentence rather than a fifth clause. It is a
+    // different KIND of fact from everything above it: those describe the frame in front of the
+    // author, this describes a search that has already happened and cannot be repeated by hand.
+    if !placed && !plan.settled.acceptable() {
+        message.push_str(" This is the best placement the engine found.");
+    }
     StandAtReply {
         moved: true,
         stood,
@@ -6170,6 +6255,14 @@ fn stand_at_shot(
         placed,
         steps: u32::from(plan.steps),
         acceptable: vantage.acceptable(),
+        hidden: 1.0 - vantage.clear.clamp(0.0, 1.0),
+        moving,
+        travel,
+        worst,
+        path: path
+            .iter()
+            .map(metrocalk_editor_shell::PathSample::of)
+            .collect(),
         message,
         reason: None,
     }
@@ -11184,7 +11277,12 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     .unwrap_or_default();
                 let _ = reply.send(info);
             }
-            EngineCmd::CinemaStandAt { id, index, reply } => {
+            EngineCmd::CinemaStandAt {
+                id,
+                index,
+                at,
+                reply,
+            } => {
                 use metrocalk_editor_shell::StandAtReply;
                 // PLAY OWNS THE CAMERA WHILE IT RUNS, and so does a running preview. Moving the orbit
                 // camera under either would put the author somewhere they cannot see and hand the
@@ -11216,7 +11314,7 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     let _ = reply.send(StandAtReply::refusal("that shot is no longer in the cut"));
                     continue;
                 };
-                let answer = stand_at_shot(&engine, &shared, entity, &cut, index, shot);
+                let answer = stand_at_shot(&engine, &shared, entity, &cut, index, shot, at);
                 let _ = reply.send(answer);
             }
             EngineCmd::CinemaPreview {
@@ -25361,17 +25459,28 @@ fn cinema_preview(
 ///
 /// Deliberately async: the answer needs the occlusion BVH, which on a 15,711-part import is a build
 /// the first cutscene command pays for.
+///
+/// ADR-201 — `progress` names one instant of the shot's move. **Absent is the worst one**, which is
+/// what every caller that predates the walk asks for and what a warning's "Take me there" still
+/// means: the frame the sentence is about. A number is the walk, and it is clamped rather than
+/// refused, because a slider's own arithmetic is what produces it.
 #[tauri::command(async)]
 fn cinema_stand_at_shot(
     state: State<AppState>,
     id: String,
     index: usize,
+    progress: Option<f32>,
 ) -> metrocalk_editor_shell::StandAtReply {
     ipc();
     let (reply, rx) = mpsc::channel();
     if state
         .tx
-        .send(EngineCmd::CinemaStandAt { id, index, reply })
+        .send(EngineCmd::CinemaStandAt {
+            id,
+            index,
+            at: progress,
+            reply,
+        })
         .is_err()
     {
         return metrocalk_editor_shell::StandAtReply::refusal("The engine is unavailable");
@@ -31949,7 +32058,7 @@ mod imported_assembly_pose_publication_tests {
                 .expect("a starting pose");
         }
 
-        let reply = stand_at_shot(&engine, &shared, assembly, &cut, 0, &cut.shots[0]);
+        let reply = stand_at_shot(&engine, &shared, assembly, &cut, 0, &cut.shots[0], None);
         assert!(reply.moved, "{reply:?}");
         assert!(!reply.placed, "this shot has no camera of its own");
 
@@ -32007,17 +32116,263 @@ mod imported_assembly_pose_publication_tests {
         let assets = assets_with_one_cad_mesh();
         rebuild(&engine, &shared, &mut HashMap::new(), &assets);
 
-        let reply = stand_at_shot(&engine, &shared, assembly, &cut, 0, &cut.shots[0]);
+        let reply = stand_at_shot(&engine, &shared, assembly, &cut, 0, &cut.shots[0], None);
         assert!(reply.placed, "{reply:?}");
         assert_eq!(reply.look_at, camera.look_at, "{reply:?}");
         for (got, want) in reply.stood.iter().zip(camera.eye.iter()) {
-            assert!((got - want).abs() < 0.01, "{:?} vs {:?}", reply.stood, camera.eye);
+            assert!(
+                (got - want).abs() < 0.01,
+                "{:?} vs {:?}",
+                reply.stood,
+                camera.eye
+            );
         }
         assert_eq!(
             reply.fov_deg, camera.fov_deg,
             "the lens is the author's too, and the message distinguishes a framing difference from a \
              placement one with it"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-201 — WALK THE MOVE. The same command, told which instant.
+    // ---------------------------------------------------------------------------------------------
+
+    /// A one-shot cut whose shot actually sweeps a path.
+    fn a_moving_cut(
+        subject: &str,
+        camera: Option<metrocalk_animation::shot::ShotCamera>,
+    ) -> metrocalk_animation::shot::Cutscene {
+        let mut cut = one_shot_cut(subject, camera);
+        cut.shots[0].motion = metrocalk_animation::shot::ShotMove::PushIn;
+        cut.shots[0].amount = 0.6;
+        cut
+    }
+
+    /// Build a scene, author the cut `make` writes for its assembly, and hand back everything a walk
+    /// needs. The builder takes the assembly's key because a shot's subject is not known until the
+    /// scene it frames exists.
+    fn a_scene_with(
+        seed: u64,
+        make: impl FnOnce(&str) -> metrocalk_animation::shot::Cutscene,
+    ) -> (
+        Engine<FlecsWorld>,
+        Shared,
+        EntityId,
+        metrocalk_animation::shot::Cutscene,
+    ) {
+        let mut engine = Engine::new(FlecsWorld::new(), seed);
+        let (assembly, _node, _part) = imported_assembly(&mut engine);
+        let cut = make(&assembly.to_loro_key());
+        author_cutscene(&mut engine, assembly, &cut);
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let assets = assets_with_one_cad_mesh();
+        rebuild(&engine, &shared, &mut HashMap::new(), &assets);
+        (engine, shared, assembly, cut)
+    }
+
+    #[test]
+    fn a_still_shot_says_it_has_no_move_to_walk() {
+        // The control that must NOT appear. A scrub over a locked-off shot moves and changes
+        // nothing, which `<ux_quality>` 6 calls an inert control — so the reply has to be able to
+        // say so, and it has to say it from the POSES rather than from the card.
+        let (engine, shared, assembly, cut) = a_scene_with(0x2011, |key| one_shot_cut(key, None));
+        let reply = stand_at_shot(&engine, &shared, assembly, &cut, 0, &cut.shots[0], None);
+        assert!(reply.moved, "{reply:?}");
+        assert!(!reply.moving, "a locked-off shot sweeps nothing: {reply:?}");
+        assert!(reply.travel <= 1.0e-3, "{reply:?}");
+        assert!(
+            !reply.message.contains("move"),
+            "and it does not talk about a move it does not have: {}",
+            reply.message
+        );
+    }
+
+    #[test]
+    fn a_moving_shot_stands_wherever_along_its_move_it_is_asked_to() {
+        // THE WHOLE CAPABILITY. Before this the four fifths of a camera path either side of its
+        // worst instant were reachable only through a preview, which HOLDS the camera and cannot be
+        // orbited from — so the frames an author most needed to judge were the ones they could not
+        // stand in.
+        let (engine, shared, assembly, cut) = a_scene_with(0x2013, |key| a_moving_cut(key, None));
+
+        let at = |progress: Option<f32>| {
+            stand_at_shot(&engine, &shared, assembly, &cut, 0, &cut.shots[0], progress)
+        };
+        let opening = at(Some(0.0));
+        let end = at(Some(1.0));
+        assert!(opening.moving && end.moving, "{opening:?} / {end:?}");
+        assert!(opening.travel > 1.0e-3, "{opening:?}");
+        let apart = dist3(opening.stood, end.stood);
+        assert!(
+            apart > 1.0e-3,
+            "the two ends of a push-in are not the same place: {apart} m apart"
+        );
+        assert!(
+            (apart - opening.travel).abs() < 0.05,
+            "and the reported travel is that distance: {apart} vs {}",
+            opening.travel
+        );
+
+        // EACH STAND IS THE POSE THE VIEWPORT ACTUALLY DRAWS THROUGH — which is what makes the next
+        // gesture ("Shoot from this view") store the frame the author walked to.
+        for progress in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let reply = at(Some(progress));
+            assert!(
+                (reply.progress - progress).abs() < 1.0e-5,
+                "{reply:?} for {progress}"
+            );
+            let (eye, look_at, _) = shared.lock().unwrap().live_camera();
+            assert_eq!(eye, reply.stood, "at {progress}: {reply:?}");
+            assert_eq!(look_at, reply.look_at, "at {progress}: {reply:?}");
+        }
+    }
+
+    #[test]
+    fn a_walk_with_no_instant_named_is_still_the_worst_one() {
+        // Every caller that predates the walk asks without a progress, and a warning's own control
+        // still does: the frame the sentence beside it is about must not move under it.
+        let (engine, shared, assembly, cut) = a_scene_with(0x2015, |key| a_moving_cut(key, None));
+        let reply = stand_at_shot(&engine, &shared, assembly, &cut, 0, &cut.shots[0], None);
+        assert_eq!(
+            reply.path.len(),
+            5,
+            "the track is the planner's own five samples: {reply:?}"
+        );
+        assert!(
+            (reply.progress - reply.worst).abs() < 1.0e-6,
+            "an unnamed instant is the worst one: {reply:?}"
+        );
+        assert!(
+            reply
+                .path
+                .iter()
+                .any(|s| (s.progress - reply.worst).abs() < 1.0e-6),
+            "and the worst is one of the instants the track draws: {reply:?}"
+        );
+        let at_worst = stand_at_shot(
+            &engine,
+            &shared,
+            assembly,
+            &cut,
+            0,
+            &cut.shots[0],
+            Some(reply.worst),
+        );
+        assert!(
+            dist3(at_worst.stood, reply.stood) < 1.0e-3,
+            "asking for the worst instant by name lands in the same place: {at_worst:?}"
+        );
+    }
+
+    #[test]
+    fn a_walk_past_the_end_of_a_move_stands_at_its_end_rather_than_refusing() {
+        let (engine, shared, assembly, cut) = a_scene_with(0x2017, |key| a_moving_cut(key, None));
+        let past = stand_at_shot(
+            &engine,
+            &shared,
+            assembly,
+            &cut,
+            0,
+            &cut.shots[0],
+            Some(4.2),
+        );
+        let end = stand_at_shot(
+            &engine,
+            &shared,
+            assembly,
+            &cut,
+            0,
+            &cut.shots[0],
+            Some(1.0),
+        );
+        assert!(past.moved && past.reason.is_none(), "{past:?}");
+        assert!((past.progress - 1.0).abs() < 1.0e-6, "{past:?}");
+        assert!(dist3(past.stood, end.stood) < 1.0e-3, "{past:?} / {end:?}");
+    }
+
+    #[test]
+    fn the_read_out_names_which_instant_of_the_move_it_is_standing_at() {
+        // The read-out IS the control's feedback: an author dragging a track with a message that
+        // does not change cannot tell a walk from a stuck slider.
+        let (engine, shared, assembly, cut) = a_scene_with(0x2019, |key| a_moving_cut(key, None));
+        let said = |progress: f32| {
+            stand_at_shot(
+                &engine,
+                &shared,
+                assembly,
+                &cut,
+                0,
+                &cut.shots[0],
+                Some(progress),
+            )
+            .message
+        };
+        assert!(
+            said(0.0).contains("at the opening of its move"),
+            "{}",
+            said(0.0)
+        );
+        assert!(
+            said(1.0).contains("at the end of its move"),
+            "{}",
+            said(1.0)
+        );
+        assert!(said(0.5).contains("50% through its move"), "{}", said(0.5));
+        assert!(
+            !said(0.0).contains("0% through"),
+            "the opening is named, not counted: {}",
+            said(0.0)
+        );
+    }
+
+    #[test]
+    fn a_placed_camera_with_a_move_is_walkable_too() {
+        // THE READING A `camera.is_none()` TEST WOULD HAVE GOT BACKWARDS. ADR-192 kept all six move
+        // verbs working on a placed camera — the move is applied AROUND the stored pose — so "put
+        // the camera here and push in" sweeps a path exactly as a card shot does, and an author who
+        // placed it is exactly the one who wants to walk it.
+        let camera = metrocalk_animation::shot::ShotCamera {
+            eye: [12.0, 4.0, -9.0],
+            look_at: [0.0, 1.0, 0.0],
+            fov_deg: 40.0,
+            track: None,
+        };
+        let (engine, shared, assembly, cut) =
+            a_scene_with(0x201B, |key| a_moving_cut(key, Some(camera)));
+        let opening = stand_at_shot(
+            &engine,
+            &shared,
+            assembly,
+            &cut,
+            0,
+            &cut.shots[0],
+            Some(0.0),
+        );
+        let end = stand_at_shot(
+            &engine,
+            &shared,
+            assembly,
+            &cut,
+            0,
+            &cut.shots[0],
+            Some(1.0),
+        );
+        assert!(opening.placed && opening.moving, "{opening:?}");
+        assert!(
+            dist3(opening.stood, camera.eye) < 0.01,
+            "the opening of the move is the pose the author placed: {opening:?}"
+        );
+        assert!(
+            dist3(end.stood, camera.eye) > 1.0e-3,
+            "and the end of it is not: {end:?}"
+        );
+    }
+
+    /// Distance between two world points, for assertions.
+    fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
+        let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt()
     }
 
     #[test]

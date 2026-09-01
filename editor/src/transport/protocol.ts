@@ -2216,9 +2216,41 @@ export interface StandAtReply {
    *  it true as well: nothing was measured, and the quiet reading is the honest one for a camera
    *  that did not move. */
   acceptable: boolean;
+  /** ADR-201 — how much of the subject is behind something else at the instant stood at, 0..1. */
+  hidden: number;
+  /** ADR-201 — true when this shot sweeps a camera path there is something to walk.
+   *
+   *  Measured from the poses, not read off the card. A push-in of zero strength is authored as a move
+   *  and travels nothing; a PLACED camera with a push-in is not a card shot and travels plenty. Both
+   *  readings a panel could take from `ShotRow` are wrong, in opposite directions. */
+  moving: boolean;
+  /** ADR-201 — how far the camera travels across the whole move, metres. */
+  travel: number;
+  /** ADR-201 — where the worst instant of the move is, 0..1. Where a walk with no instant named
+   *  lands, and the mark the track puts on itself so the author can get back to it. */
+  worst: number;
+  /** ADR-201 — the instants the planner judged, in order. Empty on a refusal. */
+  path: PathSample[];
   message: string;
   /** Set iff nothing moved, and says why. */
   reason: string | null;
+}
+
+/** ADR-201 — one instant of a shot's move, as the walk's track draws it.
+ *
+ *  The planner's OWN sample set, not a finer one: these are the frames the placement search actually
+ *  scored, and a track drawn at twenty points would claim a resolution it does not have. */
+export interface PathSample {
+  /** How far through the move this instant is, 0..1. */
+  progress: number;
+  /** True when the world had no objection to the frame here. */
+  acceptable: boolean;
+  /** The camera is inside geometry here — this stretch is a solid-colour frame. */
+  inside: boolean;
+  /** How much of the subject is behind something else here, 0..1. */
+  hidden: number;
+  /** How much of the frame here is whatever the camera is standing against, 0..1. */
+  crowded: number;
 }
 
 /** What the cutscene timeline's viewport preview answers with — the frame now on the stage.

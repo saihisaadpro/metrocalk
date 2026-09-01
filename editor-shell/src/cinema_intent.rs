@@ -536,6 +536,41 @@ pub struct CinemaReply {
 /// its pitch inside a limit, so a shot filmed from directly overhead lands a little below where it
 /// was asked to. Echoing the request would tell the author they are standing at the shot's own eye
 /// while the stage draws something else — and the next thing they press stores what the stage draws.
+/// ADR-201 — one instant of a shot's move, as the walk's track draws it.
+///
+/// The engine's own verdict at one sampled point of the path, flattened onto the wire. The panel
+/// draws a stretch out of these rather than a single number, which is the difference between *"this
+/// shot has a problem"* and *"this shot has a problem from here to here"*.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathSample {
+    /// How far through the move this instant is, `0.0` at the opening and `1.0` at the end.
+    pub progress: f32,
+    /// True when the world had no objection to the frame here.
+    pub acceptable: bool,
+    /// The camera is inside geometry here — this stretch of the move is a solid-colour frame.
+    pub inside: bool,
+    /// How much of the subject is behind something else here, `0..1`.
+    pub hidden: f32,
+    /// How much of the frame is whatever the camera is standing against rather than the subject,
+    /// `0..1`.
+    pub crowded: f32,
+}
+
+impl PathSample {
+    /// Flatten one walked moment onto the wire.
+    #[must_use]
+    pub fn of(moment: &metrocalk_animation::shot::PathMoment) -> Self {
+        Self {
+            progress: moment.progress,
+            acceptable: moment.vantage.acceptable(),
+            inside: moment.vantage.eye_inside,
+            hidden: 1.0 - moment.vantage.clear.clamp(0.0, 1.0),
+            crowded: moment.vantage.crowded.clamp(0.0, 1.0),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StandAtReply {
@@ -560,6 +595,26 @@ pub struct StandAtReply {
     pub steps: u32,
     /// True when the world had no objection to the placement the camera was taken to.
     pub acceptable: bool,
+    /// ADR-201 — how much of the subject is behind something else at the instant stood at, `0..1`.
+    /// The reading that changes as the author walks, and the reason a walk is worth taking.
+    pub hidden: f32,
+    /// ADR-201 — true when this shot sweeps a camera PATH there is something to walk.
+    ///
+    /// Measured from the poses, not read off the card: a push-in of zero strength is authored as a
+    /// move and travels nothing, and a PLACED camera with a push-in is not a card shot and travels
+    /// plenty. Either reading taken from the recipe is wrong in one of those two directions.
+    pub moving: bool,
+    /// ADR-201 — how far the camera travels across the whole move, metres.
+    pub travel: f32,
+    /// ADR-201 — where the worst instant of the move is, `0..1`. Where a walk with no instant named
+    /// lands, and the mark a track puts on itself so the author can get back to it.
+    pub worst: f32,
+    /// ADR-201 — the instants the planner judged, in order.
+    ///
+    /// The planner's OWN sample set and not a finer one: these are the frames the placement search
+    /// actually scored, and a track drawn at twenty points would claim a resolution it does not have.
+    /// Empty on a refusal, because nothing was measured.
+    pub path: Vec<PathSample>,
     /// Friendly summary.
     pub message: String,
     /// Set iff nothing moved.
@@ -3249,7 +3304,10 @@ mod tests {
         let cut = cutscene_of(&engine, hero);
         let reply = reply_for(hero, &cut, "Hero", "ok".into());
         assert!(
-            reply.problems.iter().any(|p| p.message.contains("jump cut")),
+            reply
+                .problems
+                .iter()
+                .any(|p| p.message.contains("jump cut")),
             "{:?}",
             reply.problems
         );
