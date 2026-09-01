@@ -163,7 +163,8 @@ describe("Cinematics — a shot is a sentence, solved per tick", () => {
     const r = await invoke("cinema_add_shot", { id: bad, kind: "establish" });
     console.log(`[cine] problems: ${JSON.stringify(r.problems)}`);
     expect(r.problems.length).toBeGreaterThanOrEqual(1);
-    expect(r.problems.join(" ").toLowerCase()).toContain("open");
+    // ADR-200 — each entry is `{ shot, message }` now.
+    expect(r.problems.map((p) => p.message).join(" ").toLowerCase()).toContain("open");
     // and it never blocks the author — both shots still landed.
     expect(r.shots).toBe(2);
     // Take that whole cutscene back off, so the camera-authority test below has exactly one claimant

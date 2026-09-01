@@ -6016,10 +6016,9 @@ fn shot_placement_notes(
     // records. The composition only insets to the delivery while something is holding the camera, and
     // this diagnostic runs with the ordinary editor view up, so reading the live composition would
     // plan every 2.39:1 shot at 16:9 and warn about placements the film will never use.
-    let aspect = cut
-        .delivery
-        .ratio()
-        .unwrap_or_else(|| render::frame_aspect(st.known_surface_aspect(), st.adopted_visible_rect()));
+    let aspect = cut.delivery.ratio().unwrap_or_else(|| {
+        render::frame_aspect(st.known_surface_aspect(), st.adopted_visible_rect())
+    });
     let plans = card_shot_plans(&mut st, cut, &subjects, aspect);
     let st = &*st;
     let mut out = metrocalk_animation::shot::placed_camera_problems(
@@ -6036,9 +6035,10 @@ fn shot_placement_notes(
             )
         },
     );
-    out.extend(metrocalk_animation::shot::card_shot_problems(cut, |index, _| {
-        plans.get(index).copied().flatten()
-    }));
+    out.extend(metrocalk_animation::shot::card_shot_problems(
+        cut,
+        |index, _| plans.get(index).copied().flatten(),
+    ));
     out
 }
 
@@ -6086,12 +6086,6 @@ fn stand_at_shot(
 ) -> metrocalk_editor_shell::StandAtReply {
     use metrocalk_editor_shell::StandAtReply;
     let mut st = shared.lock().unwrap();
-    if st.projection == render::Projection::Orthographic {
-        // Landing in a parallel projection would draw a diagram of the frame rather than the frame,
-        // and `cinema_set_shot_camera` then refuses to store from it. `stand_at` restores perspective
-        // for exactly that reason; this comment records that the restoration is deliberate.
-        diag_log!("cinema", "stand_at leaving the orthographic view for a lens");
-    }
     st.sync_mesh_bounds();
     let sample = cinematic_shot_subject_sample(engine, &mut st, entity, shot);
     let key = cinematic_shot_subject(engine, entity, shot).to_loro_key();
@@ -6127,12 +6121,24 @@ fn stand_at_shot(
             |pose, _| world.vantage(pose.eye, pose.look_at, sample.center, radius, &parts),
         )
     };
+    // `stand_at` also leaves an axis view behind. Landing in a parallel projection would draw a
+    // diagram of the frame rather than the frame, and `cinema_set_shot_camera` refuses to store from
+    // one — so the next thing the advice tells the author to press would refuse.
     let Some(stood) = st.stand_at(pose.eye, pose.look_at) else {
         return StandAtReply::refusal(
             "that shot's camera is standing exactly where it is looking — there is no view to take",
         );
     };
-    let off_by = (glam::Vec3::from(stood) - glam::Vec3::from(pose.eye)).length();
+    // Plain arrays, not glam: this file's own discipline is that glam stays inside `render.rs` and
+    // the gizmo crate, and one import for one distance would be the exception that ends it.
+    let off_by = {
+        let d = [
+            stood[0] - pose.eye[0],
+            stood[1] - pose.eye[1],
+            stood[2] - pose.eye[2],
+        ];
+        d[0].mul_add(d[0], d[1].mul_add(d[1], d[2] * d[2])).sqrt()
+    };
     let n = index + 1;
     // WHAT THE AUTHOR IS LOOKING AT, said plainly, because the whole point of the move is that the
     // frame in front of them is evidence. "Standing where shot 2 films from" is the claim; the
@@ -6194,7 +6200,9 @@ fn card_shot_plans(
             continue;
         }
         let (sample, key, parts) = &subjects[index];
-        out.push(Some(st.planned_placement(key, shot, *sample, aspect, parts)));
+        out.push(Some(
+            st.planned_placement(key, shot, *sample, aspect, parts),
+        ));
     }
     out
 }
@@ -11198,8 +11206,9 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                 let Some(entity) =
                     EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
                 else {
-                    let _ =
-                        reply.send(StandAtReply::refusal("that object is no longer in the scene"));
+                    let _ = reply.send(StandAtReply::refusal(
+                        "that object is no longer in the scene",
+                    ));
                     continue;
                 };
                 let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
@@ -23468,7 +23477,14 @@ fn present_cinematic_moment(
         });
         (sample, previous_sample, aspect, plan, previous_plan)
     };
-    let current_pose = solve_shot_adjusted(shot, plan, sample, playback.progress, aspect, render::CINEMATIC_FOV_DEG);
+    let current_pose = solve_shot_adjusted(
+        shot,
+        plan,
+        sample,
+        playback.progress,
+        aspect,
+        render::CINEMATIC_FOV_DEG,
+    );
     let previous_pose =
         playback
             .blend_from
@@ -23556,10 +23572,13 @@ fn plan_cinematic_shot(
         })
         .unwrap_or_default();
     let radius = sample.radius();
-    let plan =
-        metrocalk_animation::shot::plan_shot(shot, sample, aspect, render::CINEMATIC_FOV_DEG, |pose, _progress| {
-            state.vantage(pose.eye, pose.look_at, sample.center, radius, &subject)
-        });
+    let plan = metrocalk_animation::shot::plan_shot(
+        shot,
+        sample,
+        aspect,
+        render::CINEMATIC_FOV_DEG,
+        |pose, _progress| state.vantage(pose.eye, pose.look_at, sample.center, radius, &subject),
+    );
     let name_of = |size: metrocalk_animation::shot::ShotSize| -> &'static str {
         use metrocalk_animation::shot::ShotSize as S;
         match size {
@@ -23582,8 +23601,14 @@ fn plan_cinematic_shot(
     // (0-3 ms, the same cost the planner already pays per candidate) buys the ability to tell "the
     // negotiation never ran" from "the negotiation ran and was satisfied by this" -- which are different
     // faults with opposite fixes, and were indistinguishable in the previous record.
-    let filmed =
-        metrocalk_animation::shot::solve_shot_adjusted(shot, plan, sample, 0.5, aspect, render::CINEMATIC_FOV_DEG);
+    let filmed = metrocalk_animation::shot::solve_shot_adjusted(
+        shot,
+        plan,
+        sample,
+        0.5,
+        aspect,
+        render::CINEMATIC_FOV_DEG,
+    );
     let vantage = state.vantage(filmed.eye, filmed.look_at, sample.center, radius, &subject);
     state.cinematic_placements.push(render::CinematicPlacement {
         shot: shot.id.clone(),
@@ -31854,6 +31879,181 @@ mod imported_assembly_pose_publication_tests {
             (sample.center[0] - (near_x + far_x) * 0.5).abs() < 1.0,
             "and centred on that span, not on the folder: {:?}",
             sample.center
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-200 — TAKE ME THERE, end to end: an authored cutscene, a real scene, and the viewport.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Put `cut` on `entity` the way `cinema_*` does — the component the shell reads back.
+    fn author_cutscene(
+        engine: &mut Engine<FlecsWorld>,
+        entity: EntityId,
+        cut: &metrocalk_animation::shot::Cutscene,
+    ) {
+        engine
+            .commit(
+                "cutscene fixture",
+                vec![Op::SetField {
+                    entity,
+                    component: metrocalk_editor_shell::CINEMA_COMPONENT.into(),
+                    field: "source".into(),
+                    value: FieldValue::Str(
+                        serde_json::to_string(cut).expect("serialise the cutscene"),
+                    ),
+                }],
+            )
+            .expect("cutscene fixture");
+    }
+
+    fn one_shot_cut(
+        subject: &str,
+        camera: Option<metrocalk_animation::shot::ShotCamera>,
+    ) -> metrocalk_animation::shot::Cutscene {
+        use metrocalk_animation::shot::{
+            Cutscene, Delivery, Mood, RenderSettings, ShotAngle, ShotMove, ShotRecipe, ShotSize,
+        };
+        Cutscene {
+            version: 1,
+            shots: vec![ShotRecipe {
+                id: "shot-1".into(),
+                subject: subject.into(),
+                size: ShotSize::Medium,
+                angle: ShotAngle::ThreeQuarter,
+                motion: ShotMove::Hold,
+                amount: 0.0,
+                seconds: 2.5,
+                camera,
+            }],
+            mood: Mood::Normal,
+            delivery: Delivery::Widescreen,
+            render: RenderSettings::default(),
+        }
+    }
+
+    #[test]
+    fn standing_where_a_card_shot_films_from_moves_the_viewport_to_that_exact_pose() {
+        let mut engine = Engine::new(FlecsWorld::new(), 0x2000);
+        let (assembly, _node, _part) = imported_assembly(&mut engine);
+        let cut = one_shot_cut(&assembly.to_loro_key(), None);
+        author_cutscene(&mut engine, assembly, &cut);
+
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let assets = assets_with_one_cad_mesh();
+        rebuild(&engine, &shared, &mut HashMap::new(), &assets);
+        // Somewhere the shot is definitely NOT, so "it was already there" cannot pass this.
+        {
+            let mut st = shared.lock().unwrap();
+            st.stand_at([900.0, 400.0, 900.0], [800.0, 0.0, 800.0])
+                .expect("a starting pose");
+        }
+
+        let reply = stand_at_shot(&engine, &shared, assembly, &cut, 0, &cut.shots[0]);
+        assert!(reply.moved, "{reply:?}");
+        assert!(!reply.placed, "this shot has no camera of its own");
+
+        // THE PROPERTY THAT MATTERS: the camera the renderer draws through is the one the reply
+        // claims. `cinema_set_shot_camera` reads exactly this, so the very next gesture stores the
+        // frame the author is looking at — which is the whole round trip this closes.
+        let (eye, look_at, _) = shared.lock().unwrap().live_camera();
+        assert_eq!(eye, reply.stood, "{reply:?}");
+        assert_eq!(look_at, reply.look_at, "{reply:?}");
+        assert!(
+            reply.off_by < 0.01,
+            "an ordinary three-quarter shot is well inside the pitch limit: {reply:?}"
+        );
+        // ...and it is the pose the RUNTIME films, not one this function computed a second way.
+        let sample = {
+            let mut st = shared.lock().unwrap();
+            cinematic_shot_subject_sample(&engine, &mut st, assembly, &cut.shots[0])
+        };
+        let filmed = metrocalk_animation::shot::solve_shot_adjusted(
+            &cut.shots[0],
+            metrocalk_animation::shot::ShotAdjustment::authored(&cut.shots[0]),
+            sample,
+            reply.progress,
+            cut.delivery.ratio().expect("scope has a ratio"),
+            render::CINEMATIC_FOV_DEG,
+        );
+        for (got, want) in reply.stood.iter().zip(filmed.eye.iter()) {
+            assert!(
+                (got - want).abs() < 0.05,
+                "an empty scene negotiates nothing, so the placement is the authored one: \
+                 {:?} vs {:?}",
+                reply.stood,
+                filmed.eye
+            );
+        }
+    }
+
+    #[test]
+    fn standing_at_a_placed_camera_lands_on_the_authors_own_eye() {
+        // The placed half of the warning vocabulary points here too, and the promise `plan_shot` and
+        // `solve_shot_adjusted` both keep — a placed camera is never negotiated — has to hold on this
+        // path or the author is shown a corrected view of the fault they were warned about.
+        let mut engine = Engine::new(FlecsWorld::new(), 0x2001);
+        let (assembly, _node, _part) = imported_assembly(&mut engine);
+        let camera = metrocalk_animation::shot::ShotCamera {
+            eye: [12.0, 4.0, -9.0],
+            look_at: [0.0, 1.0, 0.0],
+            fov_deg: 40.0,
+            track: None,
+        };
+        let cut = one_shot_cut(&assembly.to_loro_key(), Some(camera));
+        author_cutscene(&mut engine, assembly, &cut);
+
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let assets = assets_with_one_cad_mesh();
+        rebuild(&engine, &shared, &mut HashMap::new(), &assets);
+
+        let reply = stand_at_shot(&engine, &shared, assembly, &cut, 0, &cut.shots[0]);
+        assert!(reply.placed, "{reply:?}");
+        assert_eq!(reply.look_at, camera.look_at, "{reply:?}");
+        for (got, want) in reply.stood.iter().zip(camera.eye.iter()) {
+            assert!((got - want).abs() < 0.01, "{:?} vs {:?}", reply.stood, camera.eye);
+        }
+        assert_eq!(
+            reply.fov_deg, camera.fov_deg,
+            "the lens is the author's too, and the message distinguishes a framing difference from a \
+             placement one with it"
+        );
+    }
+
+    #[test]
+    fn the_warning_list_reads_in_shot_order_across_every_producer() {
+        // The merged producer, on a real scene. Nothing here objects to anything, so the only entries
+        // are the document's own — which is the point: the ORDER is what changed, and a fixture that
+        // needed an occluder to prove it would be testing the occlusion test instead.
+        use metrocalk_animation::shot::{ShotAngle, ShotMove, ShotRecipe, ShotSize};
+        let mut engine = Engine::new(FlecsWorld::new(), 0x2002);
+        let (assembly, _node, _part) = imported_assembly(&mut engine);
+        let key = assembly.to_loro_key();
+        let mut cut = one_shot_cut(&key, None);
+        cut.shots[0].size = ShotSize::Close;
+        let twin = |size: ShotSize, seconds: f32| ShotRecipe {
+            id: format!("shot-{seconds}"),
+            subject: key.clone(),
+            size,
+            angle: ShotAngle::Profile,
+            motion: ShotMove::Hold,
+            amount: 0.0,
+            seconds,
+            camera: None,
+        };
+        cut.shots.push(twin(ShotSize::Medium, 2.0));
+        cut.shots.push(twin(ShotSize::Medium, 0.1));
+        author_cutscene(&mut engine, assembly, &cut);
+
+        let shared: Shared = Arc::new(Mutex::new(SceneState::default()));
+        let assets = assets_with_one_cad_mesh();
+        rebuild(&engine, &shared, &mut HashMap::new(), &assets);
+
+        let said = cutscene_problems(&engine, &shared, assembly, &cut, cut.problems());
+        assert!(said.len() >= 2, "{said:?}");
+        assert!(
+            said.windows(2).all(|w| w[0].shot <= w[1].shot),
+            "the list a panel draws must be in the order its timeline is read: {said:?}"
         );
     }
 

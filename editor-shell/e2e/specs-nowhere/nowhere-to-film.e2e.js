@@ -75,6 +75,12 @@ const selectRow = (id) =>
     return true;
   }, id);
 
+/** The warning SENTENCES off a cinema reply.
+ *
+ *  ADR-200 made each entry `{ shot, message }`, because a panel drawing a bare string could name the
+ *  shot in prose and act on nothing. This spec asserts the prose here and the field where it matters. */
+const said_of = (reply) => reply.problems.map((p) => p.message);
+
 const panelProblems = () =>
   browser.execute(() =>
     [...document.querySelectorAll('[data-testid="cutscene-problem"]')].map((n) => n.textContent ?? ""),
@@ -160,7 +166,7 @@ describe("ADR-197 · nowhere good to film from", () => {
       timeoutMsg: "the shot never landed",
     });
 
-    const said = (await invoke("cinema_list", { id: subject })).problems;
+    const said = said_of(await invoke("cinema_list", { id: subject }));
     note(`[open world] ${JSON.stringify(said)}`);
     expect(said.some((p) => /nowhere good to film from/.test(p))).toBe(
       false,
@@ -196,16 +202,23 @@ describe("ADR-197 · nowhere good to film from", () => {
     await moveTo(shell, HOME[0], HOME[1] - SHELL_M / 2, HOME[2]);
     await browser.pause(600);
 
-    const said = (await invoke("cinema_list", { id: subject })).problems;
+    const reply = await invoke("cinema_list", { id: subject });
+    const said = said_of(reply);
     note(`[enclosed] ${JSON.stringify(said)}`);
     const stuck = said.find((p) => /nowhere good to film from/.test(p));
     expect(stuck).toBeTruthy();
+    // ADR-200 — AND THE SHOT NUMBER IS A FIELD, not only a word in the prose. This is what a control
+    // beside the sentence acts on; without it the panel holds a string and can offer nothing.
+    const entry = reply.problems.find((p) => /nowhere good to film from/.test(p.message));
+    expect(entry.shot).toBe(0);
 
     // THE AUTHOR'S WORDS. It names the shot, says what is wrong, and points at the one control that
     // is left — never at the size or the angle, which is what the engine has already tried on every
     // rung of the ladder on the author's behalf.
     expect(stuck).toMatch(/^shot 1 /);
     expect(stuck).toMatch(/Shoot from this view/);
+    // ADR-200 — and the FIRST thing it offers is a place, not an instruction to go and find one.
+    expect(stuck).toMatch(/Take me there/);
     expect(stuck).not.toMatch(/change the size or the angle/);
     // ...and no engine vocabulary reaches the panel.
     expect(said.join(" ")).not.toMatch(/eye_inside|vantage|Vantage|acceptable|clear:|crowded/);
@@ -238,12 +251,58 @@ describe("ADR-197 · nowhere good to film from", () => {
     expect(cut.reason).toBeFalsy();
   });
 
+  it("takes the author to the placement it gave up on, and stores it from there", async () => {
+    // ADR-200 — THE ADVICE, EXECUTED. The sentence above says *press "Take me there" to stand where
+    // it tried, then frame it yourself with "Shoot from this view"*. This is that sentence carried
+    // out through the two commands the two buttons send, on the packaged binary, against the
+    // 15,711-part-scale machinery that produced the warning — which is the only way to know the
+    // advice composes rather than merely reading well.
+    const there = await invoke("cinema_stand_at_shot", { id: subject, index: 0 });
+    note(`[stood] ${JSON.stringify(there)}`);
+    expect(there.reason).toBeFalsy();
+    expect(there.moved).toBe(true);
+    // The engine took the author to the placement it SETTLED on, and says so: unacceptable, and a
+    // whole ladder's worth of rejected candidates behind it. A "take me there" that landed on the
+    // authored placement would be pointing at a frame the search never chose.
+    expect(there.acceptable).toBe(false);
+    expect(there.steps).toBeGreaterThan(0);
+    expect(there.placed).toBe(false);
+    expect(finite(there.stood)).toBe(true);
+    expect(dist(there.lookAt, HOME)).toBeLessThan(5);
+
+    // THE VIEWPORT ITSELF, not the reply's own claim about it. `camera_probe` reads the renderer's
+    // camera, and `cinematic` is false because this is the author's own orbit camera — the whole
+    // difference from a preview, which takes the camera away again on the next tick.
+    const probe = await invoke("camera_probe");
+    note(`[probe] eye ${xyz(probe.eye)} -> ${xyz(probe.lookAt)} cinematic=${probe.cinematic}`);
+    expect(probe.cinematic).toBe(false);
+    expect(dist(probe.eye, there.stood)).toBeLessThan(0.01);
+    expect(dist(probe.lookAt, there.lookAt)).toBeLessThan(0.01);
+    await captureFrame("5-take-me-there.png");
+
+    // ...and "Shoot from this view" from here stores exactly this pose. That is the round trip the
+    // warning's advice describes: the author's manual search now STARTS at the engine's answer
+    // instead of at wherever the viewport happened to be.
+    const stored = await invoke("cinema_set_shot_camera", { id: subject, index: 0 });
+    expect(stored.reason).toBeFalsy();
+    const camera = stored.rows[0].camera;
+    expect(camera).toBeTruthy();
+    expect(dist(camera.eye, there.stood)).toBeLessThan(0.01);
+    expect(dist(camera.lookAt, there.lookAt)).toBeLessThan(0.01);
+
+    // Give the shot back to its card, so the tests after this one are still about a CARD shot —
+    // which is the only kind `card_shot_problems` speaks about at all.
+    await invoke("cinema_clear_shot_camera", { id: subject, index: 0 });
+    await browser.pause(400);
+    expect((await invoke("cinema_list", { id: subject })).rows[0].camera).toBeFalsy();
+  });
+
   it("goes quiet when the obstruction goes away", async () => {
     // ...so the warning is a statement about the world, not about the shot having been made from a
     // card. Same shot, same subject, same panel — one entity removed.
     await invoke("remove_entity", { id: shell });
     await browser.pause(700);
-    const cleared = (await invoke("cinema_list", { id: subject })).problems;
+    const cleared = said_of(await invoke("cinema_list", { id: subject }));
     note(`[cleared] ${JSON.stringify(cleared)}`);
     expect(cleared.some((p) => /nowhere good to film from/.test(p))).toBe(false);
     await browser.pause(500);
@@ -260,7 +319,7 @@ describe("ADR-197 · nowhere good to film from", () => {
     await moveTo(again, HOME[0], HOME[1] - SHELL_M / 2, HOME[2]);
     await browser.pause(600);
     expect(
-      (await invoke("cinema_list", { id: subject })).problems.some((p) =>
+      said_of(await invoke("cinema_list", { id: subject })).some((p) =>
         /nowhere good to film from/.test(p),
       ),
     ).toBe(true);
@@ -282,7 +341,7 @@ describe("ADR-197 · nowhere good to film from", () => {
     await browser.pause(1500);
     expect((await invoke("cinema_list", { id: subject })).shots).toBe(1);
 
-    const reopened = (await invoke("cinema_list", { id: subject })).problems;
+    const reopened = said_of(await invoke("cinema_list", { id: subject }));
     note(`[reopened] ${JSON.stringify(reopened)}`);
     expect(reopened.some((p) => /nowhere good to film from/.test(p))).toBe(true);
     await captureFrame("4-after-reopen.png");

@@ -2396,7 +2396,12 @@ impl SceneState {
         self.distance = distance;
         self.cam_target = look_at;
         self.revision = self.revision.wrapping_add(1);
-        Some(camera_eye(self.orbit, self.elevation, self.distance, look_at))
+        Some(camera_eye(
+            self.orbit,
+            self.elevation,
+            self.distance,
+            look_at,
+        ))
     }
 
     /// Enter Focus mode on instance `i` (M3.3) — the pure state transition the `focus_entity` command
@@ -9513,7 +9518,7 @@ mod tests {
         // Dead centre of the first neighbour, the unit box at x = 3.
         let buried = ask(&cut_from([3.0, 0.0, 0.0]));
         assert_eq!(buried.len(), 1, "{buried:?}");
-        assert!(buried[0].contains("inside something"), "{buried:?}");
+        assert!(buried[0].message.contains("inside something"), "{buried:?}");
         // ...and from open air on the far side, the engine has nothing to say.
         assert!(ask(&cut_from([0.0, 0.0, -8.0])).is_empty());
     }
@@ -9726,34 +9731,70 @@ mod tests {
                 )
             },
         );
-        let memoised =
-            st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        let memoised = st.planned_placement(
+            "1_1",
+            &card_shot(),
+            card_subject(),
+            16.0 / 9.0,
+            &subject_only(),
+        );
         assert_eq!(cold, memoised, "the memo changed the answer");
         assert_eq!(st.cinema_card_plans.len(), 1);
         // And the second ask is the same answer from the map rather than a second search.
-        let warm =
-            st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        let warm = st.planned_placement(
+            "1_1",
+            &card_shot(),
+            card_subject(),
+            16.0 / 9.0,
+            &subject_only(),
+        );
         assert_eq!(warm, memoised);
-        assert_eq!(st.cinema_card_plans.len(), 1, "a second entry is a memo miss");
+        assert_eq!(
+            st.cinema_card_plans.len(),
+            1,
+            "a second entry is a memo miss"
+        );
     }
 
     #[test]
     fn membership_changing_drops_the_placement_memo_and_a_pose_does_not() {
         let mut st = crowded_scene(6);
         st.sync_occlusion();
-        let _ = st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        let _ = st.planned_placement(
+            "1_1",
+            &card_shot(),
+            card_subject(),
+            16.0 / 9.0,
+            &subject_only(),
+        );
         assert_eq!(st.cinema_card_plans_revision, Some(1));
 
         // A published pose moves `revision`, and the occluders it was measured against are NOT
         // refitted for it — so neither is this.
         st.revision = st.revision.wrapping_add(1);
-        let _ = st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
-        assert_eq!(st.cinema_card_plans.len(), 1, "a pose must not drop the memo");
+        let _ = st.planned_placement(
+            "1_1",
+            &card_shot(),
+            card_subject(),
+            16.0 / 9.0,
+            &subject_only(),
+        );
+        assert_eq!(
+            st.cinema_card_plans.len(),
+            1,
+            "a pose must not drop the memo"
+        );
 
         // Membership changing rebuilds the BVH, so every answer measured against the old one goes.
         st.ids_revision = 2;
         st.sync_occlusion();
-        let _ = st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        let _ = st.planned_placement(
+            "1_1",
+            &card_shot(),
+            card_subject(),
+            16.0 / 9.0,
+            &subject_only(),
+        );
         assert_eq!(st.cinema_card_plans_revision, Some(2));
         assert_eq!(st.cinema_card_plans.len(), 1, "the stale entries survived");
     }
@@ -9804,8 +9845,13 @@ mod tests {
         st.ids_revision += 1;
         st.sync_occlusion();
         let cold = std::time::Instant::now();
-        let plan =
-            st.planned_placement("1_1", &card_shot(), card_subject(), 16.0 / 9.0, &subject_only());
+        let plan = st.planned_placement(
+            "1_1",
+            &card_shot(),
+            card_subject(),
+            16.0 / 9.0,
+            &subject_only(),
+        );
         let cold = cold.elapsed();
         assert!(
             !plan.settled.acceptable() && plan.steps > 0,
@@ -10889,6 +10935,103 @@ mod tests {
         st.clear_focus(); // a stray Escape with nothing focused
         assert_eq!(st.focused, None);
         assert_eq!(st.revision, rev0, "no revision bump when nothing changed");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-200 — stand the camera at a pose the engine computed.
+    // ---------------------------------------------------------------------------------------------
+
+    #[test]
+    fn stand_at_puts_the_eye_where_it_was_asked_to_and_aims_where_it_was_told() {
+        let mut st = scene(3);
+        // A pose off every axis, so a sign error in any of the three cannot pass.
+        let eye = [7.0, 3.5, -4.0];
+        let look_at = [1.0, 0.5, 2.0];
+        let stood = st.stand_at(eye, look_at).expect("a real direction");
+        for (got, want) in stood.iter().zip(eye.iter()) {
+            assert!((got - want).abs() < 1.0e-3, "{stood:?} vs {eye:?}");
+        }
+        assert_eq!(st.cam_target, look_at, "the aim becomes the orbit target");
+        // ...and the camera the renderer will actually draw through agrees with both. The round trip
+        // through `live_camera` is the property that matters: `cinema_set_shot_camera` reads exactly
+        // this, so a `stand_at` that wrote fields the reader does not use would store a pose the
+        // stage was never at.
+        let (live_eye, live_look, _) = st.live_camera();
+        for (got, want) in live_eye.iter().zip(eye.iter()) {
+            assert!((got - want).abs() < 1.0e-3, "{live_eye:?} vs {eye:?}");
+        }
+        assert_eq!(live_look, look_at);
+    }
+
+    #[test]
+    fn stand_at_leaves_a_held_camera_and_an_axis_view_behind() {
+        let mut st = scene(2);
+        st.projection = Projection::Orthographic;
+        st.publish_camera(Some(CamView {
+            pos: [99.0, 99.0, 99.0],
+            look_at: Some([0.0, 0.0, 0.0]),
+            fov_deg: 20.0,
+            near: 0.1,
+            far: 1000.0,
+        }));
+        st.stand_at([5.0, 2.0, 0.0], [0.0, 0.0, 0.0])
+            .expect("a real direction");
+        assert!(
+            st.cam_override.is_none(),
+            "a held camera would keep drawing its own pose and the move would appear to do nothing"
+        );
+        assert_eq!(
+            st.projection,
+            Projection::Perspective,
+            "a cutscene camera has a lens; `cinema_set_shot_camera` refuses to store from a parallel \
+             projection, so landing in one would earn the author a refusal they did nothing to cause"
+        );
+    }
+
+    #[test]
+    fn stand_at_declines_a_pose_with_no_direction_in_it() {
+        let mut st = scene(2);
+        let before = st.camera_state();
+        assert!(st.stand_at([2.0, 2.0, 2.0], [2.0, 2.0, 2.0]).is_none());
+        assert_eq!(
+            st.camera_state(),
+            before,
+            "a declined request must not have moved the camera on its way to declining"
+        );
+    }
+
+    #[test]
+    fn stand_at_reports_the_eye_it_reached_when_the_pitch_limit_bites() {
+        // Straight down on the subject. The orbit camera cannot pitch past its own limit — the same
+        // one a mouse drag stops at — so the honest answer is the eye it actually reached.
+        let mut st = scene(2);
+        let stood = st
+            .stand_at([0.0, 10.0, 0.0], [0.0, 0.0, 0.0])
+            .expect("a real direction");
+        assert!(
+            (stood[1] - 10.0).abs() > 0.01,
+            "the clamp has to have bitten for this test to mean anything: {stood:?}"
+        );
+        let (live_eye, _, _) = st.live_camera();
+        assert_eq!(
+            stood, live_eye,
+            "the reported eye is the one the renderer draws through, not the one asked for"
+        );
+    }
+
+    #[test]
+    fn stand_at_ends_focus_rather_than_being_undone_by_it() {
+        // `clear_focus` restores the pre-focus distance AND target, so an implementation that wrote
+        // the pose first and cleared focus afterwards would hand the camera straight back.
+        let mut st = scene(4);
+        st.focus_on(2);
+        st.stand_at([9.0, 4.0, 9.0], [3.0, 0.0, 3.0])
+            .expect("a real direction");
+        assert_eq!(
+            st.focused, None,
+            "the rest of the scene must come back undimmed"
+        );
+        assert_eq!(st.cam_target, [3.0, 0.0, 3.0]);
     }
 
     #[test]

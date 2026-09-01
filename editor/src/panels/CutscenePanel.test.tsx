@@ -906,4 +906,107 @@ describe("CutscenePanel", () => {
     expect(hero.hasAttribute("disabled")).toBe(true);
     expect(hero.getAttribute("title")).toMatch(/at most 12 shots/i);
   });
+
+  // -----------------------------------------------------------------------------------------------
+  // ADR-200 — TAKE ME THERE. The engine can say *there is nowhere good to film shot 2 from*, and
+  // could not put the author anywhere. These check the three things that make the sentence
+  // actionable: the control exists on the warning that names the shot, it asks the engine for THAT
+  // shot, and it leaves the author one click from the fix.
+  // -----------------------------------------------------------------------------------------------
+  describe("standing where a shot films from", () => {
+    const NOWHERE = {
+      shot: 1,
+      message:
+        'shot 2 has nowhere good to film from — the engine tried every framing and angle, and in the best one it found 78% of the subject is behind something else; press "Take me there" to stand where it tried, then frame it yourself with "Shoot from this view" — or film a different part',
+    };
+
+    it("hangs the control off the warning, and asks the engine for the shot the sentence names", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve({ ...FOUR_SHOTS, problems: [NOWHERE] }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click(await screen.findByTestId("cutscene-take-me-there"));
+      // Shot 2 in the prose is index 1 on the wire, and nothing but the field can carry that across.
+      await waitFor(() => expect(client.cinemaStandAtShot).toHaveBeenCalledWith("e1", 1));
+    });
+
+    it("selects that shot, so the control the sentence sends them to next acts on it", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve({ ...FOUR_SHOTS, problems: [NOWHERE] }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click(await screen.findByTestId("cutscene-take-me-there"));
+      // Arriving at shot 2's placement with another shot selected would put the author one click
+      // from storing this view onto the wrong shot.
+      await waitFor(() =>
+        expect(screen.getByTestId("cutscene-shot-reads").textContent).toBe(
+          FOUR_SHOTS.rows[1].reads,
+        ),
+      );
+      expect(await screen.findByTestId("cutscene-shoot-here")).toBeTruthy();
+    });
+
+    it("hands a held preview back first, because the cutscene camera would overwrite the move", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve({ ...FOUR_SHOTS, problems: [NOWHERE] }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click(await screen.findByTestId("cutscene-preview"));
+      await waitFor(() => expect(client.cinemaPreview).toHaveBeenCalled());
+      vi.mocked(client.cinemaPreview).mockClear();
+      fireEvent.click(await screen.findByTestId("cutscene-take-me-there"));
+      // Ending the preview is what makes the stage the author's to orbit — which is the entire point
+      // of arriving there.
+      await waitFor(() =>
+        expect(vi.mocked(client.cinemaPreview).mock.calls.some((c) => c[2] === false)).toBe(true),
+      );
+      expect(client.cinemaStandAtShot).toHaveBeenCalledWith("e1", 1);
+    });
+
+    it("offers it for every shot, not only a warned one — a card shot's placement is otherwise unseeable", async () => {
+      const client = loaded();
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click((await screen.findAllByTestId("cutscene-clip"))[2]);
+      fireEvent.click(await screen.findByTestId("cutscene-stand-here"));
+      await waitFor(() => expect(client.cinemaStandAtShot).toHaveBeenCalledWith("e1", 2));
+    });
+
+    it("says what it found when it got there, in the engine's own words", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve({ ...FOUR_SHOTS, problems: [NOWHERE] }));
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click(await screen.findByTestId("cutscene-take-me-there"));
+      // The stage is a native surface a test cannot photograph, so the sentence is the evidence that
+      // the move happened AND that the panel did not invent a second wording of it.
+      await waitFor(() =>
+        expect(toastStore.getState().toasts.some((t) => /Standing where shot 2 films from/.test(t.text))).toBe(true),
+      );
+    });
+
+    it("says why when the engine refuses, instead of appearing to work", async () => {
+      const client = loaded();
+      client.cinemaList = vi.fn(() => Promise.resolve({ ...FOUR_SHOTS, problems: [NOWHERE] }));
+      client.cinemaStandAtShot = vi.fn(() =>
+        Promise.resolve({
+          moved: false,
+          stood: [0, 0, 0] as [number, number, number],
+          lookAt: [0, 0, 0] as [number, number, number],
+          fovDeg: 0,
+          offBy: 0,
+          progress: 0,
+          placed: false,
+          steps: 0,
+          acceptable: true,
+          message: "Play is driving the camera",
+          reason: "Play is driving the camera",
+        }),
+      );
+      selectSomething();
+      render(<CutscenePanel client={client} />);
+      fireEvent.click(await screen.findByTestId("cutscene-take-me-there"));
+      expect(await screen.findByTestId("cutscene-refusal")).toBeTruthy();
+    });
+  });
 });

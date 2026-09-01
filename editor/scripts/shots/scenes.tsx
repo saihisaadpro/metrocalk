@@ -730,6 +730,15 @@ const FOLLOWING_CAMERA = {
   track: [0.2, 1.35, 0.4] as [number, number, number],
 };
 
+/** The order the ENGINE sends a cut's warnings in — `metrocalk_animation::shot::in_shot_order`.
+ *
+ *  A fixture that concatenated the document's own warnings and the world's would photograph a list
+ *  ordered by which producer ran, which is exactly the defect ADR-200 fixed in the engine: a scene
+ *  claiming "the list reads in shot order" would then be asserted against a list that does not.
+ *  Stable, and cut-wide faults lead, for the same reasons the Rust side gives. */
+const inShotOrder = (problems: ShotProblem[]): ShotProblem[] =>
+  [...problems].sort((a, b) => (a.shot == null ? 0 : a.shot + 1) - (b.shot == null ? 0 : b.shot + 1));
+
 const placedCameraClient = (
   camera: typeof PLACED_CAMERA = PLACED_CAMERA,
   extraProblems: ShotProblem[] = [],
@@ -744,7 +753,7 @@ const placedCameraClient = (
     rows,
     reads: rows.map((row) => row.reads),
     // The jump cut between shots 4 and 5 is still real; the placed shot simply is not part of it.
-    problems: [...CUTSCENE.problems, ...extraProblems],
+    problems: inShotOrder([...CUTSCENE.problems, ...extraProblems]),
   };
   return {
     ...cutsceneClient(),
@@ -764,7 +773,10 @@ const placedCameraClient = (
  *  Every shot here is a CARD shot (`camera: null`), which is the whole distinction: the author never
  *  chose these positions, so the advice cannot be about the controls that produced them. */
 const cutsceneClientWithProblems = (extraProblems: ShotProblem[]) => {
-  const cut: CinemaReply = { ...CUTSCENE, problems: [...CUTSCENE.problems, ...extraProblems] };
+  const cut: CinemaReply = {
+    ...CUTSCENE,
+    problems: inShotOrder([...CUTSCENE.problems, ...extraProblems]),
+  };
   return {
     ...cutsceneClient(),
     cinemaList: () => Promise.resolve(cut),
@@ -1611,7 +1623,13 @@ export const SCENES: Scene[] = [
       ],
       text_absent: ["eye_inside", "vantage", "null", "undefined", "NaN"],
       // A NOTE, not a refusal. The way out of the fault is the control that caused it.
-      enabled: ["[data-testid='cutscene-shoot-here']", "[data-testid='cutscene-keep-framed']"],
+      enabled: [
+        "[data-testid='cutscene-shoot-here']",
+        "[data-testid='cutscene-keep-framed']",
+        // ADR-200 — and the note now carries a way to SEE the fault. Standing at the author's own
+        // eye IS the solid-colour frame the sentence describes.
+        "[data-testid='cutscene-take-me-there']",
+      ],
     },
     render: () => (
       <CutscenePanel
@@ -1639,9 +1657,13 @@ export const SCENES: Scene[] = [
       "'boxed in' — with no mechanism, no percentage of a thing they cannot see, and no vantage " +
       "vocabulary. Third, and this is the part the sentence exists for: the advice is NOT 'change " +
       "the size or the angle', because that is precisely what the engine has already tried on every " +
-      "rung of the ladder on the author's behalf — it points at the one control that is left, " +
-      "'Shoot from this view', which is on screen and enabled. Fourth, it is a NOTE and not a " +
-      "refusal: nothing is disabled, no shot is removed, and the cut still plays",
+      "rung of the ladder on the author's behalf — it points at the two controls that are left. " +
+      "Fourth, and this is ADR-200: 'Take me there' sits beside EVERY warning that names a shot, "
+      + "because the engine knows exactly where it gave up and until now could not put anybody "
+      + "there — the advice was 'frame it yourself' starting from wherever the viewport happened to "
+      + "be, which on a 262 m import is a manual orbit to a part the author cannot see. Three "
+      + "warnings, three buttons: each goes to its own shot. Fifth, it is a NOTE and not a refusal: "
+      + "nothing is disabled, no shot is removed, and the cut still plays",
     viewport: { width: 1400, height: 900 },
     setup: selectAnimatedEntity,
     click: ["[data-testid='cutscene-clip']"],
@@ -1651,6 +1673,9 @@ export const SCENES: Scene[] = [
         // Three warnings, one list: the jump cut the cut already had, plus the two shots the
         // planner could not place. A second box for the world's half would fail this claim.
         ["[data-testid='cutscene-problem']", 3],
+        // ADR-200 — ONE CONTROL PER WARNING, because each names a different shot. A single button
+        // beside a list of three would have to guess which of them it meant.
+        ["[data-testid='cutscene-take-me-there']", 3],
       ],
       text_present: [
         "shot 2 has nowhere good to film from",
@@ -1659,6 +1684,7 @@ export const SCENES: Scene[] = [
         "shot 3 has nowhere good to film from",
         "most of the frame is whatever the camera is standing against",
         "Shoot from this view",
+        "Take me there",
         "jump cut",
       ],
       // The engine's own vocabulary. (That the card sentences never say "change the size or the
@@ -1666,8 +1692,14 @@ export const SCENES: Scene[] = [
       // alone — the jump-cut warning on this same cut says exactly that, correctly, so a claim over
       // the whole panel's text could not tell the two apart.)
       text_absent: ["acceptable", "vantage", "eye_inside", "crowded", "null", "undefined", "NaN"],
-      enabled: ["[data-testid='cutscene-shoot-here']"],
-      unclipped: ["[data-testid='cutscene-problem']"],
+      enabled: [
+        "[data-testid='cutscene-shoot-here']",
+        // ADR-200 — the control the sentence now names, on screen and live. Without this claim the
+        // scene is satisfied by advice that points at a button which is not there.
+        "[data-testid='cutscene-take-me-there']",
+      ],
+      unclipped: ["[data-testid='cutscene-problem']", "[data-testid='cutscene-take-me-there']"],
+      untruncated: ["[data-testid='cutscene-take-me-there']"],
     },
     render: () => (
       <CutscenePanel

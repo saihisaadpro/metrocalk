@@ -269,7 +269,8 @@ describe("ADR-195 · keep the subject framed", () => {
     await moveTo(wall, placed.eye[0], placed.eye[1] - 1.5, placed.eye[2]);
     await browser.pause(500);
 
-    const said = (await invoke("cinema_list", { id: subject })).problems;
+    // ADR-200 made each entry `{ shot, message }`; the sentences are what this spec asserts.
+    const said = (await invoke("cinema_list", { id: subject })).problems.map((p) => p.message);
     note(`[problems] ${JSON.stringify(said)}`);
     const buried = said.find((p) => /inside something/.test(p));
     expect(buried).toBeTruthy();
@@ -290,7 +291,7 @@ describe("ADR-195 · keep the subject framed", () => {
     // not about the shot having a placed camera at all.
     await invoke("remove_entity", { id: wall });
     await browser.pause(500);
-    const cleared = (await invoke("cinema_list", { id: subject })).problems;
+    const cleared = (await invoke("cinema_list", { id: subject })).problems.map((p) => p.message);
     note(`[problems, cleared] ${JSON.stringify(cleared)}`);
     expect(cleared.some((p) => /inside something/.test(p))).toBe(false);
   });

@@ -927,28 +927,6 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
                 <Icon name="camera" size="md" />{" "}
                 {active.camera ? "Re-shoot from this view" : "Shoot from this view"}
               </Button>
-              {/* ADR-200 — THE ROUND TRIP, closed. "Shoot from this view" reads the stage into the
-                  shot; this reads the shot back onto the stage. Beside it, attached, because they
-                  are one decision seen from two ends — and useful for every shot and not only a
-                  warned one: it is the only way to SEE where a card shot the engine placed actually
-                  films from without previewing, which takes the camera away again. */}
-              <Button
-                data-testid="cutscene-stand-here"
-                variant="secondary"
-                compact
-                disabled={locked}
-                disabledReason={lockReason}
-                title={
-                  locked
-                    ? lockReason
-                    : active.camera
-                      ? "Stand the stage camera at this shot's own camera"
-                      : "Stand the stage camera where the engine films this shot from"
-                }
-                onClick={() => void takeMeThere(active.index)}
-              >
-                <Icon name="waypoint" size="md" /> Take me there
-              </Button>
               {active.camera && (
                 <Button
                   data-testid="cutscene-use-card"
@@ -967,6 +945,35 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
                 </Button>
               )}
             </ToolbarGroup>
+            <ToolbarSeparator />
+            {/* ADR-200 — THE ROUND TRIP, closed. "Shoot from this view" reads the stage into the
+                shot; this reads the shot back onto the stage.
+
+                OUTSIDE the attached pair, deliberately. Those two are one decision in two states —
+                the shot is placed, or it is on its card — and this is not a third state: it is a
+                CAMERA MOVE and changes nothing in the document. Attaching it would draw it as a
+                segment of a control it cannot be a segment of.
+
+                And it is offered for every shot, not only a warned one: it is otherwise impossible
+                to see where a card shot the ENGINE placed actually films from without previewing,
+                which takes the camera away again. */}
+            <Button
+              data-testid="cutscene-stand-here"
+              variant="secondary"
+              compact
+              disabled={locked}
+              disabledReason={lockReason}
+              title={
+                locked
+                  ? lockReason
+                  : active.camera
+                    ? "Stand the stage camera at this shot's own camera"
+                    : "Stand the stage camera where the engine films this shot from"
+              }
+              onClick={() => void takeMeThere(active.index)}
+            >
+              <Icon name="waypoint" size="md" /> Take me there
+            </Button>
             {active.camera && (
               <>
                 <ToolbarSeparator />
