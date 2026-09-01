@@ -151,6 +151,24 @@ export const control = {
 } as const;
 
 /**
+ * **Where a multi-pane workspace stops being columns.**
+ *
+ * ONE NUMBER, AND IT IS ASKED TWICE ON PURPOSE. A three-pane editor (tools · canvas · properties) has a
+ * width below which the three columns cannot all be themselves; past it the accessories stop being
+ * tracks BESIDE the canvas and become drawers OVER it — the rotation `global.css` already makes for the
+ * shell's side docks. Two things need to know that number: the stylesheet, which lays the panes out,
+ * and the editor, which must stop opening BOTH drawers once only one of them fits beside a canvas.
+ *
+ * CSS cannot read this file and TypeScript cannot read a `@container` prelude, so the two statements
+ * are compared at rest by `tokens.test.ts` — the `<test_and_ci_discipline>` 6 rule that a contract
+ * stated twice in two languages gets a check that compares them, because neither compiler will.
+ */
+export const layout = {
+  /** Container inline size at or below which panes float over the canvas instead of flanking it. */
+  panesOverlayBelow: 920,
+} as const;
+
+/**
  * **The app's z-layer ladder — one source of truth so overlays never fight.**
  *
  * THE RULE (read this before adding any floating UI): a raised `z-index` does NOT let an element escape an

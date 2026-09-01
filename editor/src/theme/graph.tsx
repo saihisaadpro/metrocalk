@@ -626,13 +626,22 @@ export function graphFitDecision({ bounds, canvas, nodeCount, minimapFrom }: Gra
 /** Re-fits once the chrome exists and the cards have been measured, and reports whether the fit hit
  *  its floor. Rendered as a child of `<ReactFlow>` because `useReactFlow` needs its provider, and it
  *  draws nothing: it is the one place that turns "the graph changed" into "the graph is framed", so
- *  the Fit button and the automatic fit cannot disagree about what framing means. */
+ *  the Fit button and the automatic fit cannot disagree about what framing means.
+ *
+ *  `fit: false` KEEPS THE DECISION AND DROPS THE FRAMING, which is what an authoring canvas needs.
+ *  `graphFitDecision`'s whole argument is that a floor which hides content silently is worse than no
+ *  floor — so the moment a fit clamps, the mini map has to say there is more graph off the side. That
+ *  reasoning is about the ZOOM the graph is drawn at, not about who asked for it: an editor whose fits
+ *  come from the Fit button and from a drawer opening clamps exactly the same way, and until now it
+ *  was the one surface the rule never reached, because the decision was only computed when the
+ *  surface also did the fitting. */
 function GraphAutoFit({
   surface,
   nodes,
   signature,
   reserve,
   minimapFrom,
+  fit,
   onDecide,
 }: {
   surface: RefObject<HTMLDivElement | null>;
@@ -640,6 +649,8 @@ function GraphAutoFit({
   signature: string;
   reserve: boolean;
   minimapFrom: number;
+  /** Whether this surface also re-frames the graph, or only measures whether a fit would clamp. */
+  fit: boolean;
   onDecide: (decision: GraphFitDecision) => void;
 }) {
   const flow = useReactFlow();
@@ -667,11 +678,11 @@ function GraphAutoFit({
         }),
       );
     }
-    void flow.fitView({ padding: chromePadding(surface.current), minZoom: GRAPH_FIT_MIN_ZOOM });
+    if (fit) void flow.fitView({ padding: chromePadding(surface.current), minZoom: GRAPH_FIT_MIN_ZOOM });
     // `reserve` is in the dependency list because showing the mini map CHANGES the bottom gutter, so
     // the fit that decided to show it is no longer the right fit. It converges in one step: the extra
     // reserve can only make the fit smaller, and smaller is still clamped.
-  }, [flow, surface, nodes, signature, reserve, minimapFrom, onDecide]);
+  }, [fit, flow, surface, nodes, signature, reserve, minimapFrom, onDecide]);
   return null;
 }
 
@@ -827,9 +838,9 @@ export function GraphSurface({
   // Reset when the graph itself changes: "this graph did not fit" is a fact about a shape, and
   // carrying it across a new selection would leave a mini map hanging over a graph of three nodes.
   useEffect(() => setFitMinimap(false), [signature]);
-  // With no automatic fit there is no fit DECISION to ask, so the count threshold is the whole rule:
-  // a graph big enough to get lost in gets a thumbnail, and one that is not does not.
-  const minimap = autoFit ? fitMinimap : sized.length >= minimapFrom;
+  // The decision is asked on EVERY surface now, fitting or not — `graphFitDecision` already folds the
+  // count threshold into it, and the `||` is only the answer before the first measurement lands.
+  const minimap = fitMinimap || sized.length >= minimapFrom;
 
   return (
     <div className="mtk-graph-surface" ref={surface} style={{ height, minHeight }} {...rest}>
@@ -859,16 +870,15 @@ export function GraphSurface({
             {...flowProps}
           >
             <Background variant={BackgroundVariant.Dots} gap={18} size={1} color={graphTheme.grid} />
-            {autoFit && (
-              <GraphAutoFit
-                surface={surface}
-                nodes={sized}
-                signature={signature}
-                reserve={minimap}
-                minimapFrom={minimapFrom}
-                onDecide={onDecide}
-              />
-            )}
+            <GraphAutoFit
+              surface={surface}
+              nodes={sized}
+              signature={signature}
+              reserve={minimap}
+              minimapFrom={minimapFrom}
+              fit={autoFit}
+              onDecide={onDecide}
+            />
             {minimap && (
               <MiniMap
                 pannable

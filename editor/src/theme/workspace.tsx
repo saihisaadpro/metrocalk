@@ -19,6 +19,7 @@ import {
 import { Popover, PopoverSurface, type Placement } from "./Popover";
 import { Icon } from "./icons";
 import { Button, type ButtonProps } from "./primitives";
+import { layout } from "./tokens";
 
 export interface DockTabItem {
   /** Stable value used for selection and change notifications. */
@@ -657,6 +658,47 @@ export function ShortcutBadge({ keys, ariaLabel, title, style }: ShortcutBadgePr
       ))}
     </kbd>
   );
+}
+
+/** How a multi-pane editor is currently arranged — `columns` while the panes flank the canvas,
+ *  `overlay` once they float over it. */
+export type PaneLane = "columns" | "overlay";
+
+/**
+ * THE LANE A PANE LAYOUT IS IN, MEASURED FROM THE ELEMENT ITSELF.
+ *
+ * A `@container` query can lay the panes out and cannot answer the question that comes with them: with
+ * only one drawer's worth of room beside the canvas, may the editor still open two? That decision is
+ * behaviour, so it needs the width in TypeScript — and the width has to come from the ELEMENT, not
+ * from `window.innerWidth`, because these editors live in docks whose track is a fraction of the
+ * window and changes when a neighbouring panel collapses, with no `resize` event to hear.
+ *
+ * Returns `columns` when the observer has not reported yet: the wide arrangement is the one that
+ * degrades gracefully into a scroll, and starting in `overlay` would flash floating panels over a
+ * canvas that has room for them.
+ */
+export function usePaneLane(breakpoint: number = layout.panesOverlayBelow): {
+  lane: PaneLane;
+  /** Attach to the element whose width decides the lane. */
+  laneRef: (el: HTMLElement | null) => void;
+} {
+  // A CALLBACK REF, NOT A `useRef` OBJECT, and the difference is a defect this hook already had. An
+  // effect keyed on a ref object runs ONCE, at mount — and these editors render a loading branch
+  // first, so at that moment the element the ref names does not exist yet and the observer is never
+  // attached. The lane then stays at its `columns` default for the life of the panel: measured at a
+  // 900px dock, the graph laid itself out in three columns under a rule that says it has room for
+  // one. A callback ref re-runs the effect when the ELEMENT changes, which is the actual event.
+  const [node, setNode] = useState<HTMLElement | null>(null);
+  const [lane, setLane] = useState<PaneLane>("columns");
+  useEffect(() => {
+    if (!node || typeof ResizeObserver === "undefined") return;
+    const read = () => setLane(node.clientWidth > 0 && node.clientWidth <= breakpoint ? "overlay" : "columns");
+    read();
+    const observer = new ResizeObserver(read);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [breakpoint, node]);
+  return { lane, laneRef: setNode };
 }
 
 export interface CanvasSplitProps {

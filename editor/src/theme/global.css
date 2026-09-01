@@ -3002,11 +3002,9 @@ body > [role="dialog"][aria-modal="true"] {
 }
 .mtk-curve__grid line { stroke: var(--mtk-border-subtle); stroke-width: 1; }
 
-.animation-workspace-root {
-  container-name: animationWorkspace;
-  container-type: inline-size;
-}
-
+/* No `container-name`/`container-type` here any more: the one query that asked about them is now
+   `[data-lane]`, set from a measurement — and `inline-size` containment on a grid that fills its dock
+   is a sizing rule nobody was reading. */
 .animation-workspace-root:focus-visible {
   outline: 2px solid var(--mtk-ring);
   outline-offset: -2px;
@@ -3071,18 +3069,11 @@ body > [role="dialog"][aria-modal="true"] {
   color: var(--mtk-text);
   background: var(--mtk-bg-canvas);
 }
-.animation-graph-editor[data-palette-open="false"][data-inspector-open="true"] {
-  grid-template-columns: minmax(420px, 1fr) minmax(250px, 310px);
-  grid-template-areas: "toolbar toolbar" "canvas inspector" "parameters parameters";
-}
-.animation-graph-editor[data-palette-open="true"][data-inspector-open="false"] {
-  grid-template-columns: minmax(190px, 230px) minmax(420px, 1fr);
-  grid-template-areas: "toolbar toolbar" "palette canvas" "parameters parameters";
-}
-.animation-graph-editor[data-palette-open="false"][data-inspector-open="false"] {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: "toolbar" "canvas" "parameters";
-}
+/* The two arrangements — which columns exist in `columns`, and where the drawers float in `overlay`
+   — are together at the end of this file, under "the graph editor's two arrangements". They were
+   here, keyed on the open/closed attributes alone, until `overlay` needed to override them and could
+   not: `[data-palette-open][data-inspector-open]` is a more specific selector than any single
+   `[data-lane]` one, so the wide grid quietly won inside the narrow regime. */
 /* The row itself is `Toolbar` (`.mtk-toolbar`) — the shared rhythm, which WRAPS rather than scrolls,
    so the actions at its right end can no longer be pushed out of a strip with no scrollbar. All this
    rule owns is where the row sits in the editor's grid. */
@@ -3546,71 +3537,121 @@ body > [role="dialog"][aria-modal="true"] {
   transform: translateX(-50%);
 }
 
-@container animationWorkspace (max-width: 920px) {
-  /* THE TIMELINE IS THIS WORKSPACE'S STAGE, AND STACKED IT WAS THE SMALLEST THING IN IT. Three auto
-     rows under `align-content: start` give each stacked panel its content minimum and nobody the
-     remainder, so the timeline sat at exactly the floor its viewport declares. Measured in the dock
-     at a 1440x900 window, where the workspace has 321px of column: the timeline section took 94 of
-     them — a **62px viewport holding 241px of content** — while the tools panel below it took 110.
-     The ruler was visible, one annotation lane was half visible, and the empty state that says what
-     to do next ("No 3D tracks yet — choose a compatible property and add a key at the playhead") was
-     scrolled out of sight in a 62px window.
+/* THE BREAKPOINT IS STATED ONCE, IN `tokens.ts`, AND IT ARRIVES HERE AS AN ATTRIBUTE. This was a
+   `@container animationWorkspace (max-width: 920px)` prelude, which is a SECOND statement of a number
+   TypeScript also needs — the graph editor has to decide whether BOTH its drawers may be open, and
+   that is behaviour a container query cannot express. Two writings of one number in two languages is
+   the drift `<test_and_ci_discipline>` 6 is about, and neither compiler compares them; `usePaneLane`
+   measures the workspace's own box and writes `data-lane`, so there is nothing left to compare.
 
-     `<ux_quality>` 5 is written about the 3D stage, but the rule it states is general and this is
-     the same shape one level in: the primary surface gets layout priority and the accessories yield.
-     So the timeline row is `minmax(floor, 1fr)` and takes the leftover; tools and inspector are
-     content-sized and already scroll inside their own `max-height`. The floor is the ruler (32) +
-     both annotation lanes (60) + one track row (48) + the view toolbar (~47) — the least that shows
-     a timeline rather than a fragment of one. */
-  .animation-workspace-layout,
-  .animation-workspace-layout--inspector {
-    --mtk-animation-timeline-floor: 220px;
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(var(--mtk-animation-timeline-floor), 1fr) auto auto;
-    grid-template-areas:
-      "timeline"
-      "tools"
-      "inspector";
-  }
+   THE TIMELINE IS THIS WORKSPACE'S STAGE, AND STACKED IT WAS THE SMALLEST THING IN IT. Three auto
+   rows under `align-content: start` give each stacked panel its content minimum and nobody the
+   remainder, so the timeline sat at exactly the floor its viewport declares. Measured in the dock at
+   a 1440x900 window, where the workspace has 321px of column: the timeline section took 94 of them —
+   a **62px viewport holding 241px of content** — while the tools panel below it took 110. The ruler
+   was visible, one annotation lane was half visible, and the empty state that says what to do next
+   ("No 3D tracks yet — choose a compatible property and add a key at the playhead") was scrolled out
+   of sight in a 62px window.
 
-  /* AND THE PANEL THAT YIELDED IS STILL A PANEL. Giving the timeline the leftover moved the squeeze
-     rather than resolving it: measured immediately afterwards, the tools panel went to **47px holding
-     345** — a header with its own content entirely behind a scrollbar. Three stacked panels do not
-     fit in the 321px a dock-height workspace has, and the repository already settled what a layout
-     does then (ADR-126): what gives way gives way by getting SMALLER, down to a floor, and past that
-     the container scrolls. It is a floor here rather than a crush, and `.animation-workspace-layout`
-     is `overflow: auto` — so a short workspace scrolls, visibly, instead of showing three panels
-     that are each too small to read. */
-  .animation-workspace-timeline { min-height: var(--mtk-animation-timeline-floor); }
-  .animation-workspace-tools,
-  .animation-workspace-inspector {
-    min-height: 148px;
-    max-height: 260px;
-  }
+   `<ux_quality>` 5 is written about the 3D stage, but the rule it states is general and this is the
+   same shape one level in: the primary surface gets layout priority and the accessories yield. So
+   the timeline row is `minmax(floor, 1fr)` and takes the leftover; tools and inspector are
+   content-sized and already scroll inside their own `max-height`. The floor is the ruler (32) + both
+   annotation lanes (60) + one track row (48) + the view toolbar (~47) — the least that shows a
+   timeline rather than a fragment of one. */
+.animation-workspace-root[data-lane="overlay"] .animation-workspace-layout,
+.animation-workspace-root[data-lane="overlay"] .animation-workspace-layout--inspector {
+  --mtk-animation-timeline-floor: 220px;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(var(--mtk-animation-timeline-floor), 1fr) auto auto;
+  grid-template-areas:
+    "timeline"
+    "tools"
+    "inspector";
+}
 
-  .animation-graph-editor {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto minmax(180px, 1fr) auto;
-    grid-template-areas: "toolbar" "canvas" "parameters";
-    overflow: hidden;
-  }
-  /* NARROW MEANS FEWER WORDS, NOT SMALLER ONES. The old rules here shrank the toolbar's own type to
-     11px and hid the spacer so the row could stay one line; `Toolbar` wraps instead, and all this
-     needs to do is stop the graph's name from taking a third of a 320px dock. */
-  .animation-graph-name { max-width: 14ch; }
-  .animation-graph-palette,
-  .animation-graph-inspector {
-    position: absolute;
-    top: 44px;
-    bottom: 44px;
-    z-index: 10;
-    width: min(310px, calc(100% - 24px));
-    max-height: none;
-    border: 1px solid var(--mtk-border-strong);
-    box-shadow: var(--mtk-shadow-4);
-  }
-  .animation-graph-palette { left: 0; }
-  .animation-graph-inspector { right: 0; }
+/* AND THE PANEL THAT YIELDED IS STILL A PANEL. Giving the timeline the leftover moved the squeeze
+   rather than resolving it: measured immediately afterwards, the tools panel went to **47px holding
+   345** — a header with its own content entirely behind a scrollbar. Three stacked panels do not fit
+   in the 321px a dock-height workspace has, and the repository already settled what a layout does
+   then (ADR-126): what gives way gives way by getting SMALLER, down to a floor, and past that the
+   container scrolls. It is a floor here rather than a crush, and `.animation-workspace-layout` is
+   `overflow: auto` — so a short workspace scrolls, visibly, instead of showing three panels that are
+   each too small to read. */
+.animation-workspace-root[data-lane="overlay"] .animation-workspace-timeline { min-height: var(--mtk-animation-timeline-floor); }
+.animation-workspace-root[data-lane="overlay"] .animation-workspace-tools,
+.animation-workspace-root[data-lane="overlay"] .animation-workspace-inspector {
+  min-height: 148px;
+  max-height: 260px;
+}
+
+/* ── the graph editor's two arrangements ──────────────────────────────────────────────────────────
+   THE LANE IS AN ATTRIBUTE, NOT A CONTAINER QUERY, AND THE REASON IS BEHAVIOUR. Laying two panes out
+   as overlays is something CSS can do; deciding that only ONE of them may be open once there is only
+   one drawer's worth of room beside the canvas is not — and without that decision the overlay regime
+   is not a layout. Measured at the width the Animate dock actually gives this editor (900px, from
+   `progress/anim-workspace/before/animation-graph-in-dock.png`): two 310px panels pinned to opposite
+   edges covered every node card in the graph AND the zoom pill, and the capture reported ten pairs of
+   controls taking each other's clicks. `usePaneLane` measures the editor's own box and writes
+   `data-lane`, so the arrangement and the decision read ONE number — `layout.panesOverlayBelow`. */
+.animation-graph-editor[data-lane="columns"][data-palette-open="false"][data-inspector-open="true"] {
+  grid-template-columns: minmax(420px, 1fr) minmax(250px, 310px);
+  grid-template-areas: "toolbar toolbar" "canvas inspector" "parameters parameters";
+}
+.animation-graph-editor[data-lane="columns"][data-palette-open="true"][data-inspector-open="false"] {
+  grid-template-columns: minmax(190px, 230px) minmax(420px, 1fr);
+  grid-template-areas: "toolbar toolbar" "palette canvas" "parameters parameters";
+}
+.animation-graph-editor[data-lane="columns"][data-palette-open="false"][data-inspector-open="false"],
+.animation-graph-editor[data-lane="overlay"] {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(180px, 1fr) auto;
+  grid-template-areas: "toolbar" "canvas" "parameters";
+}
+
+/* NARROW MEANS FEWER WORDS, NOT SMALLER ONES. An earlier rule here shrank the toolbar's own type to
+   11px and hid the spacer so the row could stay one line; `Toolbar` wraps instead, and all this needs
+   to do is stop the graph's name from taking a third of a 320px dock. */
+.animation-graph-editor[data-lane="overlay"] .animation-graph-name { max-width: 14ch; }
+
+/* THE DRAWER IS A CARD, THE WAY EVERY OTHER FLOATING SURFACE IN THIS EDITOR IS ONE — inset from its
+   edge rather than glued to it, rounded, on `shadow-4`, and it scrolls.
+   AND IT SHARES THE CANVAS CELL RATHER THAN FLOATING OVER THE WHOLE EDITOR. Two grid items placed in
+   one area overlap, which is all "floating" ever meant here — and it is bounded by construction: the
+   drawer cannot reach the toolbar above or the parameter strip below, because they are different
+   rows. `position: absolute; top: 54px; bottom: 54px` was the first spelling and it is the kind of
+   number that is right once: the parameter strip is two rows tall when a preview parameter exists,
+   so the drawer sat on top of the Speed slider and its pin, and the capture reported three more
+   pairs of controls sharing clicks. A grid area has no number to get wrong. */
+.animation-graph-editor[data-lane="overlay"] {
+  --mtk-graph-drawer-width: min(320px, calc(100% - 40px));
+}
+.animation-graph-editor[data-lane="overlay"] :is(.animation-graph-palette, .animation-graph-inspector) {
+  grid-area: canvas;
+  z-index: 10;
+  /* This stylesheet has no universal reset, so a width is a CONTENT width until an element says
+     otherwise — and the pane already carries 12px of padding and a hairline. Measured without this:
+     320 asked for, 346 drawn, which is `max_width` catching the same content-box drift it was written
+     for on `.mtk-graph-card`, and 26px the canvas beside it never got back. */
+  box-sizing: border-box;
+  width: var(--mtk-graph-drawer-width);
+  margin: 10px;
+  border: 1px solid var(--mtk-border-strong);
+  border-radius: var(--mtk-radius-lg);
+  box-shadow: var(--mtk-shadow-4);
+}
+.animation-graph-editor[data-lane="overlay"] .animation-graph-palette { justify-self: start; }
+.animation-graph-editor[data-lane="overlay"] .animation-graph-inspector { justify-self: end; }
+
+/* AND THE CANVAS GIVES THE DRAWER ITS ROOM, rather than hosting it. A drawer over a canvas whose
+   nodes, zoom pill and search field are still laid out under it is two surfaces sharing one set of
+   clicks — the exact finding the before-capture returned ten times. Padding the canvas on the open
+   side keeps React Flow's own fit arithmetic honest too: it fits to the box it is given. */
+.animation-graph-editor[data-lane="overlay"][data-palette-open="true"] .animation-graph-canvas {
+  padding-left: calc(var(--mtk-graph-drawer-width) + 20px);
+}
+.animation-graph-editor[data-lane="overlay"][data-inspector-open="true"] .animation-graph-canvas {
+  padding-right: calc(var(--mtk-graph-drawer-width) + 20px);
 }
 
 @media (prefers-reduced-motion: reduce) {

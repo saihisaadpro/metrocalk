@@ -43,8 +43,8 @@ import {
   ToolbarSpacer,
 } from "../theme/primitives";
 import { Callout, Checkbox, Field, FieldGrid, ProgressBar } from "../theme/fields";
-import { ChoiceCard, ChoiceGrid, DisclosureSection, EmptyPanelState } from "../theme/workspace";
-import { GraphSurface, graphEdge, type GraphCardNode } from "../theme/graph";
+import { ChoiceCard, ChoiceGrid, DisclosureSection, EmptyPanelState, usePaneLane } from "../theme/workspace";
+import { GRAPH_FIT_MIN_ZOOM, GraphSurface, graphEdge, type GraphCardNode } from "../theme/graph";
 import {
   ANIMATION_GRAPH_SCHEMA_VERSION,
   type AnimationGraphCondition,
@@ -377,7 +377,7 @@ export function AnimationGraphEditor({
   useEffect(() => {
     if (!fitOnNextGraphRender.current || !draft || !flowRef.current) return;
     fitOnNextGraphRender.current = false;
-    void flowRef.current.fitView({ duration: 180, padding: 0.18 });
+    void flowRef.current.fitView({ duration: 180, padding: 0.18, minZoom: GRAPH_FIT_MIN_ZOOM });
   }, [draft]);
 
   useEffect(() => {
@@ -385,6 +385,42 @@ export function AnimationGraphEditor({
     focusPaletteSearchOnOpen.current = false;
     paletteSearchRef.current.focus();
   }, [view.paletteOpen]);
+
+  /** THE ARRANGEMENT, MEASURED FROM THE EDITOR'S OWN BOX. It ships in the Animate dock, which is a
+   *  fraction of the window and changes width when a side dock collapses — so `window.innerWidth` is
+   *  the wrong ruler and there is no event for the right one. */
+  const { lane, laneRef } = usePaneLane();
+
+  /** ONE DRAWER AT A TIME, ONCE THERE IS ONLY ROOM FOR ONE. In `columns` the two panes flank the
+   *  canvas and both may be open; in `overlay` they float over it, and two 300px panels over a dock
+   *  that is 500px wide leave no canvas at all — measured at a 900px dock, where the palette covered
+   *  the graph's own node cards and the inspector covered the zoom pill. So opening one closes the
+   *  other, which is what the toolbar's two `aria-pressed` toggles already say out loud. */
+  /** THE FITS ABOVE AND BELOW ALL CARRY `GRAPH_FIT_MIN_ZOOM`, and it is the same clause the node
+   *  cards are drawn to: nothing in this editor may be smaller than the type scale bottoms out at.
+   *  Without it "fit everything" is a promise the canvas keeps by making every card illegible — at a
+   *  900px dock with a drawer open it chose ~0.35 and drew seven cards of 7px type. Above the floor
+   *  the fit shows what it can and the pan/zoom pill reaches the rest, which is what that pill is
+   *  for; `GraphSurface` has clamped its own automatic fit this way since ADR-135. */
+  /** A DRAWER TAKES CANVAS, SO THE CANVAS RE-FRAMES. `GraphSurface`'s own rule — an editor is not
+   *  re-framed while it is being edited — is about the graph's SHAPE changing under the author, and
+   *  this is the other thing: the box itself got a third smaller because they opened a panel over it,
+   *  the same reason the mini map's `reserve` re-fits. Only in `overlay`, where the change is a third
+   *  of the width; in `columns` the panes are tracks the canvas was already sized against. */
+  useEffect(() => {
+    if (lane !== "overlay" || !flowRef.current) return;
+    void flowRef.current.fitView({ duration: 180, padding: 0.18, minZoom: GRAPH_FIT_MIN_ZOOM });
+  }, [lane, view.paletteOpen, view.inspectorOpen]);
+
+  const setPane = useCallback((pane: "palette" | "inspector", next: boolean | "toggle") => {
+    animationEditorStore.getState().updateGraph(workspaceKey, (current) => {
+      const open = next === "toggle" ? !(pane === "palette" ? current.paletteOpen : current.inspectorOpen) : next;
+      if (lane === "columns" || !open) {
+        return pane === "palette" ? { ...current, paletteOpen: open } : { ...current, inspectorOpen: open };
+      }
+      return { ...current, paletteOpen: pane === "palette", inspectorOpen: pane === "inspector" };
+    });
+  }, [lane, workspaceKey]);
 
   const authorPreset = (graph: AnimationGraphDocument) => {
     fitOnNextGraphRender.current = true;
@@ -1082,12 +1118,14 @@ export function AnimationGraphEditor({
       if (paletteSearchRef.current) paletteSearchRef.current.focus();
       else {
         focusPaletteSearchOnOpen.current = true;
-        animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, paletteOpen: true }));
+        // Through `setPane` and not the store directly: at overlay width the palette takes the one
+        // drawer slot there is, so `/` has to close the inspector for the same reason the toggle does.
+        setPane("palette", true);
       }
     } else if (event.key.toLocaleLowerCase() === "f") {
       event.preventDefault();
       event.stopPropagation();
-      void flowRef.current?.fitView({ duration: 180, padding: 0.18 });
+      void flowRef.current?.fitView({ duration: 180, padding: 0.18, minZoom: GRAPH_FIT_MIN_ZOOM });
     } else if (event.key === "Delete" || event.key === "Backspace") {
       event.preventDefault();
       event.stopPropagation();
@@ -1159,7 +1197,7 @@ export function AnimationGraphEditor({
   };
 
   return (
-    <div className="animation-graph-editor" data-testid="animation-graph-editor" data-palette-open={view.paletteOpen} data-inspector-open={view.inspectorOpen} onKeyDown={onKeyDownCapture}>
+    <div ref={laneRef} className="animation-graph-editor" data-testid="animation-graph-editor" data-lane={lane} data-palette-open={view.paletteOpen} data-inspector-open={view.inspectorOpen} onKeyDown={onKeyDownCapture}>
       <Toolbar className="animation-graph-toolbar" aria-label="Animation graph actions">
         {/* THE NAME, THEN THE STATE OF IT. What was here before put the graph's name, its sequence id
             and its revision in one 230px `overflow: hidden` box, so the identity of the thing being
@@ -1185,8 +1223,8 @@ export function AnimationGraphEditor({
         </ToolbarGroup>
         <ToolbarSeparator />
         <ToolbarGroup aria-label="Graph panes and actions" data-testid="animation-graph-toolbar-actions">
-          <Button compact variant="ghost" active={view.paletteOpen} aria-pressed={view.paletteOpen} aria-expanded={view.paletteOpen} aria-controls="animation-graph-palette" onClick={() => animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, paletteOpen: !current.paletteOpen }))}>Palette</Button>
-          <Button compact variant="ghost" active={view.inspectorOpen} aria-pressed={view.inspectorOpen} aria-expanded={view.inspectorOpen} aria-controls="animation-graph-inspector" onClick={() => animationEditorStore.getState().updateGraph(workspaceKey, (current) => ({ ...current, inspectorOpen: !current.inspectorOpen }))}>Inspector</Button>
+          <Button compact variant="ghost" active={view.paletteOpen} aria-pressed={view.paletteOpen} aria-expanded={view.paletteOpen} aria-controls="animation-graph-palette" onClick={() => setPane("palette", "toggle")}>Palette</Button>
+          <Button compact variant="ghost" active={view.inspectorOpen} aria-pressed={view.inspectorOpen} aria-expanded={view.inspectorOpen} aria-controls="animation-graph-inspector" onClick={() => setPane("inspector", "toggle")}>Inspector</Button>
           {(dirty || saving) && <>
             <Button compact variant="ghost" disabled={saving} disabledReason="An Apply is in flight; wait for it to finish." onClick={discard}>Discard</Button>
             <Button
@@ -1431,7 +1469,7 @@ export function AnimationGraphEditor({
                   flowRef.current = instance as unknown as ReactFlowInstance<GraphCardNode, FlowEdge>;
                   if (fitOnNextGraphRender.current) {
                     fitOnNextGraphRender.current = false;
-                    window.requestAnimationFrame(() => void instance.fitView({ duration: 180, padding: 0.18 }));
+                    window.requestAnimationFrame(() => void instance.fitView({ duration: 180, padding: 0.18, minZoom: GRAPH_FIT_MIN_ZOOM }));
                   }
                 },
                 onConnect: connect,

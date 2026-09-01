@@ -831,6 +831,31 @@ const openGraphPanes = () => {
   store.setGraphSelection(GRAPH_WORKSPACE, ["node-locomotion-machine"], []);
 };
 
+/** The graph as the DOCK serves it: one client answering both the workspace's reads and the graph's,
+ *  because in the product they are the same client. Reaching the graph through `AnimationWorkspace`
+ *  rather than mounting `AnimationGraphEditor` directly is the whole point — `.animation-workspace-root`
+ *  is where `container-name: animationWorkspace` is declared, so it is the only route by which the
+ *  narrow-regime rules in `global.css` can apply to anything at all. */
+const animationDockClient = () =>
+  ({
+    animationState: () => Promise.resolve(ANIMATED),
+    animationPlaybackState: () =>
+      Promise.resolve({ playing: false, currentTick: ANIMATED.currentTick, durationTick: ANIMATED.durationTick, loopPolicy: ANIMATED.loopPolicy, crossedEvents: [], eventsTruncated: false }),
+    animationGraphState: () => Promise.resolve(GRAPH_STATE),
+    animationGraphDebug: () => Promise.resolve(GRAPH_DEBUG),
+    animationGraphSetPreviewParameters: () => Promise.resolve({ ok: true, message: "", accepted: {} }),
+    animationGraphClearPreviewParameters: () => Promise.resolve({ ok: true, message: "", accepted: {} }),
+  }) as unknown as EditorClient;
+
+/** THE ANIMATE DOCK'S OWN BOX, because `.animation-workspace-root` is `height: 100%` and a frame with
+ *  no definite height gives it max-content — a workspace that can never run out of room, which is the
+ *  one thing every rule in the narrow regime is about. The bottom dock is
+ *  `clamp(330px, 50vh, 560px)` tall (`global.css`) minus its 42px bar, so 430 is the middle of the
+ *  range the product actually serves. */
+function animationDock(height: number, node: ReactNode) {
+  return <div style={{ display: "grid", height, minHeight: 0, background: "var(--mtk-bg-panel)" }}>{node}</div>;
+}
+
 /** A DEFINITE HEIGHT, because that is what the editor actually gets. `AnimationWorkspace` puts this
  *  surface in a `minmax(0, 1fr)` row of a `height: 100%` grid, so its own `overflow: hidden` and its
  *  panes' `overflow: auto` are load-bearing. Rendered into the harness frame's `min-height: 100vh`
@@ -887,6 +912,54 @@ function animationGraphScenes(): Scene[] {
         unclipped: ["[data-testid='animation-graph-toolbar-actions'] button", ".mtk-graph-legend", ".mtk-graph-controls button"],
       },
       render: () => animationGraphEditor(800),
+    },
+    {
+      id: "animation-graph-in-dock",
+      looking_for:
+        "THE REGIME THIS EDITOR ACTUALLY SHIPS IN, and the one nothing had ever photographed. The "
+        + "Animate dock is the full window minus both side docks, so at every ordinary window the "
+        + "graph gets well under the 920px its three columns need — and the rules for that width "
+        + "were unreachable from every existing capture, because the graph scene above renders "
+        + "`AnimationGraphEditor` bare and the lane lives on the workspace around it. Reached here "
+        + "the way a user reaches it: the Animate workspace at dock size, the Graph surface, then "
+        + "the two pane toggles in order. WHAT THE BEFORE-CAPTURE SHOWED: two 310px panels pinned to "
+        + "opposite edges of a 900px editor, covering every node card in the graph, the zoom pill "
+        + "and the preview-parameter row — ten pairs of controls taking each other's clicks. What "
+        + "must be true now is that ONE drawer is open (the second toggle closed the first, because "
+        + "there is only one drawer's worth of room beside a canvas here), that it is a card in the "
+        + "canvas's own cell rather than a column pinned edge to edge, and that the canvas beside it "
+        + "is still a canvas — the graph re-fitted into the room it was left",
+      viewport: { width: 900, height: 620 },
+      setup: selectAnimatedEntity,
+      click: [
+        "#animation-surfaces-graph-tab",
+        "[aria-controls='animation-graph-palette']",
+        "[aria-controls='animation-graph-inspector']",
+      ],
+      expect: {
+        present: [
+          ["[data-testid='animation-graph-editor'][data-lane='overlay']", 1],
+          [".animation-graph-inspector", 1],
+          [".react-flow__node", 7],
+        ],
+        // ONE DRAWER, AND THIS IS THE HALF A CAPTURE CANNOT MAKE ON ITS OWN: a palette that closed
+        // and a palette that is merely off the right-hand edge photograph identically.
+        absent: [".animation-graph-palette", "[data-icon-missing]"],
+        text_absent: ["null", "undefined", "NaN"],
+        // The drawer is whole, and so is the chrome it used to sit on top of.
+        unclipped: [
+          ".animation-graph-inspector",
+          ".mtk-graph-controls button",
+          ".animation-graph-parameters .mtk-btn",
+        ],
+        // The canvas keeps a canvas's worth of room beside the drawer. 320 of 900 is the drawer; a
+        // floor of 400 fails the moment a drawer starts growing to fit its own content again.
+        min_width: [[".mtk-graph-surface__canvas", 400]],
+        // ...and the drawer stays a drawer: `min(320px, 100% - 40px)` is a ceiling nothing inside it
+        // may push through, which is the failure mode a floor on the canvas cannot see.
+        max_width: [[".animation-graph-inspector", 320]],
+      },
+      render: () => animationDock(430, <AnimationWorkspace client={animationDockClient()} />),
     },
   ];
 }

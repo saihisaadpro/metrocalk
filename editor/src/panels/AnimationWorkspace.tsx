@@ -41,7 +41,7 @@ import {
 } from "../theme/primitives";
 import { Icon } from "../theme/icons";
 import { Modal } from "../theme/Popover";
-import { DisclosureSection, DockTabs, EmptyPanelState } from "../theme/workspace";
+import { DisclosureSection, DockTabs, EmptyPanelState, usePaneLane } from "../theme/workspace";
 import {
   CURVE_VIEWBOX,
   CurveCanvas,
@@ -549,6 +549,11 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
     }),
     [model.sequenceId, projectSessionId],
   );
+  /** WHICH ARRANGEMENT THIS WORKSPACE IS IN, measured from its own box rather than the window's — the
+   *  Animate dock is a band whose width changes when a side dock collapses, with no event for it. The
+   *  stylesheet reads `data-lane`; the graph editor inside reads the same measurement for the decision
+   *  a stylesheet cannot make (whether both of its drawers may be open). */
+  const { lane, laneRef } = usePaneLane();
   const workspaceView = useStore(animationEditorStore, (state) => animationWorkspaceView(state, workspaceKey));
   const graphWorkspaceView = useStore(animationEditorStore, (state) => animationWorkspaceView(state, graphWorkspaceKey));
   const activeContext = workspaceView.activeContext;
@@ -1488,9 +1493,16 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
 
   return (
     <div
-      ref={workspaceRef}
+      ref={(el) => {
+        // Two readers of one element: the playhead writes a custom property onto it every frame, and
+        // the lane observer watches its width. Composed here rather than given a wrapper, because a
+        // wrapper is a second box and `height: 100%` on this one is load-bearing.
+        workspaceRef.current = el;
+        laneRef(el);
+      }}
       data-testid="animation-workspace"
       className="animation-workspace-root"
+      data-lane={lane}
       role="region"
       aria-label="Animation editor"
       tabIndex={0}
