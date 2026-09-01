@@ -54,6 +54,17 @@ export interface ProjectionState {
   pending: Record<string, PendingOp>;
   rejections: RejectInfo[];
   selectedId: string | null;
+  /** ADR-197 — a monotonic count of committed deltas: "the scene changed", and nothing more.
+   *
+   *  A panel showing something DERIVED FROM THE WORLD rather than from its own document needs a
+   *  reason to ask again, and until this existed there was none. The Cutscene panel's warning list
+   *  was the case that proved it: `Cutscene::problems` used to be a pure reading of the cutscene, so
+   *  re-reading after the panel's own edits was sufficient — and once the list started carrying what
+   *  the WORLD says about a shot's camera (ADR-195, ADR-197), an author could move a machine into a
+   *  shot's line of sight and the panel would keep saying the shot was fine until they next touched
+   *  the cutscene. It counts deltas rather than diffing anything: any committed change can move a
+   *  derived reading, and a subscriber that re-asks the engine costs one IPC. */
+  revision: number;
   /** M10.6 multi-selection (always includes `selectedId` as the primary/anchor). Verbs that act on a
    *  selection (group, multi-edit, multi-delete) read this; the inspector/reveal read `selectedId`. */
   multiSelect: string[];
@@ -112,6 +123,7 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
   pending: {},
   rejections: [],
   selectedId: null,
+  revision: 0,
   multiSelect: [],
   deactivated: {},
 
@@ -126,7 +138,7 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
       summaries[e.id] = { id: e.id, name: e.name, parentId: e.parentId, kind: deriveKind(e.components), rel: deriveRel(e.components) };
       order.push(e.id);
     }
-    set({ base, displayed: { ...base }, summaries, order, edges: {}, pending: {}, rejections: [], deactivated: {} });
+    set({ base, displayed: { ...base }, summaries, order, edges: {}, pending: {}, rejections: [], deactivated: {}, revision: get().revision + 1 });
   },
 
   optimisticEdit(op) {
@@ -289,7 +301,7 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
 
     // `deactivated` was rebuilt above from each upsert's authoritative `active` flag (full = from scratch),
     // so deactivate state is correct on reload/undo and incremental deltas keep optimistic marks.
-    set({ base, displayed, summaries, order, edges: edgesChanged ? edges : s.edges, pending, rejections, deactivated });
+    set({ base, displayed, summaries, order, edges: edgesChanged ? edges : s.edges, pending, rejections, deactivated, revision: s.revision + 1 });
 
     // Drive the live-thumbnail dirty-tracking off the SAME committed op-stream (M14.2 / ADR-058): only a
     // silhouette-affecting op (mesh · material · transform · visibility) invalidates a thumbnail — a Health
@@ -342,7 +354,7 @@ export const projectionStore = createStore<ProjectionState>((set, get) => ({
   },
 
   reset() {
-    set({ base: {}, displayed: {}, summaries: {}, order: [], edges: {}, pending: {}, rejections: [], selectedId: null, multiSelect: [], deactivated: {} });
+    set({ base: {}, displayed: {}, summaries: {}, order: [], edges: {}, pending: {}, rejections: [], selectedId: null, multiSelect: [], deactivated: {}, revision: get().revision + 1 });
   },
 }));
 
@@ -375,3 +387,8 @@ export const useFieldValue = (id: string, component: string, field: string): Jso
   useStore(projectionStore, (s) => s.displayed[id]?.components[component]?.[field]);
 
 export const useEdges = (): Record<string, BindEdge> => useStore(projectionStore, (s) => s.edges);
+
+/** ADR-197 — "the scene changed", for a surface whose reading depends on the world rather than on its
+ *  own document. A number that only ever goes up: put it in an effect's dependency list and the effect
+ *  re-runs once per committed delta. See `ProjectionState.revision` for why this is not a diff. */
+export const useDocumentRevision = (): number => useStore(projectionStore, (s) => s.revision);

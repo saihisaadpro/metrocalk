@@ -28,7 +28,7 @@
 //! committed per pixel would bury the author's previous state under forty identical undo steps.
 
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useSelectedId, useSummary } from "../store/projection";
+import { useDocumentRevision, useSelectedId, useSummary } from "../store/projection";
 import { usePlaying } from "../store/play";
 import { cinemaPreviewStore, useCinemaPreview } from "../store/cinemaPreview";
 import { subjectAimStore, useSubjectAim } from "../store/subjectAim";
@@ -149,6 +149,8 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
   const [busy, setBusy] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
+  /** "The scene changed" — see the read effect below. */
+  const docRevision = useDocumentRevision();
   // The value a slider currently reads while the pointer is down, before it becomes a commit.
   const [draftSeconds, setDraftSeconds] = useState<number | null>(null);
   /** Whether the render dialog is open. ADR-175. */
@@ -214,7 +216,14 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
   }, [client]);
 
   // Keyed on the entity asked for, cleared on a selection change, and re-read across a Play
-  // transition and after every local mutation — the same discipline the Cinematics block uses.
+  // transition, after every local mutation, and on every committed change to the SCENE.
+  //
+  // ADR-197 — THE LAST OF THOSE IS NOT TIDINESS. The warning list used to be a pure reading of the
+  // cutscene, so the panel's own edits were the only thing that could change it. It now carries what
+  // the world says about each shot's camera (ADR-195, ADR-197), and without `docRevision` an author
+  // could push a machine into a shot's line of sight and read "nothing wrong with this cut" until
+  // they next touched the cutscene itself. Found on the packaged `.exe`, where the engine's reply
+  // carried the warning and the panel beside it drew none.
   useEffect(() => {
     let live = true;
     if (!selected) {
@@ -231,7 +240,7 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
     return () => {
       live = false;
     };
-  }, [client, selected, playing, revision]);
+  }, [client, selected, playing, revision, docRevision]);
 
   const rows = cut.rows;
   const duration = cut.seconds;

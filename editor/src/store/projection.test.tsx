@@ -141,3 +141,36 @@ describe("tear-free under a concurrent transition", () => {
     expect(observed.at(-1)).toEqual([5, 5]);
   });
 });
+
+describe("ADR-197 — the scene-changed signal", () => {
+  it("counts every committed delta, so a world-derived reading has a reason to re-ask", () => {
+    // The panel that needs this shows what the WORLD says about a shot's camera. Before it existed
+    // the Cutscene panel re-read only after its OWN edits, so moving a machine into a shot's line of
+    // sight left "nothing wrong with this cut" on screen. The signal is deliberately not a diff: any
+    // committed change can move a derived reading.
+    const before = projectionStore.getState().revision;
+    projectionStore.getState().applyDelta({
+      ops: [{ op: "setField", id: "e1", component: "Transform", field: "x", value: 9 }],
+    });
+    expect(projectionStore.getState().revision).toBe(before + 1);
+    // A second, unrelated delta moves it again — it is a counter, not a flag.
+    projectionStore.getState().applyDelta({
+      ops: [{ op: "setField", id: "e1", component: "Transform", field: "y", value: 9 }],
+    });
+    expect(projectionStore.getState().revision).toBe(before + 2);
+  });
+
+  it("moves on a full re-projection too, which is what an undo and an open both are", () => {
+    const before = projectionStore.getState().revision;
+    projectionStore.getState().applyDelta({ full: true, ops: [] });
+    expect(projectionStore.getState().revision).toBe(before + 1);
+  });
+
+  it("never goes backwards across a reset", () => {
+    // A subscriber keyed on this must never see a value it has already responded to, or it stops
+    // re-asking exactly when the scene has been replaced under it.
+    const before = projectionStore.getState().revision;
+    projectionStore.getState().reset();
+    expect(projectionStore.getState().revision).toBeGreaterThan(before);
+  });
+});

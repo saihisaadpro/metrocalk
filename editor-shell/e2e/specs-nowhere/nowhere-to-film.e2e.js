@@ -119,13 +119,20 @@ describe("ADR-197 · nowhere good to film from", () => {
   /** The shell that swallows every placement the ladder can reach. Spawned in test 2, gone in test 4. */
   let shell;
   const HOME = [0, 1.6, 0];
-  /** How big the shell has to be, and the number is load-bearing.
+  /** How big the shell has to be, and the number is load-bearing in BOTH directions.
    *
-   *  The ladder widens as well as swinging, and `ExtremeWide` on a metre-scale subject solves a
-   *  stand-off around 30 m. A shell that only swallowed the authored framing would be escaped by a
-   *  wider candidate, the planner would come back with an ACCEPTABLE placement, and this spec would
-   *  fail while the engine did exactly the right thing. 120 m puts every rung inside it. */
-  const SHELL_M = 120;
+   *  Big enough: the ladder widens as well as swinging, and `ExtremeWide` (occupancy 0.12) on this
+   *  capsule's 0.74 m bounding radius solves a stand-off of about 14.6 m at the cinematic 50-degree
+   *  lens. A shell that only swallowed the authored framing would be escaped by a wider candidate,
+   *  the planner would come back with an ACCEPTABLE placement, and this spec would fail while the
+   *  engine did exactly the right thing.
+   *
+   *  Small enough: a box side is declared `0.05..50.0` m in the shape catalogue, and out-of-range
+   *  parameters are REFUSED rather than clamped. The first version of this spec asked for 120 —
+   *  `shape_update` correctly refused it, the box stayed at its 1 m default, nothing was enclosed,
+   *  and three tests failed reporting that the engine had said nothing. It was right. The resize is
+   *  now asserted below so a refused precondition can never again read as a missing warning. */
+  const SHELL_M = 48;
 
   before(async () => {
     await browser.waitUntil(
@@ -192,7 +199,13 @@ describe("ADR-197 · nowhere good to film from", () => {
     // A shape rests on the ground in its own local frame, so the block's origin sits half its height
     // below the subject for the subject to be at its centre.
     shell = (await invoke("shape_spawn", { kind: "box", pos: [0, 0, 0] })).created;
-    await invoke("shape_update", { id: shell, params: { width: SHELL_M, height: SHELL_M, depth: SHELL_M } });
+    const grewShell = await invoke("shape_update", {
+      id: shell,
+      params: { width: SHELL_M, height: SHELL_M, depth: SHELL_M },
+    });
+    // THE PRECONDITION, ASSERTED. A refused resize leaves a 1 m box and every claim below
+    // then reads as "the engine said nothing", which is the opposite of what happened.
+    expect(grewShell.reason ?? null).toBeFalsy();
     await moveTo(shell, HOME[0], HOME[1] - SHELL_M / 2, HOME[2]);
     await browser.pause(600);
 
@@ -212,7 +225,24 @@ describe("ADR-197 · nowhere good to film from", () => {
 
     // THE SURFACE, not only the reply: the sentence is drawn in the same warning list as the
     // continuity notes, which is the "one place the author looks" claim made checkable.
-    await browser.pause(600);
+    //
+    // RE-SELECT THE SUBJECT FIRST, and this is not tidying. Spawning a shape SELECTS it, so the
+    // Cutscene panel is now showing the shell's cutscene — which has no shots and no warnings. The
+    // first version of this file read an empty list here and, worse, read an empty list again in
+    // "goes quiet" and called that a pass: a false green that would have survived the feature being
+    // deleted.
+    expect(await selectRow(subject)).toBe(true);
+    await browser.pause(900);
+    note(
+      `[panel state] ${JSON.stringify(
+        await browser.execute(() => ({
+          panels: document.querySelectorAll('[data-testid="cutscene-panel"]').length,
+          clips: document.querySelectorAll('[data-testid="cutscene-clip"]').length,
+          problems: document.querySelectorAll('[data-testid="cutscene-problem"]').length,
+          head: document.querySelector('[data-testid="cutscene-panel"]')?.textContent?.slice(0, 220) ?? null,
+        })),
+      )}`,
+    );
     const drawn = await panelProblems();
     note(`[panel] ${JSON.stringify(drawn)}`);
     expect(drawn.some((p) => /nowhere good to film from/.test(p))).toBe(true);
@@ -224,13 +254,13 @@ describe("ADR-197 · nowhere good to film from", () => {
     // the camera still moves to a real, finite pose and the cutscene still plays. A warning that
     // silently stopped filming the shot would be a far worse failure than the silence it replaced.
     const pose = await filmedPose(subject, "3-filmed-anyway.png");
-    note(`[filmed] eye ${xyz(pose.eye)} -> ${xyz(pose.look_at)}`);
+    note(`[filmed] eye ${xyz(pose.eye)} -> ${xyz(pose.lookAt)}`);
     expect(finite(pose.eye)).toBe(true);
-    expect(finite(pose.look_at)).toBe(true);
+    expect(finite(pose.lookAt)).toBe(true);
     // Aimed at the thing it is about, however bad the view of it is. A loose bound on purpose: this
     // is a sanity check that the camera is still pointed at the subject, not a claim about framing,
     // and a spawned shape rests on the ground so its centre is not exactly `HOME`.
-    expect(dist(pose.look_at, HOME)).toBeLessThan(5);
+    expect(dist(pose.lookAt, HOME)).toBeLessThan(5);
     // The shot is still in the document, at its authored length, with nothing removed or disabled.
     const cut = await invoke("cinema_list", { id: subject });
     expect(cut.shots).toBe(1);
@@ -246,8 +276,16 @@ describe("ADR-197 · nowhere good to film from", () => {
     const cleared = (await invoke("cinema_list", { id: subject })).problems;
     note(`[cleared] ${JSON.stringify(cleared)}`);
     expect(cleared.some((p) => /nowhere good to film from/.test(p))).toBe(false);
-    await browser.pause(500);
-    expect((await panelProblems()).some((p) => /nowhere good to film from/.test(p))).toBe(false);
+    // The subject's OWN panel, and it must still be drawing the cut: an empty list because the panel
+    // is showing something else would pass this test with the warning still on screen.
+    expect(await selectRow(subject)).toBe(true);
+    await browser.pause(900);
+    // ...and PROVE the panel is drawing this cut, because "no warnings" and "no panel" look the
+    // same from a query that only counts warnings. One clip on the timeline is the subject's shot.
+    expect(await browser.execute(() => document.querySelectorAll('[data-testid="cutscene-clip"]').length)).toBe(1);
+    const stillDrawn = await panelProblems();
+    note(`[panel, cleared] ${JSON.stringify(stillDrawn)}`);
+    expect(stillDrawn.some((p) => /nowhere good to film from/.test(p))).toBe(false);
   });
 
   it("comes back by itself after Save, New and Open — it is derived, not stored", async () => {
@@ -256,7 +294,13 @@ describe("ADR-197 · nowhere good to film from", () => {
     // project must produce it again from the geometry alone — and if it did NOT come back, the
     // silence would look exactly like a scene with nothing wrong in it.
     const again = (await invoke("shape_spawn", { kind: "box", pos: [0, 0, 0] })).created;
-    await invoke("shape_update", { id: again, params: { width: SHELL_M, height: SHELL_M, depth: SHELL_M } });
+    const grewAgain = await invoke("shape_update", {
+      id: again,
+      params: { width: SHELL_M, height: SHELL_M, depth: SHELL_M },
+    });
+    // THE PRECONDITION, ASSERTED. A refused resize leaves a 1 m box and every claim below
+    // then reads as "the engine said nothing", which is the opposite of what happened.
+    expect(grewAgain.reason ?? null).toBeFalsy();
     await moveTo(again, HOME[0], HOME[1] - SHELL_M / 2, HOME[2]);
     await browser.pause(600);
     expect(
