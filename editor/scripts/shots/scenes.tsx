@@ -54,6 +54,7 @@ import type {
   RevealResponse,
   RoleRow,
   RoleSpec,
+  ShotProblem,
   ShotRow,
   ShotSpec,
   StateMachine,
@@ -543,7 +544,13 @@ const CUTSCENE: CinemaReply = (() => {
     reads: rows.map((row) => row.reads),
     rows,
     problems: [
-      'shots 4 and 5 on "Weld Gun 7" are framed identically back to back — that reads as a jump cut; change the size or the angle',
+      // ADR-200 — filed under shot 5 (index 4), the one an author re-frames to fix the cut. The
+      // sentence names both; the field names the fix.
+      {
+        shot: 4,
+        message:
+          'shots 4 and 5 on "Weld Gun 7" are framed identically back to back — that reads as a jump cut; change the size or the angle',
+      },
     ],
     message: "",
     reason: null,
@@ -725,7 +732,7 @@ const FOLLOWING_CAMERA = {
 
 const placedCameraClient = (
   camera: typeof PLACED_CAMERA = PLACED_CAMERA,
-  extraProblems: string[] = [],
+  extraProblems: ShotProblem[] = [],
 ) => {
   const following = camera.track !== null;
   const reads = following
@@ -756,7 +763,7 @@ const placedCameraClient = (
  *
  *  Every shot here is a CARD shot (`camera: null`), which is the whole distinction: the author never
  *  chose these positions, so the advice cannot be about the controls that produced them. */
-const cutsceneClientWithProblems = (extraProblems: string[]) => {
+const cutsceneClientWithProblems = (extraProblems: ShotProblem[]) => {
   const cut: CinemaReply = { ...CUTSCENE, problems: [...CUTSCENE.problems, ...extraProblems] };
   return {
     ...cutsceneClient(),
@@ -1609,7 +1616,10 @@ export const SCENES: Scene[] = [
     render: () => (
       <CutscenePanel
         client={placedCameraClient(FOLLOWING_CAMERA, [
-          "shot 1's camera is inside something — that frame will be solid colour",
+          {
+            shot: 0,
+            message: "shot 1's camera is inside something — that frame will be solid colour",
+          },
         ])}
       />
     ),
@@ -1662,8 +1672,16 @@ export const SCENES: Scene[] = [
     render: () => (
       <CutscenePanel
         client={cutsceneClientWithProblems([
-          "shot 2 has nowhere good to film from — the engine tried every framing and angle, and in the best one it found 78% of the subject is behind something else; frame it yourself with \"Shoot from this view\", or film a different part",
-          "shot 3 has nowhere good to film from — the engine tried every framing and angle, and in the best one it found most of the frame is whatever the camera is standing against rather than the subject; frame it yourself with \"Shoot from this view\", or film a different part",
+          {
+            shot: 1,
+            message:
+              "shot 2 has nowhere good to film from — the engine tried every framing and angle, and in the best one it found 78% of the subject is behind something else; press \"Take me there\" to stand where it tried, then frame it yourself with \"Shoot from this view\" — or film a different part",
+          },
+          {
+            shot: 2,
+            message:
+              "shot 3 has nowhere good to film from — the engine tried every framing and angle, and in the best one it found most of the frame is whatever the camera is standing against rather than the subject; press \"Take me there\" to stand where it tried, then frame it yourself with \"Shoot from this view\" — or film a different part",
+          },
         ])}
       />
     ),

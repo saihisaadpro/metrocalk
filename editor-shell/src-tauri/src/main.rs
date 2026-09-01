@@ -2976,6 +2976,18 @@ enum EngineCmd {
         active: bool,
         reply: Sender<metrocalk_editor_shell::CinemaPreviewReply>,
     },
+    /// Cinematics (ADR-200) — stand the stage camera where one shot is filmed from.
+    ///
+    /// The inverse of `CinemaSetShotCamera`, which reads the stage into a shot. Changes nothing in
+    /// the document — a pure camera op, like `CinemaPreview` and for the same reason — but unlike a
+    /// preview it does NOT take the camera: it moves the ordinary orbit camera and leaves, so the
+    /// author can carry on orbiting from there and store the result.
+    CinemaStandAt {
+        id: String,
+        /// Which shot to stand at, zero-based.
+        index: usize,
+        reply: Sender<metrocalk_editor_shell::StandAtReply>,
+    },
     /// Cinematics (ADR-175) — start writing a cutscene out as a numbered PNG sequence.
     ///
     /// The job then advances on the engine's own heartbeat, one frame per capture round-trip, and is
@@ -5914,9 +5926,9 @@ fn shot_subject_name(engine: &Engine<FlecsWorld>, key: &str) -> Option<String> {
 /// EVERY cutscene reply this process sends. One producer, so the panel's warning list cannot be one
 /// thing after adding a shot and another after moving one.
 ///
-/// It is `cinema_reply_named` plus the half that needs the world — see [`shot_placement_notes`]. The
-/// two halves are appended rather than merged because they answer different questions and only one of
-/// them can be answered by a crate that has never seen a scene.
+/// It is `cinema_reply_named` plus the half that needs the world — see [`shot_placement_notes`] —
+/// and then the two are MERGED in shot order rather than appended, because the reader of that list
+/// is looking at a timeline and not at a call graph. See [`cutscene_problems`].
 fn cinema_reply(
     engine: &Engine<FlecsWorld>,
     shared: &render::Shared,
@@ -5929,9 +5941,13 @@ fn cinema_reply(
         metrocalk_editor_shell::cinema_reply_named(entity, cut, owner_name, message, &|key| {
             shot_subject_name(engine, key)
         });
-    reply
-        .problems
-        .extend(shot_placement_notes(engine, shared, entity, cut));
+    reply.problems = cutscene_problems(
+        engine,
+        shared,
+        entity,
+        cut,
+        std::mem::take(&mut reply.problems),
+    );
     reply
 }
 
@@ -5960,7 +5976,7 @@ fn shot_placement_notes(
     shared: &render::Shared,
     entity: EntityId,
     cut: &metrocalk_animation::shot::Cutscene,
-) -> Vec<String> {
+) -> Vec<metrocalk_animation::shot::ShotProblem> {
     if cut.shots.is_empty() {
         return Vec::new();
     }
@@ -6024,6 +6040,133 @@ fn shot_placement_notes(
         plans.get(index).copied().flatten()
     }));
     out
+}
+
+/// The whole warning list for one cutscene, in the order its author reads the timeline in.
+///
+/// ADR-200 — the two halves used to be appended, and the document's own continuity warnings appended
+/// before both, so a cut whose shot 1 opens tight and whose shot 3 is boxed in listed the boxed-in
+/// one first. That is an order the reader cannot see: it is the order the functions ran in. Merging
+/// them needs a shot number on every entry, which is what `ShotProblem` carries.
+fn cutscene_problems(
+    engine: &Engine<FlecsWorld>,
+    shared: &render::Shared,
+    entity: EntityId,
+    cut: &metrocalk_animation::shot::Cutscene,
+    from_the_document: Vec<metrocalk_animation::shot::ShotProblem>,
+) -> Vec<metrocalk_animation::shot::ShotProblem> {
+    let mut all = from_the_document;
+    all.extend(shot_placement_notes(engine, shared, entity, cut));
+    metrocalk_animation::shot::in_shot_order(all)
+}
+
+/// ADR-200 — put the stage camera where shot `index` is filmed from, at its worst moment.
+///
+/// **Which instant, and why not the opening.** A shot is a PATH, and both halves of the warning
+/// vocabulary describe its worst frame: *"your move takes its camera into a corner — most of the
+/// frame it ends on..."*. Standing at the opening of that move would show the author a frame nobody
+/// is complaining about and label it the problem. `worst_moment` re-walks the same samples the
+/// planner scored, with the same comparison, so the pose this lands on is the one the sentence beside
+/// the button is about. A still shot has one pose at every sample and this degenerates to it.
+///
+/// **A placed camera is not negotiated here either.** `solve_shot_adjusted` returns it untouched, so
+/// this lands on the author's own eye — which is the right answer for the placed half of the
+/// vocabulary: standing there IS the solid-colour frame they were warned about.
+///
+/// **The delivery frame, not the live composition** — the same reasoning [`shot_placement_notes`]
+/// records. This runs with the ordinary editor view up, so reading the live composition would solve a
+/// 2.39:1 shot at 16:9 and stand the author at a placement the film never uses.
+fn stand_at_shot(
+    engine: &Engine<FlecsWorld>,
+    shared: &render::Shared,
+    entity: EntityId,
+    cut: &metrocalk_animation::shot::Cutscene,
+    index: usize,
+    shot: &metrocalk_animation::shot::ShotRecipe,
+) -> metrocalk_editor_shell::StandAtReply {
+    use metrocalk_editor_shell::StandAtReply;
+    let mut st = shared.lock().unwrap();
+    if st.projection == render::Projection::Orthographic {
+        // Landing in a parallel projection would draw a diagram of the frame rather than the frame,
+        // and `cinema_set_shot_camera` then refuses to store from it. `stand_at` restores perspective
+        // for exactly that reason; this comment records that the restoration is deliberate.
+        diag_log!("cinema", "stand_at leaving the orthographic view for a lens");
+    }
+    st.sync_mesh_bounds();
+    let sample = cinematic_shot_subject_sample(engine, &mut st, entity, shot);
+    let key = cinematic_shot_subject(engine, entity, shot).to_loro_key();
+    let parts: std::collections::HashSet<u32> = st
+        .cinema_subtree
+        .get(&key)
+        .map(|indices| {
+            indices
+                .iter()
+                .filter_map(|i| u32::try_from(*i).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    st.sync_occlusion();
+    let aspect = cut.delivery.ratio().unwrap_or_else(|| {
+        render::frame_aspect(st.known_surface_aspect(), st.adopted_visible_rect())
+    });
+    let placed = shot.camera.is_some_and(|camera| camera.is_usable());
+    let plan = if placed {
+        metrocalk_animation::shot::ShotAdjustment::authored(shot)
+    } else {
+        st.planned_placement(&key, shot, sample, aspect, &parts)
+    };
+    let radius = sample.radius();
+    let (progress, pose, vantage) = {
+        let world = &*st;
+        metrocalk_animation::shot::worst_moment(
+            shot,
+            plan,
+            sample,
+            aspect,
+            render::CINEMATIC_FOV_DEG,
+            |pose, _| world.vantage(pose.eye, pose.look_at, sample.center, radius, &parts),
+        )
+    };
+    let Some(stood) = st.stand_at(pose.eye, pose.look_at) else {
+        return StandAtReply::refusal(
+            "that shot's camera is standing exactly where it is looking — there is no view to take",
+        );
+    };
+    let off_by = (glam::Vec3::from(stood) - glam::Vec3::from(pose.eye)).length();
+    let n = index + 1;
+    // WHAT THE AUTHOR IS LOOKING AT, said plainly, because the whole point of the move is that the
+    // frame in front of them is evidence. "Standing where shot 2 films from" is the claim; the
+    // qualifiers are the parts of it the engine cannot promise.
+    let mut message = if placed {
+        format!("Standing at shot {n}'s camera")
+    } else {
+        format!("Standing where shot {n} films from")
+    };
+    if progress > 0.0 {
+        message.push_str(&format!(" — {:.0}% through its move", progress * 100.0));
+    }
+    if !vantage.acceptable() {
+        message.push_str(" — this is the best placement the engine found");
+    }
+    if off_by > 0.01 {
+        message.push_str(&format!(
+            " — {off_by:.1} m off, the stage camera cannot pitch that far"
+        ));
+    }
+    message.push('.');
+    StandAtReply {
+        moved: true,
+        stood,
+        look_at: pose.look_at,
+        fov_deg: pose.fov_deg,
+        off_by,
+        progress,
+        placed,
+        steps: u32::from(plan.steps),
+        acceptable: vantage.acceptable(),
+        message,
+        reason: None,
+    }
 }
 
 /// Negotiate every card shot's placement the way the runtime will, through the memo.
@@ -11032,6 +11175,40 @@ fn engine_thread(rx: mpsc::Receiver<EngineCmd>, shared: Shared, self_tx: Sender<
                     })
                     .unwrap_or_default();
                 let _ = reply.send(info);
+            }
+            EngineCmd::CinemaStandAt { id, index, reply } => {
+                use metrocalk_editor_shell::StandAtReply;
+                // PLAY OWNS THE CAMERA WHILE IT RUNS, and so does a running preview. Moving the orbit
+                // camera under either would put the author somewhere they cannot see and hand the
+                // viewport straight back on the next tick — the move would appear to do nothing at
+                // all, which is the worst answer a control can give.
+                if play_mode {
+                    let _ = reply.send(StandAtReply::refusal(
+                        "Play is driving the camera — stop Play to stand where a shot films from.",
+                    ));
+                    continue;
+                }
+                if cinema_preview.is_some() {
+                    let _ = reply.send(StandAtReply::refusal(
+                        "Preview is holding the camera — turn preview off to stand where a shot \
+                         films from.",
+                    ));
+                    continue;
+                }
+                let Some(entity) =
+                    EntityId::from_loro_key(&id).filter(|e| engine.entity_exists(*e))
+                else {
+                    let _ =
+                        reply.send(StandAtReply::refusal("that object is no longer in the scene"));
+                    continue;
+                };
+                let cut = metrocalk_editor_shell::cutscene_of(&engine, entity);
+                let Some(shot) = cut.shots.get(index) else {
+                    let _ = reply.send(StandAtReply::refusal("that shot is no longer in the cut"));
+                    continue;
+                };
+                let answer = stand_at_shot(&engine, &shared, entity, &cut, index, shot);
+                let _ = reply.send(answer);
             }
             EngineCmd::CinemaPreview {
                 id,
@@ -25150,6 +25327,35 @@ fn cinema_preview(
     })
 }
 
+/// ADR-200 — stand the stage camera where a shot is filmed from.
+///
+/// THE OTHER HALF OF "SHOOT FROM THIS VIEW". That gesture reads the stage into a shot; there was no
+/// gesture that read a shot back onto the stage, so every sentence this engine writes about a
+/// placement — a camera in a wall, a subject behind something, a ladder that ran out — ended in
+/// advice the author had to act on by orbiting a 262 m import by hand to a part they could not see.
+///
+/// Deliberately async: the answer needs the occlusion BVH, which on a 15,711-part import is a build
+/// the first cutscene command pays for.
+#[tauri::command(async)]
+fn cinema_stand_at_shot(
+    state: State<AppState>,
+    id: String,
+    index: usize,
+) -> metrocalk_editor_shell::StandAtReply {
+    ipc();
+    let (reply, rx) = mpsc::channel();
+    if state
+        .tx
+        .send(EngineCmd::CinemaStandAt { id, index, reply })
+        .is_err()
+    {
+        return metrocalk_editor_shell::StandAtReply::refusal("The engine is unavailable");
+    }
+    recv_reply(&rx).unwrap_or_else(|_| {
+        metrocalk_editor_shell::StandAtReply::refusal("The engine did not answer in time")
+    })
+}
+
 /// ADR-182 — the delivery a render command was asked for.
 ///
 /// `None` on the wire is the DEFAULT and not an error: every caller that predates this asked for a
@@ -28379,6 +28585,7 @@ fn main() {
             cinema_set_shot_camera,
             cinema_clear_shot_camera,
             cinema_set_shot_tracking,
+            cinema_stand_at_shot,
             cinema_subject_catalog,
             cinema_subject_chain,
             cinema_set_mood,

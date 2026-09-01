@@ -2171,9 +2171,51 @@ export interface CinemaReply {
   reads: string[];
   /** The same shots with their numbers. */
   rows: ShotRow[];
-  /** Continuity warnings in plain language (a jump cut, opening tight, a rushed shot). */
-  problems: string[];
+  /** Everything wrong with this cut, in plain language, each one carrying the shot it is about and
+   *  merged into shot order across the three producers that write them. */
+  problems: ShotProblem[];
   message: string;
+  reason: string | null;
+}
+
+/** ADR-200 — one warning about a cut, and the shot it is about.
+ *
+ *  The number was always in the SENTENCE — every producer writes "shot 2 ..." — and never in the
+ *  reply, so a panel drawing this list held a string and had nothing to hang a control off. A reader
+ *  can act on prose; a button cannot. */
+export interface ShotProblem {
+  /** The shot this is about, 0-based, or `null` when the fault belongs to the whole cut. */
+  shot: number | null;
+  /** The sentence, in the author's language. */
+  message: string;
+}
+
+/** ADR-200 — where the stage camera was put by "Take me there", and what it found when it got there.
+ *
+ *  Deliberately not a `CinemaReply`: nothing in the document changed, and a reply carrying `rows`
+ *  would invite a panel to re-render its whole shot list off a camera move. */
+export interface StandAtReply {
+  /** True when the camera moved. */
+  moved: boolean;
+  /** Where the stage camera now stands — read back from the viewport, not echoed from the request. */
+  stood: [number, number, number];
+  /** What it is looking at, which is also the new orbit target. */
+  lookAt: [number, number, number];
+  /** The lens the shot is filmed through, degrees. */
+  fovDeg: number;
+  /** How far the eye ended up from the one the shot films at, metres. Non-zero only when the stage
+   *  camera's pitch limit bit. */
+  offBy: number;
+  /** How far through the shot's move this pose is, 0..1. */
+  progress: number;
+  /** True when this is the author's own placed camera rather than a placement the engine chose. */
+  placed: boolean;
+  /** How many rungs of the planner's ladder this placement cost. 0 is the shot as directed. */
+  steps: number;
+  /** True when the world had no objection to the placement the camera was taken to. */
+  acceptable: boolean;
+  message: string;
+  /** Set iff nothing moved, and says why. */
   reason: string | null;
 }
 

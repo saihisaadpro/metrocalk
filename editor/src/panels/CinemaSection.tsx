@@ -304,8 +304,8 @@ export function CinemaSection({ client, onOpenTimeline }: CinemaSectionProps) {
             // Four identical shots emit three byte-identical jump-cut warnings, so the string alone
             // is not a key.
             // eslint-disable-next-line react/no-array-index-key -- see above
-            <Callout key={`${problem}-${i}`} data-testid="cinema-problem" tone="warn">
-              {problem}
+            <Callout key={`${problem.message}-${i}`} data-testid="cinema-problem" tone="warn">
+              {problem.message}
             </Callout>
           ))}
         </div>

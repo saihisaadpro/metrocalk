@@ -11,8 +11,8 @@
 //! rule — which is why the closed action vocabulary never had to grow to gain cutscenes.
 
 use metrocalk_animation::shot::{
-    Cutscene, Delivery, Mood, RenderSettings, ShotAngle, ShotCamera, ShotMove, ShotRecipe,
-    ShotSize, MAX_SECONDS, MAX_SHOTS, MIN_SECONDS,
+    Cutscene, Delivery, Mood, RenderSettings, ShotAngle, ShotCamera, ShotMove, ShotProblem,
+    ShotRecipe, ShotSize, MAX_SECONDS, MAX_SHOTS, MIN_SECONDS,
 };
 // ADR-190 moved these three into the document crate when `RenderSettings` put them in the cutscene.
 // Re-exported from here, where every caller already looks for them, so moving the definition did not
@@ -513,12 +513,70 @@ pub struct CinemaReply {
     pub reads: Vec<String>,
     /// The same shots with their numbers — what the timeline draws and the shot inspector edits.
     pub rows: Vec<ShotRow>,
-    /// Continuity warnings, in plain language (a jump cut, opening tight, a rushed shot).
-    pub problems: Vec<String>,
+    /// Everything wrong with this cut, in plain language, each one carrying the shot it is about.
+    ///
+    /// ADR-200 — the shot number was always in the SENTENCE and never in the reply, so a panel could
+    /// print *"shot 2 has nowhere good to film from"* and had nothing to hang a control off. It is a
+    /// field now, which is also what lets the three producers be read in one order rather than in the
+    /// order they happen to run.
+    pub problems: Vec<ShotProblem>,
     /// Friendly summary.
     pub message: String,
     /// Set iff nothing changed.
     pub reason: Option<String>,
+}
+
+/// ADR-200 — where the stage camera was put, and what it is looking at when it gets there.
+///
+/// The reply to "Take me there". It is deliberately NOT a `CinemaReply`: nothing about the document
+/// changed, and a reply carrying `rows`/`problems` would invite a panel to re-render its whole shot
+/// list off a camera move — which is how a pure camera op quietly becomes a document read.
+///
+/// **`stood` is read back from the viewport, not echoed from the request.** The orbit camera holds
+/// its pitch inside a limit, so a shot filmed from directly overhead lands a little below where it
+/// was asked to. Echoing the request would tell the author they are standing at the shot's own eye
+/// while the stage draws something else — and the next thing they press stores what the stage draws.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StandAtReply {
+    /// True when the camera moved.
+    pub moved: bool,
+    /// Where the stage camera now stands.
+    pub stood: [f32; 3],
+    /// What it is looking at — the shot's own aim, which is also the new orbit target.
+    pub look_at: [f32; 3],
+    /// The lens the shot is filmed through, in degrees. The stage draws through its own; reported so
+    /// an author can tell a framing difference from a placement one.
+    pub fov_deg: f32,
+    /// How far the eye ended up from the one the shot films at, in metres. Zero unless the pitch
+    /// limit bit; non-zero is the honest reading, not a rounding error.
+    pub off_by: f32,
+    /// How far through the shot's move this pose is, `0.0` at its opening and `1.0` at its end.
+    pub progress: f32,
+    /// True when this is the author's own placed camera rather than a placement the engine chose.
+    pub placed: bool,
+    /// How many rungs of the ladder the planner climbed to reach this placement. `0` is the shot as
+    /// directed; a card shot the engine could not place at all carries the whole count.
+    pub steps: u32,
+    /// True when the world had no objection to the placement the camera was taken to.
+    pub acceptable: bool,
+    /// Friendly summary.
+    pub message: String,
+    /// Set iff nothing moved.
+    pub reason: Option<String>,
+}
+
+impl StandAtReply {
+    /// A refusal that moved nothing, explained.
+    #[must_use]
+    pub fn refusal(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            message: reason.clone(),
+            reason: Some(reason),
+            ..Self::default()
+        }
+    }
 }
 
 impl CinemaReply {

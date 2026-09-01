@@ -134,8 +134,8 @@ pub use cinema_intent::{
     set_render_ops, set_shot_camera_ops, set_shot_framing_ops, set_shot_seconds_ops,
     set_shot_subject_ops, shot_specs, subject_catalog, subject_chain, CinemaError,
     CinemaPreviewReply, CinemaReply, FrameSizing, FramingCatalog, FramingEdit, FramingOption,
-    RenderFormat, RenderPlan, RenderReply, RenderScope, ShotRow, ShotSpec, SubjectCandidate,
-    SubjectCatalog, CINEMA_COMPONENT, DEFAULT_RENDER_FPS, DEFAULT_RENDER_HEIGHT,
+    RenderFormat, RenderPlan, RenderReply, RenderScope, ShotRow, ShotSpec, StandAtReply,
+    SubjectCandidate, SubjectCatalog, CINEMA_COMPONENT, DEFAULT_RENDER_FPS, DEFAULT_RENDER_HEIGHT,
     MAX_MOVIE_DIMENSION, MAX_RENDER_DIMENSION, MAX_RENDER_FRAMES, MAX_RENDER_NAME, RENDER_HEIGHTS,
     RENDER_RATES,
 };

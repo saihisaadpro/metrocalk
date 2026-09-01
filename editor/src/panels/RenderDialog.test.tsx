@@ -712,14 +712,22 @@ describe("RenderDialog", () => {
     // solid-colour frame, and the click that spends the render happens here, with the panel that
     // would have said so hidden behind the sheet.
     const problems = [
-      'shots 2 and 3 on "Weld Gun 7" are framed identically back to back — that reads as a jump cut; change the size or the angle',
-      'shot 2\'s subject is hidden from every angle the engine tried — 78% of it is behind something else; frame it yourself with "Shoot from this view", or film a different part',
+      {
+        shot: 2,
+        message:
+          'shots 2 and 3 on "Weld Gun 7" are framed identically back to back — that reads as a jump cut; change the size or the angle',
+      },
+      {
+        shot: 1,
+        message:
+          'shot 2\'s subject is hidden from every angle the engine tried — 78% of it is behind something else; press "Take me there" to stand where it tried, then frame it yourself with "Shoot from this view" — or film a different part',
+      },
     ];
     open({ cut: { ...CUT, problems } });
     const block = await screen.findByTestId("render-problems");
     // The SAME sentences, never a second wording of them — one producer, read here.
     for (const problem of problems) {
-      expect(block.textContent).toContain(problem);
+      expect(block.textContent).toContain(problem.message);
     }
     expect(block.textContent).toContain("2 warnings about this cut");
     // A NOTE, NOT A GATE. An author may know exactly why a shot is boxed in and want the render.
@@ -729,7 +737,9 @@ describe("RenderDialog", () => {
   });
 
   it("counts one warning in the singular", async () => {
-    open({ cut: { ...CUT, problems: ["shot 1 has nowhere to film from"] } });
+    open({
+      cut: { ...CUT, problems: [{ shot: 0, message: "shot 1 has nowhere to film from" }] },
+    });
     const block = await screen.findByTestId("render-problems");
     expect(block.textContent).toContain("One warning about this cut");
   });

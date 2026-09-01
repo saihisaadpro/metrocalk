@@ -870,7 +870,7 @@ export function RenderDialog({
                   {cut.problems.map((problem, i) => (
                     // Identical framings emit byte-identical warnings, so the string is not a key.
                     // eslint-disable-next-line react/no-array-index-key -- see above
-                    <li key={`${problem}-${i}`}>{problem}</li>
+                    <li key={`${problem.message}-${i}`}>{problem.message}</li>
                   ))}
                 </ul>
               </Callout>

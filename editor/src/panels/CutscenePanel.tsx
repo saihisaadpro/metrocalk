@@ -414,6 +414,45 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
     );
   };
 
+  // ADR-200 — TAKE ME THERE. The inverse of "Shoot from this view", and the half that was missing:
+  // the engine could say *there is nowhere good to film shot 2 from* and the only fix it could offer
+  // was "frame it yourself", starting the author from wherever the viewport happened to be. On a
+  // 262 m import that is a manual orbit to a part they cannot see, to redo by hand the fifty-four
+  // placement search the engine has just finished. This stands them AT the engine's own best
+  // attempt, at the instant the warning is about, so the next click is the one that fixes it.
+  //
+  // THE PREVIEW IS HANDED BACK FIRST, not refused over. An author reads these warnings while
+  // previewing — that is when a bad frame is visible — and the cutscene camera holds the viewport,
+  // so standing the orbit camera anywhere would be overwritten on the next tick. Ending the preview
+  // is what makes the stage theirs to orbit, which is the whole point of arriving there.
+  //
+  // AND IT SELECTS THE SHOT. The control the sentence sends them to next ("Shoot from this view")
+  // acts on the shot the inspector is editing, so arriving at shot 2's placement with shot 5 still
+  // selected would put the author one click from storing this view onto the wrong shot.
+  const takeMeThere = async (index: number) => {
+    if (!selected || busy) return;
+    setBusy(true);
+    try {
+      if (previewingRef.current) await endPreview(selected);
+      const row = rows.find((r) => r.index === index);
+      if (row) setActiveId(row.id);
+      const reply = await client.cinemaStandAtShot(selected, index);
+      if (reply.reason) {
+        setRefusal(reply.reason);
+        pushToast(reply.reason, "error");
+        return;
+      }
+      setRefusal(null);
+      setStatus(reply.message);
+      pushToast(reply.message, "info");
+    } catch (e) {
+      console.error("Take me there failed", e);
+      pushToast("Take me there failed — please try again", "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const useTheCardAgain = (row: ShotRow) => {
     if (!selected) return;
     void run(() => client.cinemaClearShotCamera(selected, row.index), "Use the card again");
@@ -888,6 +927,28 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
                 <Icon name="camera" size="md" />{" "}
                 {active.camera ? "Re-shoot from this view" : "Shoot from this view"}
               </Button>
+              {/* ADR-200 — THE ROUND TRIP, closed. "Shoot from this view" reads the stage into the
+                  shot; this reads the shot back onto the stage. Beside it, attached, because they
+                  are one decision seen from two ends — and useful for every shot and not only a
+                  warned one: it is the only way to SEE where a card shot the engine placed actually
+                  films from without previewing, which takes the camera away again. */}
+              <Button
+                data-testid="cutscene-stand-here"
+                variant="secondary"
+                compact
+                disabled={locked}
+                disabledReason={lockReason}
+                title={
+                  locked
+                    ? lockReason
+                    : active.camera
+                      ? "Stand the stage camera at this shot's own camera"
+                      : "Stand the stage camera where the engine films this shot from"
+                }
+                onClick={() => void takeMeThere(active.index)}
+              >
+                <Icon name="waypoint" size="md" /> Take me there
+              </Button>
               {active.camera && (
                 <Button
                   data-testid="cutscene-use-card"
@@ -1256,14 +1317,43 @@ export function CutscenePanel({ client }: { client: EditorClient }) {
         </section>
       )}
 
+      {/* ADR-200 — EVERY WARNING IS NOW A PLACE. Each of these sentences names a shot, and until the
+          shot number was a FIELD rather than a word inside the prose, that was all the panel had:
+          the reader could act on it and the panel could not. The button beside each one takes the
+          stage camera to where that shot films from, at the instant the sentence is about.
+
+          The list is also in shot order now. Three producers write it — the document's own
+          continuity checks, a placed camera's view of the world, a negotiated placement's — and they
+          were appended in the order the functions ran, so a cut whose shot 1 opened tight and whose
+          shot 3 was boxed in read "shot 3 ..." first. `in_shot_order` merges them in the engine, so
+          there is one order and every surface drawing this list gets it. */}
       {cut.problems.length > 0 && (
         <div role="status" style={{ display: "grid", gap: space.xxs }}>
           {cut.problems.map((problem, i) => (
             // Four identical shots emit three byte-identical jump-cut warnings, so the string alone
             // is not a key.
             // eslint-disable-next-line react/no-array-index-key -- see above
-            <Callout key={`${problem}-${i}`} tone="warn" data-testid="cutscene-problem">
-              {problem}
+            <Callout key={`${problem.message}-${i}`} tone="warn" data-testid="cutscene-problem">
+              <div style={{ display: "grid", gap: space.xxs, justifyItems: "start" }}>
+                <span>{problem.message}</span>
+                {problem.shot != null && (
+                  <Button
+                    data-testid="cutscene-take-me-there"
+                    variant="secondary"
+                    compact
+                    disabled={locked}
+                    disabledReason={lockReason}
+                    title={
+                      locked
+                        ? lockReason
+                        : `Stand the camera where shot ${problem.shot + 1} films from, so you can see this and re-frame it`
+                    }
+                    onClick={() => void takeMeThere(problem.shot ?? 0)}
+                  >
+                    <Icon name="waypoint" size="md" /> Take me there
+                  </Button>
+                )}
+              </div>
             </Callout>
           ))}
         </div>

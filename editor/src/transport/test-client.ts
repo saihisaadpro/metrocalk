@@ -432,6 +432,10 @@ export function fakeClient(over: Partial<EditorClient> = {}): EditorClient {
     // draws its disabled pickers and its pose read-out from.
     cinemaSetShotCamera: vi.fn((id: string, index: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: ["a placed shot of Crate, pushing in — 2.5s"], rows: [{ ...HERO_ROW, index, camera: { eye: [6, 3, 8] as [number, number, number], lookAt: [0, 0.5, 0] as [number, number, number], fovDeg: 55, track: null }, reads: `a placed shot of Crate, pushing in — 2.5s` }], problems: [], message: `Shot ${index + 1} is now a placed shot of Crate, pushing in — 2.5s`, reason: null })),
     cinemaClearShotCamera: vi.fn((id: string, index: number) => Promise.resolve({ entity: id, shots: 1, seconds: 2.5, mood: "normal" as const, delivery: "viewport" as const, render: DEFAULT_RENDER_SETTINGS, reads: [HERO_ROW.reads], rows: [{ ...HERO_ROW, index }], problems: [], message: `Shot ${index + 1} is now ${HERO_ROW.reads}`, reason: null })),
+    // ADR-200 — TAKE ME THERE. The fake engine answers with a pose, because that is what the real
+    // one does: a card shot's placement is NEGOTIATED against the scene, so no caller on this side
+    // can compute it and no test may pretend otherwise by echoing back what it sent.
+    cinemaStandAtShot: vi.fn((_id: string, index: number) => Promise.resolve({ moved: true, stood: [6, 3, 8] as [number, number, number], lookAt: [0, 0.5, 0] as [number, number, number], fovDeg: 40, offBy: 0, progress: 0, placed: false, steps: 0, acceptable: false, message: `Standing where shot ${index + 1} films from — this is the best placement the engine found.`, reason: null })),
     // ADR-195 — the fake engine resolves the OFFSET, exactly as the real one does: the caller sends a
     // boolean and gets back a camera whose head is on (or off), so a panel that tried to compose the
     // offset itself would have nothing to send.

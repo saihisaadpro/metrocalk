@@ -812,7 +812,7 @@ impl Cutscene {
     /// Subjects are named by their key, which is a fact about the document and not a word an author
     /// has ever seen. Use [`Self::problems_named`] wherever a display name can be resolved.
     #[must_use]
-    pub fn problems(&self) -> Vec<String> {
+    pub fn problems(&self) -> Vec<ShotProblem> {
         self.problems_named(&|_| None)
     }
 
@@ -824,23 +824,30 @@ impl Cutscene {
     /// in the document's vocabulary instead of the author's. The names live in the shell, which is why
     /// this is a parameter and not a lookup.
     #[must_use]
-    pub fn problems_named(&self, subject_name: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    pub fn problems_named(
+        &self,
+        subject_name: &dyn Fn(&str) -> Option<String>,
+    ) -> Vec<ShotProblem> {
         let mut out = Vec::new();
         if self.shots.len() > MAX_SHOTS {
-            out.push(format!(
+            out.push(ShotProblem::about_the_cut(format!(
                 "a cutscene can hold at most {MAX_SHOTS} shots — this one has {}",
                 self.shots.len()
-            ));
+            )));
         }
         for (i, shot) in self.shots.iter().enumerate() {
             let n = i + 1;
             if shot.seconds < MIN_SECONDS {
-                out.push(format!(
-                    "shot {n} is shorter than {MIN_SECONDS}s — it will not read"
+                out.push(ShotProblem::about(
+                    i,
+                    format!("shot {n} is shorter than {MIN_SECONDS}s — it will not read"),
                 ));
             }
             if shot.seconds > MAX_SECONDS {
-                out.push(format!("shot {n} runs longer than {MAX_SECONDS}s"));
+                out.push(ShotProblem::about(
+                    i,
+                    format!("shot {n} runs longer than {MAX_SECONDS}s"),
+                ));
             } else if self
                 .effective_shot_seconds(i)
                 .is_some_and(|effective| effective < self.mood.min_shot_seconds())
@@ -852,9 +859,12 @@ impl Cutscene {
                 // catalogue (`closeup` 1.8s, `detail` 1.6s) permanently un-authorable in a Calm
                 // cutscene, where they in fact run 4.5s and 4.0s: a director following the tool's own
                 // warnings could not put a close-up in a calm sequence at all.
-                out.push(format!(
-                    "shot {n} runs {:.1}s at this pacing — it may feel rushed",
-                    self.effective_shot_seconds(i).unwrap_or(shot.seconds)
+                out.push(ShotProblem::about(
+                    i,
+                    format!(
+                        "shot {n} runs {:.1}s at this pacing — it may feel rushed",
+                        self.effective_shot_seconds(i).unwrap_or(shot.seconds)
+                    ),
                 ));
             }
         }
@@ -881,16 +891,24 @@ impl Cutscene {
                 // resolvable. Four identical shots produce three warnings; naming only the subject
                 // made all three byte-identical and none of them said where to look.
                 let (m, n) = (first + 1, first + 2);
-                out.push(match subject_name(&a.subject) {
-                    Some(who) => format!(
-                        "shots {m} and {n} on \"{who}\" are framed identically back to back — that \
-                         reads as a jump cut; change the size or the angle"
-                    ),
-                    None => format!(
-                        "shots {m} and {n} are framed identically back to back — that reads as a \
-                         jump cut; change the size or the angle"
-                    ),
-                });
+                // FILED UNDER THE SECOND SHOT, not the first. The warning is about a CUT, which
+                // belongs to neither shot alone — and the one an author changes to fix it is the
+                // second, because re-framing the first only moves the identical pair one place
+                // earlier. So the control this warning now carries points at the shot whose size
+                // or angle is the fix.
+                out.push(ShotProblem::about(
+                    first + 1,
+                    match subject_name(&a.subject) {
+                        Some(who) => format!(
+                            "shots {m} and {n} on \"{who}\" are framed identically back to back — \
+                             that reads as a jump cut; change the size or the angle"
+                        ),
+                        None => format!(
+                            "shots {m} and {n} are framed identically back to back — that reads \
+                             as a jump cut; change the size or the angle"
+                        ),
+                    },
+                ));
             }
         }
         // No establishing shot: opening tight leaves the viewer lost. A placed opener is exempt for
@@ -901,14 +919,76 @@ impl Cutscene {
                 && matches!(first.size, ShotSize::Close | ShotSize::ExtremeClose)
                 && self.shots.len() > 1
             {
-                out.push(
-                    "the cutscene opens tight — a wide shot first would establish where we are"
-                        .into(),
-                );
+                out.push(ShotProblem::about(
+                    0,
+                    "the cutscene opens tight — a wide shot first would establish where we are",
+                ));
             }
         }
         out
     }
+}
+
+/// One warning about a cutscene, and the shot it is about.
+///
+/// **Why the number is a field and not just a word in the sentence.** Every producer here already
+/// wrote *"shot 2 ..."* into its prose, because an author cannot act on a warning without knowing
+/// which shot it names. A reader can act on that; a CONTROL cannot. The panel drawing these lists had
+/// no way to put a button beside *"shot 2 has nowhere good to film from"* that did anything to shot 2
+/// — it held a sentence, and the shot number in it was as opaque as any other word. So the advice
+/// ended in *"frame it yourself"* and the author went hunting for the shot the engine had just
+/// identified.
+///
+/// It is also what lets the three producers below be read in one order. They answer different
+/// questions — the document's own continuity, a placed camera's view, a negotiated placement's — and
+/// were appended in producer order, so a cut with faults of two kinds listed *"shot 3 ..."* above
+/// *"shot 1 ..."*. [`in_shot_order`] merges them, which needs exactly this field.
+///
+/// `shot` is `None` for the faults that belong to no single shot — there is one, and it is about the
+/// cut being longer than a cutscene may be.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShotProblem {
+    /// The shot this is about, zero-based, or `None` when the fault is the whole cut's.
+    pub shot: Option<usize>,
+    /// The sentence, in the author's language — unchanged by this being structured.
+    pub message: String,
+}
+
+impl ShotProblem {
+    /// A fault of shot `index`.
+    #[must_use]
+    pub fn about(index: usize, message: impl Into<String>) -> Self {
+        Self {
+            shot: Some(index),
+            message: message.into(),
+        }
+    }
+
+    /// A fault of the cut as a whole, belonging to no one shot.
+    #[must_use]
+    pub fn about_the_cut(message: impl Into<String>) -> Self {
+        Self {
+            shot: None,
+            message: message.into(),
+        }
+    }
+}
+
+/// Put a cut's warnings into the order its author reads the timeline in.
+///
+/// The three producers each sweep the shots in order, so each list is already sorted; concatenating
+/// them is not. A cut whose shot 1 opens tight and whose shot 3 is boxed in listed the boxed-in one
+/// first, because it came from the producer that runs last — and a list that is sorted by which
+/// function noticed the fault is a list sorted by nothing the reader can see.
+///
+/// STABLE, so two faults of one shot keep the order their producer chose: those are ranked
+/// worst-first inside each producer, and re-sorting by shot must not throw that away. Cut-wide faults
+/// lead, because a cutscene that holds more shots than it may is a fact about all of them.
+#[must_use]
+pub fn in_shot_order(mut problems: Vec<ShotProblem>) -> Vec<ShotProblem> {
+    problems.sort_by_key(|problem| problem.shot.map_or(0, |shot| shot + 1));
+    problems
 }
 
 /// Where along a placed shot's move the world is asked about it.
@@ -949,7 +1029,7 @@ pub fn placed_camera_problems(
     cut: &Cutscene,
     mut subject_center: impl FnMut(usize, &ShotRecipe) -> [f32; 3],
     mut look: impl FnMut(usize, &CameraSample) -> Vantage,
-) -> Vec<String> {
+) -> Vec<ShotProblem> {
     let mut out = Vec::new();
     for (index, shot) in cut.shots.iter().enumerate() {
         let Some(camera) = shot.camera.filter(ShotCamera::is_usable) else {
@@ -985,17 +1065,17 @@ pub fn placed_camera_problems(
         // wall" are different faults with different fixes — one moves the tripod, the other softens
         // the move — and a message that cannot tell them apart sends the author to the wrong control.
         if vantage.eye_inside {
-            out.push(if moving {
+            out.push(ShotProblem::about(index, if moving {
                 format!(
                     "shot {n}'s move takes its camera inside something — those frames will be solid \
                      colour"
                 )
             } else {
                 format!("shot {n}'s camera is inside something — that frame will be solid colour")
-            });
+            }));
         } else if vantage.clear < MIN_CLEAR_FRACTION {
             let hidden = (1.0 - vantage.clear.clamp(0.0, 1.0)) * 100.0;
-            out.push(if moving {
+            out.push(ShotProblem::about(index, if moving {
                 format!(
                     "shot {n}'s move puts {hidden:.0}% of its subject behind something else before it \
                      ends"
@@ -1005,9 +1085,9 @@ pub fn placed_camera_problems(
                     "shot {n}'s subject is mostly hidden from where its camera stands — {hidden:.0}% \
                      of it is behind something else"
                 )
-            });
+            }));
         } else if vantage.crowded > MAX_CROWDED_FRACTION {
-            out.push(if moving {
+            out.push(ShotProblem::about(index, if moving {
                 format!(
                     "shot {n}'s move takes its camera into a corner — most of the frame it ends on is \
                      whatever it is standing against"
@@ -1017,7 +1097,7 @@ pub fn placed_camera_problems(
                     "shot {n}'s camera is boxed in — most of that frame is whatever it is standing \
                      against"
                 )
-            });
+            }));
         }
     }
     out
@@ -1051,7 +1131,7 @@ pub fn placed_camera_problems(
 pub fn card_shot_problems(
     cut: &Cutscene,
     mut settled: impl FnMut(usize, &ShotRecipe) -> Option<ShotAdjustment>,
-) -> Vec<String> {
+) -> Vec<ShotProblem> {
     let mut out = Vec::new();
     for (index, shot) in cut.shots.iter().enumerate() {
         // A placed camera is the other function's business, and asking here would report the
@@ -1073,24 +1153,43 @@ pub fn card_shot_problems(
         // specific fault is about the placement it SETTLED on, and the wording says so rather than
         // claiming every rejected candidate failed the same way; they did not, and the difference
         // would be a sentence the engine cannot support.
-        let lead = format!("shot {n} has nowhere good to film from — the engine tried every framing \
-                            and angle, and");
-        let out_of = "frame it yourself with \"Shoot from this view\", or film a different part";
+        let lead = format!(
+            "shot {n} has nowhere good to film from — the engine tried every framing \
+                            and angle, and"
+        );
+        // AND THE FIRST HALF OF THE ADVICE IS NOW A PLACE, not an instruction to go and find one.
+        // "Frame it yourself" was the only fix this sentence could offer, and it started the
+        // author from wherever the viewport happened to be — which, on a 262 m import, is a manual
+        // orbit to a part they cannot see, to redo by hand the search the engine has just
+        // finished. The least-bad placement is in `ShotAdjustment` and `worst_moment` recovers the
+        // instant the rest of this sentence describes, so the advice can name a control that
+        // stands there.
+        let out_of = "press \"Take me there\" to stand where it tried, then frame it \
+                      yourself with \"Shoot from this view\" — or film a different part";
         if vantage.eye_inside {
-            out.push(format!(
+            out.push(ShotProblem::about(
+                index,
+                format!(
                 "{lead} in the best one it found the camera is inside something, so those frames \
                  will be solid colour; {out_of}"
+            ),
             ));
         } else if vantage.clear < MIN_CLEAR_FRACTION {
             let hidden = (1.0 - vantage.clear.clamp(0.0, 1.0)) * 100.0;
-            out.push(format!(
+            out.push(ShotProblem::about(
+                index,
+                format!(
                 "{lead} in the best one it found {hidden:.0}% of the subject is behind something \
                  else; {out_of}"
+            ),
             ));
         } else if vantage.crowded > MAX_CROWDED_FRACTION {
-            out.push(format!(
-                "{lead} in the best one it found most of the frame is whatever the camera is \
+            out.push(ShotProblem::about(
+                index,
+                format!(
+                    "{lead} in the best one it found most of the frame is whatever the camera is \
                  standing against rather than the subject; {out_of}"
+                ),
             ));
         }
     }
@@ -1715,6 +1814,53 @@ pub fn solve_shot_adjusted(
     pose
 }
 
+/// ADR-200 — WHERE this shot is filmed from, and at which instant it is worst.
+///
+/// The pose an author needs to be standing at to see what a warning is about. [`plan_shot`] judges
+/// every candidate at [`PATH_SAMPLES`] and keeps the verdict from the worst-scoring one, because a
+/// camera path is only as good as the frame a viewer would most object to — and it keeps only the
+/// verdict, so the moment that produced it was gone by the time anything could point at it. This
+/// re-walks the same five samples for a placement already chosen, with the same comparison, and
+/// hands back the pose and the progress.
+///
+/// **The same comparison, deliberately.** `score() < worst` is strict, so ties go to the earliest
+/// sample exactly as they do inside the search. A function that agreed with `plan_shot` about the
+/// verdict but not about which frame produced it would take an author to a frame that looks fine
+/// and tell them it is the problem.
+///
+/// A still shot solves to one pose at every sample, so this degenerates to the opening and needs no
+/// special case. A placed camera is returned untouched by [`solve_shot_adjusted`], so this reports
+/// the author's own pose — which is the right answer for the placed half of the warning vocabulary:
+/// standing there IS the solid-colour frame.
+///
+/// `look` is the world's verdict on one pose, the same one [`plan_shot`] negotiated against. A caller
+/// with no occlusion data hands back [`Vantage::OPEN`] every time, and this then returns the opening
+/// pose — the honest answer when nothing can be measured.
+#[must_use]
+pub fn worst_moment(
+    shot: &ShotRecipe,
+    adjustment: ShotAdjustment,
+    subject: SubjectSample,
+    aspect: f32,
+    fov_deg: f32,
+    mut look: impl FnMut(&CameraSample, f32) -> Vantage,
+) -> (f32, CameraSample, Vantage) {
+    let mut worst: Option<(f32, CameraSample, Vantage)> = None;
+    for progress in PATH_SAMPLES {
+        let pose = solve_shot_adjusted(shot, adjustment, subject, progress, aspect, fov_deg);
+        let vantage = look(&pose, progress);
+        if worst.is_none_or(|(_, _, held)| vantage.score() < held.score()) {
+            worst = Some((progress, pose, vantage));
+        }
+    }
+    worst.unwrap_or_else(|| {
+        // PATH_SAMPLES is a non-empty constant, so this is unreachable; written as a value rather
+        // than an unwrap so a future edit to that constant cannot turn a diagnostic into a panic.
+        let pose = solve_shot_adjusted(shot, adjustment, subject, 0.0, aspect, fov_deg);
+        (0.0, pose, Vantage::OPEN)
+    })
+}
+
 /// Swing the eye around the subject's vertical axis, keeping its height and its distance. The aim is
 /// untouched, so the subject stays exactly as framed — only the side we look from changes.
 fn rotate_eye_about_subject(pose: CameraSample, center: [f32; 3], yaw_deg: f32) -> CameraSample {
@@ -2001,7 +2147,7 @@ mod tests {
         let rushed = |cut: &Cutscene| {
             cut.problems()
                 .iter()
-                .any(|problem| problem.contains("rushed"))
+                .any(|problem| problem.message.contains("rushed"))
         };
 
         // 1.8s authored is 4.5s on screen in Calm -- more than twice the 2.0s Calm minimum.
@@ -2274,11 +2420,11 @@ mod tests {
         };
         let problems = jump.problems();
         assert!(
-            problems.iter().any(|p| p.contains("jump cut")),
+            problems.iter().any(|p| p.message.contains("jump cut")),
             "an identical back-to-back framing is a jump cut: {problems:?}"
         );
         assert!(
-            problems.iter().any(|p| p.contains("opens tight")),
+            problems.iter().any(|p| p.message.contains("opens tight")),
             "opening on a close-up should suggest establishing first: {problems:?}"
         );
 
@@ -3113,7 +3259,7 @@ mod tests {
             delivery: Delivery::Widescreen,
             render: RenderSettings::default(),
         };
-        let flags = |c: &Cutscene| c.problems().iter().any(|p| p.contains("jump cut"));
+        let flags = |c: &Cutscene| c.problems().iter().any(|p| p.message.contains("jump cut"));
 
         // Ten degrees apart: two frames a viewer reads as one jolt — and BOTH carry the same card,
         // which is exactly the case the old size-and-angle check could not see.
@@ -3150,7 +3296,11 @@ mod tests {
             delivery: Delivery::Widescreen,
             render: RenderSettings::default(),
         };
-        let opens_tight = |c: &Cutscene| c.problems().iter().any(|p| p.contains("opens tight"));
+        let opens_tight = |c: &Cutscene| {
+            c.problems()
+                .iter()
+                .any(|p| p.message.contains("opens tight"))
+        };
         assert!(opens_tight(&two(tight.clone())));
         assert!(!opens_tight(&two(ShotRecipe {
             camera: Some(ShotCamera {
@@ -3439,7 +3589,9 @@ mod tests {
             placed_camera_problems(&cut, |_, _| cube().center, world_with_a_blob_at(eye, 1.0));
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(
-            said[0].starts_with("shot 1's camera is inside something"),
+            said[0]
+                .message
+                .starts_with("shot 1's camera is inside something"),
             "{said:?}"
         );
     }
@@ -3458,7 +3610,9 @@ mod tests {
         );
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(
-            said[0].contains("move takes its camera inside something"),
+            said[0]
+                .message
+                .contains("move takes its camera inside something"),
             "the message must send the author to the move, not to the tripod: {said:?}"
         );
 
@@ -3484,7 +3638,7 @@ mod tests {
             },
         );
         assert_eq!(said.len(), 1, "{said:?}");
-        assert!(said[0].contains("75%"), "{said:?}");
+        assert!(said[0].message.contains("75%"), "{said:?}");
         // At the threshold itself the shot is acceptable and nothing is said.
         assert!(placed_camera_problems(
             &cut,
@@ -3515,7 +3669,7 @@ mod tests {
             1,
             "three faults on one camera are one sentence: {said:?}"
         );
-        assert!(said[0].contains("inside something"), "{said:?}");
+        assert!(said[0].message.contains("inside something"), "{said:?}");
         let crowded = placed_camera_problems(
             &cut,
             |_, _| cube().center,
@@ -3524,7 +3678,7 @@ mod tests {
                 ..Vantage::OPEN
             },
         );
-        assert!(crowded[0].contains("boxed in"), "{crowded:?}");
+        assert!(crowded[0].message.contains("boxed in"), "{crowded:?}");
     }
 
     #[test]
@@ -3606,8 +3760,8 @@ mod tests {
             },
         );
         assert_eq!(said.len(), 2, "{said:?}");
-        assert!(said[0].starts_with("shot 2's"), "{said:?}");
-        assert!(said[1].starts_with("shot 3's"), "{said:?}");
+        assert!(said[0].message.starts_with("shot 2's"), "{said:?}");
+        assert!(said[1].message.starts_with("shot 3's"), "{said:?}");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -3645,7 +3799,11 @@ mod tests {
     fn an_open_world_has_nothing_to_say_about_a_negotiated_placement() {
         // THE NEGATIVE CONTROL. Every message below must be caused by the world objecting to every
         // placement on the ladder, not by a card shot merely existing.
-        let cut = cut_of(vec![shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold)]);
+        let cut = cut_of(vec![shot(
+            ShotSize::Close,
+            ShotAngle::Front,
+            ShotMove::Hold,
+        )]);
         let plans = plans_of(&cut, |_, _| Vantage::OPEN);
         assert!(card_shot_problems(&cut, |i, _| plans[i]).is_empty());
     }
@@ -3656,7 +3814,11 @@ mod tests {
         // nothing wrong. This is why `Vantage`'s `Default` is written by hand: the DERIVED one is
         // `clear: 0.0`, which would make every unmeasured shot shout.
         assert_eq!(Vantage::default(), Vantage::OPEN);
-        let cut = cut_of(vec![shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold)]);
+        let cut = cut_of(vec![shot(
+            ShotSize::Close,
+            ShotAngle::Front,
+            ShotMove::Hold,
+        )]);
         let authored = ShotAdjustment::authored(&cut.shots[0]);
         assert!(authored.settled.acceptable());
         assert!(card_shot_problems(&cut, |_, _| Some(authored)).is_empty());
@@ -3675,7 +3837,13 @@ mod tests {
             backing: 0.4,
             crowded: 0.0,
         };
-        let plan = plan_shot(&s, cube(), 16.0 / 9.0, 50.0, a_world_that_is_always(hostile));
+        let plan = plan_shot(
+            &s,
+            cube(),
+            16.0 / 9.0,
+            50.0,
+            a_world_that_is_always(hostile),
+        );
         assert!(!plan.settled.acceptable(), "{plan:?}");
         assert_eq!(plan.settled, hostile, "{plan:?}");
         let filmed = solve_shot_adjusted(&s, plan, cube(), 0.5, 16.0 / 9.0, 50.0);
@@ -3700,24 +3868,37 @@ mod tests {
 
     #[test]
     fn a_shot_the_planner_cannot_place_anywhere_says_so_and_names_the_shot() {
-        let cut = cut_of(vec![shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold)]);
+        let cut = cut_of(vec![shot(
+            ShotSize::Close,
+            ShotAngle::Front,
+            ShotMove::Hold,
+        )]);
         let plans = plans_of(&cut, a_world_that_is_always(NOWHERE_TO_STAND));
         let said = card_shot_problems(&cut, |i, _| plans[i]);
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(
-            said[0].starts_with("shot 1 has nowhere good to film from"),
+            said[0]
+                .message
+                .starts_with("shot 1 has nowhere good to film from"),
             "{said:?}"
         );
-        assert!(said[0].contains("the camera is inside something"), "{said:?}");
+        assert!(
+            said[0].message.contains("the camera is inside something"),
+            "{said:?}"
+        );
         // The advice must be the one that is LEFT. Changing the size or the angle is what the engine
         // has already done, on every rung of the ladder, on the author's behalf.
-        assert!(said[0].contains("Shoot from this view"), "{said:?}");
-        assert!(!said[0].contains("change the size"), "{said:?}");
+        assert!(said[0].message.contains("Shoot from this view"), "{said:?}");
+        assert!(!said[0].message.contains("change the size"), "{said:?}");
     }
 
     #[test]
     fn a_subject_hidden_from_every_angle_reports_how_much_of_it_is_behind_something() {
-        let cut = cut_of(vec![shot(ShotSize::Medium, ShotAngle::Front, ShotMove::Hold)]);
+        let cut = cut_of(vec![shot(
+            ShotSize::Medium,
+            ShotAngle::Front,
+            ShotMove::Hold,
+        )]);
         let plans = plans_of(
             &cut,
             a_world_that_is_always(Vantage {
@@ -3729,7 +3910,12 @@ mod tests {
         );
         let said = card_shot_problems(&cut, |i, _| plans[i]);
         assert_eq!(said.len(), 1, "{said:?}");
-        assert!(said[0].contains("75% of the subject is behind something else"), "{said:?}");
+        assert!(
+            said[0]
+                .message
+                .contains("75% of the subject is behind something else"),
+            "{said:?}"
+        );
     }
 
     #[test]
@@ -3751,7 +3937,9 @@ mod tests {
         let said = card_shot_problems(&cut, |i, _| plans[i]);
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(
-            said[0].contains("most of the frame is whatever the camera is standing against"),
+            said[0]
+                .message
+                .contains("most of the frame is whatever the camera is standing against"),
             "{said:?}"
         );
     }
@@ -3795,8 +3983,14 @@ mod tests {
         let plans = plans_of(&cut, a_world_that_is_always(NOWHERE_TO_STAND));
         let said = card_shot_problems(&cut, |i, _| plans[i]);
         assert_eq!(said.len(), 2, "{said:?}");
-        assert!(said[0].starts_with("shot 2 has nowhere good"), "{said:?}");
-        assert!(said[1].starts_with("shot 3 has nowhere good"), "{said:?}");
+        assert!(
+            said[0].message.starts_with("shot 2 has nowhere good"),
+            "{said:?}"
+        );
+        assert!(
+            said[1].message.starts_with("shot 3 has nowhere good"),
+            "{said:?}"
+        );
     }
 
     #[test]
@@ -3842,22 +4036,240 @@ mod tests {
         let bare = cut.problems();
         let jump = bare
             .iter()
-            .find(|p| p.contains("jump cut"))
+            .find(|p| p.message.contains("jump cut"))
             .expect("a jump cut");
         assert!(
-            jump.starts_with("shots 2 and 3 are framed identically"),
-            "{jump}"
+            jump.message
+                .starts_with("shots 2 and 3 are framed identically"),
+            "{jump:?}"
         );
         assert!(
-            !bare.iter().any(|p| p.contains("412_3")),
+            !bare.iter().any(|p| p.message.contains("412_3")),
             "an entity key reached the author: {bare:?}"
         );
         let named = cut.problems_named(&|key| (key == "412_3").then(|| "Weld Gun 7".to_string()));
         assert!(
-            named
-                .iter()
-                .any(|p| p.starts_with("shots 2 and 3 on \"Weld Gun 7\" are framed identically")),
+            named.iter().any(|p| p
+                .message
+                .starts_with("shots 2 and 3 on \"Weld Gun 7\" are framed identically")),
             "{named:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ADR-200 — a warning knows which shot it is about, and where that shot films from.
+    // ---------------------------------------------------------------------------------------------
+
+    #[test]
+    fn every_continuity_warning_names_the_shot_a_control_would_act_on() {
+        // One cut carrying faults at two different shots, so the numbers cannot both be right by
+        // accident.
+        let mut rushed = shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold);
+        rushed.seconds = 0.1;
+        let cut = cut_of(vec![
+            shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold),
+            shot(ShotSize::Medium, ShotAngle::Profile, ShotMove::Hold),
+            rushed,
+        ]);
+        let said = cut.problems();
+        let opens = said
+            .iter()
+            .find(|p| p.message.contains("opens tight"))
+            .expect("opens tight");
+        assert_eq!(opens.shot, Some(0), "{said:?}");
+        let short = said
+            .iter()
+            .find(|p| p.message.contains("shorter than"))
+            .expect("too short");
+        assert_eq!(
+            short.shot,
+            Some(2),
+            "the number in the sentence and the number in the field have to agree: {said:?}"
+        );
+        assert!(short.message.starts_with("shot 3 "), "{said:?}");
+    }
+
+    #[test]
+    fn a_jump_cut_is_filed_under_the_shot_whose_framing_is_the_fix() {
+        let cut = cut_of(vec![
+            shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold),
+            shot(ShotSize::Medium, ShotAngle::Profile, ShotMove::Hold),
+            shot(ShotSize::Medium, ShotAngle::Profile, ShotMove::Hold),
+        ]);
+        let said = cut.problems();
+        let jump = said
+            .iter()
+            .find(|p| p.message.contains("jump cut"))
+            .expect("a jump cut");
+        // The sentence names both shots; the field names the SECOND, which is the one an author
+        // re-frames. Filing it under the first would point every control at a shot that is fine.
+        assert!(jump.message.starts_with("shots 2 and 3"), "{said:?}");
+        assert_eq!(jump.shot, Some(2), "{said:?}");
+    }
+
+    #[test]
+    fn the_over_count_belongs_to_no_shot() {
+        let cut = cut_of(
+            (0..=MAX_SHOTS)
+                .map(|_| shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold))
+                .collect(),
+        );
+        let said = cut.problems();
+        let over = said
+            .iter()
+            .find(|p| p.message.contains("at most"))
+            .expect("the over-count");
+        assert_eq!(over.shot, None, "{said:?}");
+    }
+
+    #[test]
+    fn a_cut_with_faults_of_two_kinds_reads_in_shot_order() {
+        // THE DEFECT: the producers are appended, so a placed-camera fault at shot 3 printed above a
+        // continuity fault at shot 1 — a list ordered by which function noticed it.
+        let cut = cut_of(vec![
+            shot(ShotSize::Close, ShotAngle::Front, ShotMove::Hold),
+            shot(ShotSize::Wide, ShotAngle::Front, ShotMove::Hold),
+            placed(ShotMove::Hold, 0.0),
+        ]);
+        let mut said = cut.problems();
+        said.extend(placed_camera_problems(
+            &cut,
+            |_, _| cube().center,
+            |_, _| Vantage {
+                eye_inside: true,
+                ..Vantage::OPEN
+            },
+        ));
+        assert_eq!(
+            said.iter().map(|p| p.shot).collect::<Vec<_>>(),
+            vec![Some(0), Some(2)],
+            "the fixture has to carry one fault of each kind for the merge to mean anything"
+        );
+        let merged = in_shot_order(said);
+        assert!(
+            merged.windows(2).all(|w| w[0].shot <= w[1].shot),
+            "{merged:?}"
+        );
+    }
+
+    #[test]
+    fn in_shot_order_leads_with_the_cut_and_keeps_two_faults_of_one_shot_in_producer_order() {
+        let merged = in_shot_order(vec![
+            ShotProblem::about(2, "second of shot 3"),
+            ShotProblem::about(0, "shot 1"),
+            ShotProblem::about_the_cut("the whole cut"),
+            ShotProblem::about(2, "third of shot 3"),
+        ]);
+        assert_eq!(
+            merged.iter().map(|p| p.message.as_str()).collect::<Vec<_>>(),
+            vec![
+                "the whole cut",
+                "shot 1",
+                "second of shot 3",
+                "third of shot 3"
+            ],
+            "cut-wide leads, and two faults of one shot keep the order their producer ranked them in"
+        );
+    }
+
+    #[test]
+    fn worst_moment_agrees_with_the_search_about_which_frame_produced_the_verdict() {
+        // A push-in whose END is inside a machine. `plan_shot` keeps the verdict from the worst
+        // sample; this has to hand back the sample that produced it, or the author is taken to a
+        // frame that looks fine and told it is the problem.
+        //
+        // The world objects to the LAST instant of any move and to nothing else, so no rung of the
+        // ladder can escape it: a fixture keyed on the authored pose's end point is escaped by the
+        // first yaw detour, and the search then honestly reports a clean placement.
+        let card = shot(ShotSize::Medium, ShotAngle::Front, ShotMove::PushIn);
+        let mut world = |_: &CameraSample, progress: f32| {
+            if progress > 0.9 {
+                NOWHERE_TO_STAND
+            } else {
+                Vantage::OPEN
+            }
+        };
+        let plan = plan_shot(&card, cube(), 16.0 / 9.0, 50.0, &mut world);
+        let (progress, pose, vantage) =
+            worst_moment(&card, plan, cube(), 16.0 / 9.0, 50.0, &mut world);
+        assert_eq!(
+            vantage, plan.settled,
+            "the verdict at the moment returned must be the verdict the plan carries"
+        );
+        assert!(
+            (progress - 1.0).abs() < 1.0e-6,
+            "the fault is at the end of the move, not at its opening: {progress}"
+        );
+        assert_eq!(
+            pose.eye,
+            solve_shot_adjusted(&card, plan, cube(), progress, 16.0 / 9.0, 50.0).eye,
+            "the pose has to be the one the runtime films at that instant"
+        );
+    }
+
+    #[test]
+    fn worst_moment_of_a_still_shot_is_its_one_pose() {
+        let card = shot(ShotSize::Medium, ShotAngle::Front, ShotMove::Hold);
+        let plan = ShotAdjustment::authored(&card);
+        let (progress, pose, _) = worst_moment(
+            &card,
+            plan,
+            cube(),
+            16.0 / 9.0,
+            50.0,
+            a_world_that_is_always(Vantage::OPEN),
+        );
+        assert_eq!(progress, 0.0, "ties go to the earliest sample");
+        assert_eq!(
+            pose.eye,
+            solve_shot(&card, cube(), 0.0, 16.0 / 9.0, 50.0).eye
+        );
+    }
+
+    #[test]
+    fn worst_moment_of_a_placed_camera_is_the_pose_the_author_put_there() {
+        // The placed half of the vocabulary points at this too, and a planner correction must not
+        // reach it: standing at the author's own eye IS the solid-colour frame they are warned about.
+        let cut = cut_of(vec![placed(ShotMove::Hold, 0.0)]);
+        let card = &cut.shots[0];
+        let camera = card.camera.expect("placed");
+        let (_, pose, _) = worst_moment(
+            card,
+            ShotAdjustment {
+                size: ShotSize::ExtremeWide,
+                yaw_offset_deg: 90.0,
+                steps: 12,
+                settled: NOWHERE_TO_STAND,
+            },
+            cube(),
+            16.0 / 9.0,
+            50.0,
+            a_world_that_is_always(Vantage::OPEN),
+        );
+        assert_eq!(
+            pose.eye, camera.eye,
+            "an adjustment must not move a placed camera"
+        );
+    }
+
+    #[test]
+    fn the_advice_for_a_shot_with_nowhere_to_stand_names_both_controls() {
+        let cut = cut_of(vec![shot(
+            ShotSize::Close,
+            ShotAngle::Front,
+            ShotMove::Hold,
+        )]);
+        let plans = plans_of(&cut, a_world_that_is_always(NOWHERE_TO_STAND));
+        let said = card_shot_problems(&cut, |i, _| plans[i]);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0].shot, Some(0));
+        assert!(
+            said[0].message.contains("\"Take me there\""),
+            "the advice must name the control that goes to the placement it just described: {said:?}"
+        );
+        assert!(
+            said[0].message.contains("\"Shoot from this view\""),
+            "{said:?}"
         );
     }
 }

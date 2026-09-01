@@ -45,6 +45,7 @@ import type {
   ConditionSpec,
   ShotSpec,
   CinemaPreviewReply,
+  StandAtReply,
   RenderFormat,
   RenderReply,
   CinemaReply,
@@ -369,6 +370,15 @@ export interface EditorClient {
   cinemaSetShotCamera(id: string, index: number): Promise<CinemaReply>;
   /** Give one shot back to its card, restoring exactly the framing it was authored with. */
   cinemaClearShotCamera(id: string, index: number): Promise<CinemaReply>;
+  /** ADR-200 — TAKE ME THERE: stand the stage camera where one shot films from.
+   *
+   *  The inverse of `cinemaSetShotCamera`, and the same argument for taking no pose: the engine
+   *  works out where the shot films from — for a card shot that is a placement it NEGOTIATED against
+   *  the scene, which nothing on this side can compute — and moves its own camera there.
+   *
+   *  Changes nothing in the document. It is a camera move, so it is not undoable and does not bump
+   *  the document revision. */
+  cinemaStandAtShot(id: string, index: number): Promise<StandAtReply>;
   /** ADR-195 — KEEP THE SUBJECT FRAMED: put a placed camera's head on its subject, or lock it off.
    *
    *  A BOOLEAN, not an offset. The framing the camera has right now is what gets preserved, and the
@@ -1116,6 +1126,9 @@ export class TauriClient implements EditorClient {
   }
   cinemaClearShotCamera(id: string, index: number): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_clear_shot_camera", { id, index }).catch((e: unknown) => { console.error("cinema_clear_shot_camera failed", e); throw e; });
+  }
+  cinemaStandAtShot(id: string, index: number): Promise<StandAtReply> {
+    return this.core.invoke<StandAtReply>("cinema_stand_at_shot", { id, index }).catch((e: unknown) => { console.error("cinema_stand_at_shot failed", e); throw e; });
   }
   cinemaSetShotTracking(id: string, index: number, track: boolean): Promise<CinemaReply> {
     return this.core.invoke<CinemaReply>("cinema_set_shot_tracking", { id, index, track }).catch((e: unknown) => { console.error("cinema_set_shot_tracking failed", e); throw e; });
@@ -3066,6 +3079,11 @@ class MockClient implements EditorClient {
   }
   cinemaClearShotCamera(): Promise<CinemaReply> {
     return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });
+  }
+  /** A REFUSAL, for the reason `cinemaSetShotCamera` is one: there is no wgpu camera behind a
+   *  browser build to stand anywhere. */
+  cinemaStandAtShot(): Promise<StandAtReply> {
+    return Promise.resolve({ moved: false, stood: [0, 0, 0], lookAt: [0, 0, 0], fovDeg: 0, offBy: 0, progress: 0, placed: false, steps: 0, acceptable: true, message: "", reason: "Cinematics are available in the packaged desktop editor." });
   }
   cinemaSetShotTracking(): Promise<CinemaReply> {
     return Promise.resolve({ entity: null, shots: 0, seconds: 0, mood: "normal", delivery: "viewport", render: DEFAULT_RENDER_SETTINGS, reads: [], rows: [], problems: [], message: "", reason: "Cinematics are available in the packaged desktop editor." });

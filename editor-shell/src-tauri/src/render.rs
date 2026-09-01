@@ -1037,6 +1037,14 @@ fn camera_forward(orbit: f32, elevation: f32) -> Vec3 {
     .normalize_or_zero()
 }
 
+/// How far the orbit camera may pitch away from horizontal, in radians (about 83 degrees).
+///
+/// Named because two things now have to agree about it: the mouse drag that has always clamped here,
+/// and [`SceneState::stand_at`], which lands the camera at a pose computed somewhere else. A literal
+/// in one of them and a different literal in the other is a camera that can be PUT somewhere a drag
+/// can never reach, and then rolls when the author touches it.
+const ORBIT_ELEVATION_LIMIT: f32 = 1.45;
+
 /// The camera's `(right, up)` basis for an orbit/elevation pair. Shared by the fit and by the framing
 /// offset, so a subject is measured and then placed against the same axes.
 fn camera_right_up(orbit: f32, elevation: f32) -> (Vec3, Vec3) {
@@ -2338,6 +2346,57 @@ impl SceneState {
             self.cam_target[1],
             self.cam_target[2],
         ]
+    }
+
+    /// ADR-200 — stand the stage camera at `eye`, looking at `look_at`.
+    ///
+    /// The inverse of [`camera_eye`], and the one op that lets a pose the ENGINE computed become a
+    /// place the AUTHOR is standing. Everything else that moves this camera takes a subject
+    /// ([`Self::focus_on`], [`Self::frame_all`]) or a direction ([`Self::set_view_preset`]); there
+    /// was no way to say *put me exactly here*, which is why a shot the planner could not place had
+    /// no control that could show it to anybody.
+    ///
+    /// **`look_at` becomes the orbit target, and that is the point.** The author's very next gesture
+    /// is to orbit — the frame they were brought to is by construction one the engine already
+    /// rejected — and orbiting around the SUBJECT is the search the planner just did by hand. An
+    /// implementation that kept the previous target and only moved the eye would put them at the
+    /// right frame and then swing them away from it on the first drag.
+    ///
+    /// **Perspective, always.** An axis view is orthographic (see `set_view_preset`), and a cutscene
+    /// camera carries a field of view. Landing in a parallel projection would show a diagram of the
+    /// frame rather than the frame, and `cinema_set_shot_camera` refuses to store from one — so
+    /// "Take me there" followed by "Shoot from this view" would end in a refusal the author did
+    /// nothing to earn.
+    ///
+    /// Returns the eye it ACTUALLY stands at, which is not always the one asked for: the elevation is
+    /// held to the same limit a mouse drag is, because past it the look-at basis degenerates and the
+    /// picture rolls. Reported rather than silently clamped — the caller says so, and the shot stored
+    /// from here is then the frame on the stage rather than a number that was never drawn.
+    ///
+    /// A pure camera op (invariant 4 — render state only, never undoable). Declines a degenerate
+    /// request (an eye at the point it is looking at) rather than dividing by zero.
+    pub fn stand_at(&mut self, eye: [f32; 3], look_at: [f32; 3]) -> Option<[f32; 3]> {
+        let offset = Vec3::from(eye) - Vec3::from(look_at);
+        let distance = offset.length();
+        if !distance.is_finite() || distance < 1.0e-4 {
+            return None;
+        }
+        // `clear_focus` restores the pre-focus distance and target, so it runs BEFORE the new pose is
+        // written — otherwise standing somewhere while focused hands the camera back the framing it
+        // had before the focus. The same ordering `frame_all_with_aspect` keeps, for the same reason.
+        self.clear_focus();
+        self.publish_camera(None);
+        self.projection = Projection::Perspective;
+        let elevation = (offset.y / distance).clamp(-1.0, 1.0).asin();
+        // The same limit the orbit drag applies. Beyond it the eye is directly over the target and the
+        // up vector is parallel to the view direction.
+        let elevation = elevation.clamp(-ORBIT_ELEVATION_LIMIT, ORBIT_ELEVATION_LIMIT);
+        self.orbit = offset.z.atan2(offset.x);
+        self.elevation = elevation;
+        self.distance = distance;
+        self.cam_target = look_at;
+        self.revision = self.revision.wrapping_add(1);
+        Some(camera_eye(self.orbit, self.elevation, self.distance, look_at))
     }
 
     /// Enter Focus mode on instance `i` (M3.3) — the pure state transition the `focus_entity` command
@@ -4535,7 +4594,8 @@ async fn render_loop(window: tauri::WebviewWindow, shared: Shared) {
                 if let Some(p) = cursor_pos {
                     if let Some((lx, ly)) = st.drag_last {
                         st.orbit += (p.x - lx) as f32 * 0.01;
-                        st.elevation = (st.elevation + (p.y - ly) as f32 * 0.01).clamp(-1.45, 1.45);
+                        st.elevation = (st.elevation + (p.y - ly) as f32 * 0.01)
+                            .clamp(-ORBIT_ELEVATION_LIMIT, ORBIT_ELEVATION_LIMIT);
                     }
                     st.drag_last = Some((p.x, p.y));
                 }
