@@ -499,15 +499,21 @@ export function SearchField({
   );
 }
 
-/** Shared native select styling preserves platform semantics while removing subsystem-specific controls. */
+/** Shared native select styling preserves platform semantics while removing subsystem-specific controls.
+ *
+ *  `ref` is declared for the same reason [`SearchField`] declares it: a dialog that opens onto the
+ *  first choice the user still owes it has to be able to focus that control, and the alternative is a
+ *  raw `<select>` beside the shared one — the second control family the constitution forbids. */
 export function SelectField({
   className,
   children,
   style,
+  ref,
   ...rest
-}: SelectHTMLAttributes<HTMLSelectElement>) {
+}: SelectHTMLAttributes<HTMLSelectElement> & { ref?: Ref<HTMLSelectElement> }) {
   return (
     <select
+      ref={ref}
       className={["mtk-input", "mtk-select", className].filter(Boolean).join(" ")}
       style={style}
       {...rest}

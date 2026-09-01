@@ -35,12 +35,13 @@ import {
   SelectField,
   Slider,
   SliderField,
+  TextField,
   Toolbar,
   ToolbarGroup,
   ToolbarSeparator,
 } from "../theme/primitives";
 import { Icon } from "../theme/icons";
-import { Modal } from "../theme/Popover";
+import { DialogSurface, Modal } from "../theme/Popover";
 import { DisclosureSection, DockTabs, EmptyPanelState, usePaneLane } from "../theme/workspace";
 import {
   CURVE_VIEWBOX,
@@ -62,7 +63,7 @@ import {
   timelineTickAt,
   timelineTicks,
 } from "../theme/timeline";
-import { color, font, fontSize, radius, space } from "../theme/tokens";
+import { color, elevation, font, fontSize, radius, space } from "../theme/tokens";
 import { AnimationGraphEditor } from "../graph/AnimationGraphEditor";
 import type {
   AnimationBindingState,
@@ -241,12 +242,25 @@ function timeLabel(tick: number, ticksPerSecond: number, display: "frames" | "se
   return `${(tick / Math.max(1, ticksPerSecond)).toFixed(2)}s`;
 }
 
+/** THE ONE PLACE AUTHORED CHANNELS BECOME A PAINTABLE COLOUR.
+ *
+ *  A marker's colour, a Sprite tint and a UiStyle fill are the same fact — a value the author wrote
+ *  into the document and is watching the timeline animate — and each one used to build its own
+ *  `rgba()` at its own call site. Three statements of one conversion is three chances to disagree
+ *  about whether a channel is 0..1 or 0..255, and it is also three findings for the constitution
+ *  scanner to be told about individually. One function, one waiver, one arithmetic.
+ *
+ *  `channels` are 0..1 or 0..255 (both are in the wire format); alpha is normalised the same way. */
+const authoredColor = (r: number, g: number, b: number, a: number): string => {
+  const scale = Math.max(r, g, b) <= 1 ? 255 : 1;
+  const alpha = a > 1 ? a / 255 : a;
+  // ui-constitution-allow literal-ui-color: an AUTHORED colour read off the document, not a UI colour choice — a token here would paint every marker and every tint preview the same and discard what the author wrote
+  return `rgba(${Math.round(r * scale)}, ${Math.round(g * scale)}, ${Math.round(b * scale)}, ${Math.min(1, Math.max(0, alpha))})`;
+};
+
 function markerColor(marker: AnimationMarkerInfo): string {
   if (!marker.color) return color.warn.text;
-  const [red, green, blue, alpha] = marker.color;
-  const scale = Math.max(red, green, blue) <= 1 ? 255 : 1;
-  const normalizedAlpha = alpha > 1 ? alpha / 255 : alpha;
-  return `rgba(${Math.round(red * scale)}, ${Math.round(green * scale)}, ${Math.round(blue * scale)}, ${Math.min(1, Math.max(0, normalizedAlpha))})`;
+  return authoredColor(marker.color[0], marker.color[1], marker.color[2], marker.color[3]);
 }
 
 function isInteractiveTarget(target: EventTarget | null): boolean {
@@ -344,10 +358,10 @@ function ContextPreview({
     const scaleY = Math.max(0.15, Math.min(2.5, finiteNumber(values["Transform.sy"], 1)));
     const flipX = values["Sprite.flipX"] === true ? -1 : 1;
     const flipY = values["Sprite.flipY"] === true ? -1 : 1;
-    const red = finiteChannel(values["Sprite.tintR"], 0.2);
-    const green = finiteChannel(values["Sprite.tintG"], 0.65);
-    const blue = finiteChannel(values["Sprite.tintB"], 1);
-    const alpha = finiteChannel(values["Sprite.tintA"], 1);
+    const tintR = finiteChannel(values["Sprite.tintR"], 0.2);
+    const tintG = finiteChannel(values["Sprite.tintG"], 0.65);
+    const tintB = finiteChannel(values["Sprite.tintB"], 1);
+    const tintA = finiteChannel(values["Sprite.tintA"], 1);
     const frame = Math.round(finiteNumber(values["Sprite.frame"], 0));
     return (
       <div data-testid="animation-context-preview" data-context="2d" data-readiness={readiness.state} title={readiness.reason} style={{ marginBottom: space.sm }}>
@@ -355,7 +369,7 @@ function ContextPreview({
           <span>Editor preview · deployment adapter required for Sprite channels · frame {frame}</span><span>{selectedName ?? "Selection"}</span>
         </div>
         <div style={previewFrame} aria-label="2D animation preview">
-          <div style={{ position: "absolute", left: "50%", top: "50%", width: 46, height: 46, margin: "-23px", display: "grid", placeItems: "center", border: `1px solid ${color.accent.base}`, borderRadius: radius.md, color: color.text.primary, background: `rgba(${Math.round(red * 255)}, ${Math.round(green * 255)}, ${Math.round(blue * 255)}, ${alpha})`, opacity, transform: `translate(${x}px, ${y}px) scale(${scaleX * flipX}, ${scaleY * flipY})`, boxShadow: `0 8px 24px rgba(0, 0, 0, ${0.18 * opacity})`, font: font.mono, fontSize: fontSize.micro }}>
+          <div style={{ position: "absolute", left: "50%", top: "50%", width: 46, height: 46, margin: "-23px", display: "grid", placeItems: "center", border: `1px solid ${color.accent.base}`, borderRadius: radius.md, color: color.text.primary, background: authoredColor(tintR, tintG, tintB, tintA), opacity, transform: `translate(${x}px, ${y}px) scale(${scaleX * flipX}, ${scaleY * flipY})`, boxShadow: elevation.e2, font: font.mono, fontSize: fontSize.micro }}>
             {frame}
           </div>
         </div>
@@ -369,10 +383,10 @@ function ContextPreview({
   const height = Math.max(28, Math.min(72, finiteNumber(values["UiStyle.height"], 48)));
   const scale = Math.max(0.25, Math.min(2, finiteNumber(values["UiStyle.scale"], 1)));
   const visible = values["UiStyle.visible"] !== false;
-  const red = finiteChannel(values["UiStyle.r"], 0.12);
-  const green = finiteChannel(values["UiStyle.g"], 0.48);
-  const blue = finiteChannel(values["UiStyle.b"], 0.9);
-  const alpha = finiteChannel(values["UiStyle.a"], 1);
+  const tintR = finiteChannel(values["UiStyle.r"], 0.12);
+  const tintG = finiteChannel(values["UiStyle.g"], 0.48);
+  const tintB = finiteChannel(values["UiStyle.b"], 0.9);
+  const tintA = finiteChannel(values["UiStyle.a"], 1);
   const healthWidth = Math.max(0, Math.min(100, finiteNumber(values["HealthBar.width"], 72)));
   return (
     <div data-testid="animation-context-preview" data-context="ui" data-readiness={readiness.state} title={readiness.reason} style={{ marginBottom: space.sm }}>
@@ -380,8 +394,8 @@ function ContextPreview({
         <span>Editor preview · deployment adapter required</span><span>{visible ? "visible" : "hidden"}</span>
       </div>
       <div style={previewFrame} aria-label="UI animation preview">
-        <div style={{ position: "absolute", left: "50%", top: "50%", width, height, marginLeft: -width / 2, marginTop: -height / 2, padding: 8, border: `1px solid ${color.accent.base}`, borderRadius: radius.md, background: `rgba(${Math.round(red * 255)}, ${Math.round(green * 255)}, ${Math.round(blue * 255)}, ${alpha})`, opacity: visible ? opacity : 0.12, transform: `translate(${x}px, ${y}px) scale(${scale})`, boxShadow: "0 10px 26px rgba(0, 0, 0, 0.22)" }}>
-          <div style={{ overflow: "hidden", height: 7, borderRadius: 99, background: "rgba(0, 0, 0, 0.28)" }}>
+        <div style={{ position: "absolute", left: "50%", top: "50%", width, height, marginLeft: -width / 2, marginTop: -height / 2, padding: 8, border: `1px solid ${color.accent.base}`, borderRadius: radius.md, background: authoredColor(tintR, tintG, tintB, tintA), opacity: visible ? opacity : 0.12, transform: `translate(${x}px, ${y}px) scale(${scale})`, boxShadow: elevation.e3 }}>
+          <div style={{ overflow: "hidden", height: 7, borderRadius: radius.pill, background: color.bg.scrim }}>
             <div style={{ width: `${healthWidth}%`, height: "100%", background: color.success.text }} />
           </div>
           <div style={{ marginTop: 7, color: color.text.primary, fontSize: fontSize.micro, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{selectedName ?? "UI element"}</div>
@@ -1740,8 +1754,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
           <div style={{ marginTop: space.md, paddingTop: space.sm, borderTop: `1px solid ${color.border.subtle}` }}>
             <Header title="Timeline annotations" detail="Shared by all contexts" />
             <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: space.xs }}>
-              <input
-                className="mtk-input"
+              <TextField
                 data-testid="animation-marker-name"
                 aria-label="New marker name"
                 placeholder="Marker name"
@@ -1749,8 +1762,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                 onChange={(event) => animationEditorStore.getState().setDraft(workspaceKey, activeContext, MARKER_NAME_DRAFT, event.target.value)}
               />
               <Button compact data-testid="animation-add-marker" disabled={!selectedId || busy} disabledReason={annotationRefusal} aria-describedby={ANNOTATION_STATUS_ID} onClick={addMarker}>+ Marker</Button>
-              <input
-                className="mtk-input"
+              <TextField
                 data-testid="animation-event-name"
                 aria-label="New event name"
                 placeholder="Event name"
@@ -1772,8 +1784,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
             <div id={ANNOTATION_STATUS_ID} data-testid="animation-annotation-status">
               {annotationRefusal && <Hint>{annotationRefusal}</Hint>}
             </div>
-            <input
-              className="mtk-input"
+            <TextField
               data-testid="animation-event-payload"
               aria-label="New event payload"
               placeholder='Optional payload, e.g. {"sound":"step"}'
@@ -2334,19 +2345,15 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                                   ariaLabelledBy={`animation-clip-mapper-heading-${clip.clipId}`}
                                   ariaDescribedBy={`animation-clip-mapper-description-${clip.clipId}`}
                                 >
-                                  <div
+                                  {/* `DialogSurface`, not a private re-statement of one. This box drew its
+                                      own width, padding, border, radius, background and elevation, and the
+                                      elevation was `rgba(0, 0, 0, 0.48)` — a shadow for a dark editor, on a
+                                      light workbench, five milestones after the theme went light. The only
+                                      thing here that is this dialog's own is that it is wider than the
+                                      shared default, because it lists one row per source target. */}
+                                  <DialogSurface
                                     data-testid="animation-clip-setup-dialog"
-                                    style={{
-                                      width: "min(720px, calc(100vw - 32px))",
-                                      maxHeight: "calc(100vh - 32px)",
-                                      overflow: "auto",
-                                      padding: space.lg,
-                                      border: `1px solid ${color.border.strong}`,
-                                      borderRadius: radius.xl,
-                                      background: color.bg.raised,
-                                      color: color.text.primary,
-                                      boxShadow: "0 22px 72px rgba(0, 0, 0, 0.48)",
-                                    }}
+                                    style={{ width: "min(720px, calc(100vw - 32px))" }}
                                   >
                                     <h2
                                       id={`animation-clip-mapper-heading-${clip.clipId}`}
@@ -2418,8 +2425,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                                               >
                                                 {sourceLabel}
                                               </label>
-                                              <select
-                                                className="mtk-input mtk-select"
+                                              <SelectField
                                                 ref={sourceTargetId === firstUnresolvedSourceId ? clipFirstUnresolvedTarget : undefined}
                                                 id={`animation-clip-target-${clip.clipId}-${index}`}
                                                  aria-label={`Target for ${sourceLabel}`}
@@ -2435,7 +2441,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                                                 {liveTransformTargets.map((target) => (
                                                   <option key={target.id} value={target.id}>{target.name} · {target.id}</option>
                                                 ))}
-                                              </select>
+                                              </SelectField>
                                               <div style={{ display: "flex", flexWrap: "wrap", gap: space.xs, marginTop: space.sm }}>
                                                 {(sourceBindings.length > 0
                                                   ? sourceBindings.map((binding) => {
@@ -2554,7 +2560,7 @@ export function AnimationWorkspace({ client }: { client: EditorClient }) {
                                         {repairing ? "Repair mapping" : "Confirm mapping"}
                                       </Button>
                                     </div>
-                                  </div>
+                                  </DialogSurface>
                                 </Modal>
                               )}
                             </div>

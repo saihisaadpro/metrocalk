@@ -157,8 +157,8 @@
       "unitless-length": 0
     },
     "src/panels/AnimationWorkspace.tsx": {
-      "raw-native-control": 4,
-      "literal-ui-color": 9,
+      "raw-native-control": 0,
+      "literal-ui-color": 0,
       "first-party-css": 0,
       "literal-motion": 0,
       "unitless-length": 0
